@@ -36,22 +36,22 @@ The engine lives in `python/ray/data/_internal/planner/gpu_sort_general.py`
 CPU sort control flow is **untouched** when `gpu` is unset/`False` (see
 zero-regression below).
 
-## Running the forked Ray (not a pip install)
+## Running the forked Ray (this worktree's source)
 
-This is a Ray **source** checkout. Activate it (overlays the compiled core, puts
-this `python/` first on `PYTHONPATH`):
+Each worktree has its own self-contained `.venv` with every dependency **except
+Ray**, plus this worktree's Ray installed **editable** (`pip install -e .` with
+`SKIP_BAZEL_BUILD=1`, reusing the prebuilt native core). So `import ray` resolves
+to this worktree's `python/ray` from any directory — no `PYTHONPATH` needed:
 
 ```bash
-source setup_forked_ray.sh
-$RAY_FORK_PYTHON -c "import ray, cudf, rapidsmpf; print(ray.__version__, ray.__file__)"
+.venv/bin/python -c "import ray, cudf, rapidsmpf; print(ray.__version__, ray.__file__)"
 # 3.0.0.dev0  <worktree>/python/ray/__init__.py
 ```
 
 ## Tests (accuracy + zero-regression)
 
 ```bash
-source setup_forked_ray.sh
-$RAY_FORK_PYTHON -m pytest python/ray/data/tests/test_gpu_sort.py -v
+.venv/bin/python -m pytest python/ray/data/tests/test_gpu_sort.py -v
 ```
 
 * **Policy / wiring / zero-regression** tests run on any host (no GPU): they pin
@@ -66,10 +66,9 @@ $RAY_FORK_PYTHON -m pytest python/ray/data/tests/test_gpu_sort.py -v
 ## Benchmark (reproduce the numbers)
 
 ```bash
-source setup_forked_ray.sh
-$RAY_FORK_PYTHON gpu_sort_bench/benchmark.py --gpus 16 --trials 3        # 64 GiB
-$RAY_FORK_PYTHON gpu_sort_bench/benchmark.py --quick                     # 1 GiB sanity
-$RAY_FORK_PYTHON gpu_sort_bench/benchmark.py --backends cpu,gpu_general  # subset
+.venv/bin/python gpu_sort_bench/benchmark.py --gpus 16 --trials 3        # 64 GiB
+.venv/bin/python gpu_sort_bench/benchmark.py --quick                     # 1 GiB sanity
+.venv/bin/python gpu_sort_bench/benchmark.py --backends cpu,gpu_general  # subset
 ```
 
 Dataset: **1Gi rows (1,073,741,824) × 16 int32 = 64 GiB**, key `c0` = random
@@ -81,7 +80,7 @@ key sum / min / max / global monotonicity).
 
 ### Results (16× Tesla V100-SXM3-32GB, cuDF 26.02, rapidsmpf 26.02; forked Ray 3.0.0.dev0)
 
-Measured on the forked source Ray (`bench_64gib.log`, best/median of 3 trials;
+Measured on the forked source Ray (best/median of 3 trials;
 the run-2 spike that hits every backend is excluded by best/median):
 
 | backend | best | median | FULL | h2d | shuffle | GPU-only | d2h | vs pyarrow | vs polars | sorted |

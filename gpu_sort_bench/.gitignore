@@ -1,0 +1,2 @@
+# Benchmark / probe output logs are regenerated on every run — don't track them.
+*.log
