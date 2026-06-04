@@ -1,0 +1,435 @@
+2026-06-02 17:36:52,536	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+
+=== ray runtime before data build ===
+ray version: 2.55.1
+python: 3.10.12
+os cpu_count: 96
+ray nodes alive/total: 1/1
+ray total CPUs: 96.0
+ray available CPUs now: 96.0
+ray total GPUs: 16.0
+ray object store: 512.00 GiB
+node 0: addr=10.150.30.2 CPU=96.0 GPU=16.0 object_store=512.00 GiB
+ray workers listed: unavailable (ServerUnavailable: Failed to make request to http://127.0.0.1:8265/api/v0/workers. Failed to connect to API server. Please check the API server log for details. Make sure dependencies are installed with `pip install ray[default]`. Please also check dashboard is available, and included when starting ray cluster, i.e. `ray start --include-dashboard=True --head`. )
+
+planned rows: 1,073,741,824
+planned cols: 16
+planned input blocks: 256
+rows per block: 4,194,304
+raw dataset size: 64.00 GiB
+raw block size: 0.25 GiB
+put block 1/256
+put block 2/256
+put block 3/256
+put block 4/256
+put block 5/256
+put block 6/256
+put block 7/256
+put block 8/256
+put block 9/256
+put block 10/256
+put block 11/256
+put block 12/256
+put block 13/256
+put block 14/256
+put block 15/256
+put block 16/256
+put block 17/256
+put block 18/256
+put block 19/256
+put block 20/256
+put block 21/256
+put block 22/256
+put block 23/256
+put block 24/256
+put block 25/256
+put block 26/256
+put block 27/256
+put block 28/256
+put block 29/256
+put block 30/256
+put block 31/256
+put block 32/256
+put block 33/256
+put block 34/256
+put block 35/256
+put block 36/256
+put block 37/256
+put block 38/256
+put block 39/256
+put block 40/256
+put block 41/256
+put block 42/256
+put block 43/256
+put block 44/256
+put block 45/256
+put block 46/256
+put block 47/256
+put block 48/256
+put block 49/256
+put block 50/256
+put block 51/256
+put block 52/256
+put block 53/256
+put block 54/256
+put block 55/256
+put block 56/256
+put block 57/256
+put block 58/256
+put block 59/256
+put block 60/256
+put block 61/256
+put block 62/256
+put block 63/256
+put block 64/256
+put block 65/256
+put block 66/256
+put block 67/256
+put block 68/256
+put block 69/256
+put block 70/256
+put block 71/256
+put block 72/256
+put block 73/256
+put block 74/256
+put block 75/256
+put block 76/256
+put block 77/256
+put block 78/256
+put block 79/256
+put block 80/256
+put block 81/256
+put block 82/256
+put block 83/256
+put block 84/256
+put block 85/256
+put block 86/256
+put block 87/256
+put block 88/256
+put block 89/256
+put block 90/256
+put block 91/256
+put block 92/256
+put block 93/256
+put block 94/256
+put block 95/256
+put block 96/256
+put block 97/256
+put block 98/256
+put block 99/256
+put block 100/256
+put block 101/256
+put block 102/256
+put block 103/256
+put block 104/256
+put block 105/256
+put block 106/256
+put block 107/256
+put block 108/256
+put block 109/256
+put block 110/256
+put block 111/256
+put block 112/256
+put block 113/256
+put block 114/256
+put block 115/256
+put block 116/256
+put block 117/256
+put block 118/256
+put block 119/256
+put block 120/256
+put block 121/256
+put block 122/256
+put block 123/256
+put block 124/256
+put block 125/256
+put block 126/256
+put block 127/256
+put block 128/256
+put block 129/256
+put block 130/256
+put block 131/256
+put block 132/256
+put block 133/256
+put block 134/256
+put block 135/256
+put block 136/256
+put block 137/256
+put block 138/256
+put block 139/256
+put block 140/256
+put block 141/256
+put block 142/256
+put block 143/256
+put block 144/256
+put block 145/256
+put block 146/256
+put block 147/256
+put block 148/256
+put block 149/256
+put block 150/256
+put block 151/256
+put block 152/256
+put block 153/256
+put block 154/256
+put block 155/256
+put block 156/256
+put block 157/256
+put block 158/256
+put block 159/256
+put block 160/256
+put block 161/256
+put block 162/256
+put block 163/256
+put block 164/256
+put block 165/256
+put block 166/256
+put block 167/256
+put block 168/256
+put block 169/256
+put block 170/256
+put block 171/256
+put block 172/256
+put block 173/256
+put block 174/256
+put block 175/256
+put block 176/256
+put block 177/256
+put block 178/256
+put block 179/256
+put block 180/256
+put block 181/256
+put block 182/256
+put block 183/256
+put block 184/256
+put block 185/256
+put block 186/256
+put block 187/256
+put block 188/256
+put block 189/256
+put block 190/256
+put block 191/256
+put block 192/256
+put block 193/256
+put block 194/256
+put block 195/256
+put block 196/256
+put block 197/256
+put block 198/256
+put block 199/256
+put block 200/256
+put block 201/256
+put block 202/256
+put block 203/256
+put block 204/256
+put block 205/256
+put block 206/256
+put block 207/256
+put block 208/256
+put block 209/256
+put block 210/256
+put block 211/256
+put block 212/256
+put block 213/256
+put block 214/256
+put block 215/256
+put block 216/256
+put block 217/256
+put block 218/256
+put block 219/256
+put block 220/256
+put block 221/256
+put block 222/256
+put block 223/256
+put block 224/256
+put block 225/256
+put block 226/256
+put block 227/256
+put block 228/256
+put block 229/256
+put block 230/256
+put block 231/256
+put block 232/256
+put block 233/256
+put block 234/256
+put block 235/256
+put block 236/256
+put block 237/256
+put block 238/256
+put block 239/256
+put block 240/256
+put block 241/256
+put block 242/256
+put block 243/256
+put block 244/256
+put block 245/256
+put block 246/256
+put block 247/256
+put block 248/256
+put block 249/256
+put block 250/256
+put block 251/256
+put block 252/256
+put block 253/256
+put block 254/256
+put block 255/256
+put block 256/256
+2026-06-02 17:37:31,938	INFO logging.py:416 -- Registered dataset logger for dataset dataset_2_0
+2026-06-02 17:37:31,951	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_2_0. Full logs are in /tmp/ray/session_2026-06-02_17-36-49_748774_463488/logs/ray-data
+2026-06-02 17:37:31,951	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_2_0: InputDataBuffer[Input] -> AllToAllOperator[Sort]
+2026-06-02 17:37:31,955	INFO __init__.py:56 -- Progress will be logged because stdout is a non-interactive terminal.
+2026-06-02 17:37:32,844	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_2_0 =======
+2026-06-02 17:37:32,844	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 17:37:32,844	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 17:37:32,845	INFO logging_progress.py:181 -- 
+2026-06-02 17:37:32,845	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 17:37:32,845	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 17:37:32,845	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 17:37:32,845	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 17:37:32,845	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 17:37:32,845	INFO logging_progress.py:192 -- ============================================
+2026-06-02 17:38:17,476	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_2_0 =======
+2026-06-02 17:38:17,477	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 17:38:17,477	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 17:38:17,477	INFO logging_progress.py:181 -- 
+2026-06-02 17:38:17,477	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 17:38:17,477	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 0 (0.0B); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 17:38:17,477	INFO logging_progress.py:231 --     - Sort Sample: 2560/1
+2026-06-02 17:38:17,477	INFO logging_progress.py:231 --     - Shuffle Map: 1073741824/1
+2026-06-02 17:38:17,477	INFO logging_progress.py:231 --     - Shuffle Reduce: 1073741824/1
+2026-06-02 17:38:17,477	INFO logging_progress.py:192 -- ============================================
+2026-06-02 17:38:17,518	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_2_0 execution finished in 45.56 seconds
+
+=== ray runtime after input materialized ===
+ray version: 2.55.1
+python: 3.10.12
+os cpu_count: 96
+ray nodes alive/total: 1/1
+ray total CPUs: 96.0
+ray available CPUs now: 96.0
+ray total GPUs: 16.0
+ray object store: 512.00 GiB
+node 0: addr=10.150.30.2 CPU=96.0 GPU=16.0 object_store=512.00 GiB
+ray workers listed: unavailable (ServerUnavailable: Failed to make request to http://127.0.0.1:8265/api/v0/workers. Failed to connect to API server. Please check the API server log for details. Make sure dependencies are installed with `pip install ray[default]`. Please also check dashboard is available, and included when starting ray cluster, i.e. `ray start --include-dashboard=True --head`. )
+
+=== input dataset ===
+schema: Column  Type
+------  ----
+c0      int32
+c1      int32
+c2      int32
+c3      int32
+c4      int32
+c5      int32
+c6      int32
+c7      int32
+c8      int32
+c9      int32
+c10     int32
+c11     int32
+c12     int32
+c13     int32
+c14     int32
+c15     int32
+num_blocks: 256
+
+sort+materialize seconds: 45.691
+
+=== ray runtime after sort ===
+ray version: 2.55.1
+python: 3.10.12
+os cpu_count: 96
+ray nodes alive/total: 1/1
+ray total CPUs: 96.0
+ray available CPUs now: 96.0
+ray total GPUs: 16.0
+ray object store: 512.00 GiB
+node 0: addr=10.150.30.2 CPU=96.0 GPU=16.0 object_store=512.00 GiB
+ray workers listed: unavailable (ServerUnavailable: Failed to make request to http://127.0.0.1:8265/api/v0/workers. Failed to connect to API server. Please check the API server log for details. Make sure dependencies are installed with `pip install ray[default]`. Please also check dashboard is available, and included when starting ray cluster, i.e. `ray start --include-dashboard=True --head`. )
+
+=== sorted dataset ===
+schema: Column  Type
+------  ----
+c0      int32
+c1      int32
+c2      int32
+c3      int32
+c4      int32
+c5      int32
+c6      int32
+c7      int32
+c8      int32
+c9      int32
+c10     int32
+c11     int32
+c12     int32
+c13     int32
+c14     int32
+c15     int32
+num_blocks: 256
+
+=== ray data stats ===
+Operator 0 FromArrow: 1 tasks executed, 256 blocks produced in 0.38s
+* Remote wall time: 15.78us min, 1.14ms max, 31.46us mean, 8.05ms total
+* Remote cpu time: 13.48us min, 56.23us max, 23.51us mean, 6.02ms total
+* UDF time: 0us min, 0us max, 0.0us mean, 0us total
+* Peak heap memory usage (MiB): 0.0 min, 0.0 max, 0 mean
+* Output num rows per block: 4194304 min, 4194304 max, 4194304 mean, 1073741824 total
+* Output size bytes per block: 268435456 min, 268435456 max, 268435456 mean, 68719476736 total
+* Output rows per task: 1073741824 min, 1073741824 max, 1073741824 mean, 1 tasks used
+* Tasks per node: 1 min, 1 max, 1 mean; 1 nodes used
+* Operator throughput:
+	* Total input num rows: 0 rows
+	* Total output num rows: 1073741824 rows
+	* Ray Data throughput: 2805609671.6452174 rows/s
+	* Estimated single task throughput: 133303661279.60422 rows/s
+
+Operator 1 Sort: executed in 45.56s
+
+	Suboperator 0 SortMap: 1 tasks executed, 256 blocks produced
+	* Remote wall time: 2.09s min, 8.27s max, 5.96s mean, 1526.25s total
+	* Remote cpu time: 2.09s min, 8.05s max, 5.84s mean, 1495.62s total
+	* UDF time: 0us min, 0us max, 0.0us mean, 0us total
+	* Peak heap memory usage (MiB): 0.0 min, 0.0 max, 0 mean
+	* Output num rows per block: 4194304 min, 4194304 max, 4194304 mean, 1073741824 total
+	* Output size bytes per block: 268435456 min, 268435456 max, 268435456 mean, 68719476736 total
+	* Output rows per task: 1073741824 min, 1073741824 max, 1073741824 mean, 1 tasks used
+	* Tasks per node: 1 min, 1 max, 1 mean; 1 nodes used
+	* Operator throughput:
+		* Total input num rows: 1073741824 rows
+		* Total output num rows: 1073741824 rows
+		* Ray Data throughput: 38902167.6251565 rows/s
+		* Estimated single task throughput: 703515.3227758972 rows/s
+
+	Suboperator 1 SortReduce: 1 tasks executed, 256 blocks produced
+	* Remote wall time: 727.44ms min, 6.27s max, 2.66s mean, 681.46s total
+	* Remote cpu time: 490.38ms min, 3.22s max, 1.58s mean, 403.96s total
+	* UDF time: 0us min, 0us max, 0.0us mean, 0us total
+	* Peak heap memory usage (MiB): 0.0 min, 0.0 max, 0 mean
+	* Output num rows per block: 1417106 min, 8689505 max, 4194304 mean, 1073741824 total
+	* Output size bytes per block: 90694784 min, 556128320 max, 268435456 mean, 68719476736 total
+	* Output rows per task: 1073741824 min, 1073741824 max, 1073741824 mean, 1 tasks used
+	* Tasks per node: 1 min, 1 max, 1 mean; 1 nodes used
+	* Operator throughput:
+		* Total input num rows: 1073741824 rows
+		* Total output num rows: 1073741824 rows
+		* Ray Data throughput: 69909225.39455503 rows/s
+		* Estimated single task throughput: 1575638.7547157996 rows/s
+
+Dataset throughput:
+	* Ray Data throughput: 24508815.938897453 rows/s
+
+
+=== ray memory stats ===
+Traceback (most recent call last):
+  File "/bobbwang/projects/sort_iso_bench/sort.py", line 117, in <module>
+    subprocess.run(["ray", "memory", "--stats-only"], check=False)
+  File "/usr/lib/python3.10/subprocess.py", line 503, in run
+    with Popen(*popenargs, **kwargs) as process:
+  File "/usr/lib/python3.10/subprocess.py", line 971, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.10/subprocess.py", line 1863, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'ray'

@@ -162,6 +162,7 @@ def plan_all_to_all_op(
             op.batch_format,
             data_context,
             debug_limit_shuffle_execution_to_num_blocks,
+            gpu=getattr(op, "gpu", None),
         )
 
     elif isinstance(op, Aggregate):

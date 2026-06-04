@@ -1,0 +1,20 @@
+2026-06-03 20:38:02,963	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+=== shuffle_bench backend=rapidsmpf ===
+rows=1,073,741,824 cols=16 -> 64.00 GiB
+rapidsmpf input resident: 16 x 4.00 GiB = 64.00 GiB
+all-to-all chunk: 4,194,304 rows per (src,dst) pair
+warmup shuffle...
+trial 0:   84.321 ms   dataset=  759.0 GiB/s   fabric=  711.6 GiB/s
+trial 1:   80.203 ms   dataset=  798.0 GiB/s   fabric=  748.1 GiB/s
+trial 2:   77.340 ms   dataset=  827.5 GiB/s   fabric=  775.8 GiB/s
+trial 3:   81.782 ms   dataset=  782.6 GiB/s   fabric=  733.7 GiB/s
+trial 4:   73.369 ms   dataset=  872.3 GiB/s   fabric=  817.8 GiB/s
+
+=== rapidsmpf Shuffler all-to-all (UCXX/NVLink) ===
+dataset: 64.00 GiB
+best: 73.369 ms   mean: 79.403 ms
+dataset throughput (best): 872.30 GiB/s
+fabric bytes moved: 60.00 GiB
+fabric throughput (best): 817.78 GiB/s

@@ -1,0 +1,8 @@
+2026-06-02 20:41:07,491	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+=== h2d_probe: 16 GPUs x 16 blocks x 4,194,304 rows x 16 cols = 64.0 GiB ===
+a) pageable .set() per-col + transpose            1408.3 ms      45.4 GiB/s
+d) pageable .set() per-col, no transpose          1419.4 ms      45.1 GiB/s
+b) pinned stage + big async + transpose           2320.5 ms      27.6 GiB/s
+c) pinned stage + big async, no transpose         2208.5 ms      29.0 GiB/s

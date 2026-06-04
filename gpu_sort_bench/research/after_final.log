@@ -1,0 +1,105 @@
+2026-06-02 20:57:36,187	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+2026-06-02 20:58:18,099	INFO logging.py:416 -- Registered dataset logger for dataset dataset_2_0
+2026-06-02 20:58:18,112	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_2_0. Full logs are in /tmp/ray/session_2026-06-02_20-57-33_469596_1148890/logs/ray-data
+2026-06-02 20:58:18,112	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_2_0: InputDataBuffer[Input] -> AllToAllOperator[Sort]
+2026-06-02 20:58:18,116	INFO __init__.py:56 -- Progress will be logged because stdout is a non-interactive terminal.
+2026-06-02 20:58:19,027	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_2_0 =======
+2026-06-02 20:58:19,027	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 20:58:19,027	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 20:58:19,027	INFO logging_progress.py:181 -- 
+2026-06-02 20:58:19,027	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 20:58:19,027	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 20:58:19,027	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 20:58:19,027	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 20:58:19,027	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 20:58:19,027	INFO logging_progress.py:192 -- ============================================
+2026-06-02 21:00:38,499	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_2_0 =======
+2026-06-02 21:00:38,499	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 21:00:38,499	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 21:00:38,499	INFO logging_progress.py:181 -- 
+2026-06-02 21:00:38,499	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 21:00:38,499	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 0 (0.0B); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 21:00:38,499	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 21:00:38,499	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 21:00:38,499	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 21:00:38,499	INFO logging_progress.py:192 -- ============================================
+2026-06-02 21:00:38,522	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_2_0 execution finished in 140.41 seconds
+2026-06-02 21:00:38,618	INFO logging.py:416 -- Registered dataset logger for dataset dataset_5_0
+2026-06-02 21:00:38,622	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_5_0. Full logs are in /tmp/ray/session_2026-06-02_20-57-33_469596_1148890/logs/ray-data
+2026-06-02 21:00:38,622	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_5_0: InputDataBuffer[Input] -> AllToAllOperator[Sort]
+2026-06-02 21:00:38,678	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_5_0 =======
+2026-06-02 21:00:38,678	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 21:00:38,678	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 21:00:38,678	INFO logging_progress.py:181 -- 
+2026-06-02 21:00:38,678	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 21:00:38,678	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 21:00:38,678	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 21:00:38,678	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 21:00:38,678	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 21:00:38,678	INFO logging_progress.py:192 -- ============================================
+2026-06-02 21:00:44,965	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_5_0 execution finished in 6.34 seconds
+2026-06-02 21:00:44,997	INFO logging.py:416 -- Registered dataset logger for dataset dataset_8_0
+2026-06-02 21:00:44,998	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_8_0. Full logs are in /tmp/ray/session_2026-06-02_20-57-33_469596_1148890/logs/ray-data
+2026-06-02 21:00:44,998	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_8_0: InputDataBuffer[Input] -> AllToAllOperator[Sort]
+2026-06-02 21:00:45,052	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_8_0 =======
+2026-06-02 21:00:45,052	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 21:00:45,052	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 21:00:45,052	INFO logging_progress.py:181 -- 
+2026-06-02 21:00:45,052	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 21:00:45,052	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 21:00:45,052	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 21:00:45,052	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 21:00:45,052	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 21:00:45,052	INFO logging_progress.py:192 -- ============================================
+2026-06-02 21:00:51,489	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_8_0 execution finished in 6.49 seconds
+2026-06-02 21:00:51,522	INFO logging.py:416 -- Registered dataset logger for dataset dataset_11_0
+2026-06-02 21:00:51,524	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_11_0. Full logs are in /tmp/ray/session_2026-06-02_20-57-33_469596_1148890/logs/ray-data
+2026-06-02 21:00:51,524	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_11_0: InputDataBuffer[Input] -> AllToAllOperator[Sort]
+2026-06-02 21:00:51,651	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_11_0 =======
+2026-06-02 21:00:51,651	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 21:00:51,651	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 21:00:51,651	INFO logging_progress.py:181 -- 
+2026-06-02 21:00:51,651	INFO logging_progress.py:231 -- Sort: 0/1
+2026-06-02 21:00:51,651	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 21:00:51,651	INFO logging_progress.py:231 --     - Sort Sample: 0/1
+2026-06-02 21:00:51,651	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 21:00:51,651	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 21:00:51,651	INFO logging_progress.py:192 -- =============================================
+2026-06-02 21:00:58,191	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_11_0 execution finished in 6.67 seconds
+=== ray gpu sort benchmark ===
+rows: 1,073,741,824  cols: 16  blocks: 256  gpus: 16
+rows/block: 4,194,304  dataset: 64.00 GiB
+ray GPUs: 16.0
+
+building input blocks in object store...
+input built. in_count=1,073,741,824 in_sum=1152916656995531798 in_min=9 in_max=2147483645
+
+warmup sort...
+[33m(raylet)[0m It looks like you're creating a detached actor in an anonymous namespace. In order to access this actor in the future, you will need to explicitly connect to this namespace with ray.init(namespace="8de49d6b-04a2-48f8-9446-c2065d964163", ...)
+
+=== correctness (on the sorted Ray result) ===
+rows out: 1,073,741,824 / materialized 1,073,741,824 (expected 1,073,741,824) -> OK
+globally sorted across blocks: OK
+key sum match: OK (out=1152916656995531798 in=1152916656995531798)
+key min/max match: OK (out=[9,2147483645] in=[9,2147483645])
+output block rows: [67131286, 67981102, 67343055, 67473731, 66230556, 67304591, 66170880, 66644629, 66885382, 67808045, 66438554, 66626979, 68122246, 66345146, 66696670, 68538972]
+
+=== timed trials ===
+trial 0: full=3.383s (h2d=1.792 sort=0.233 d2h=1.357) | gpu-only=0.2330s | ds.sort().materialize() wall=6.376s
+trial 1: full=3.536s (h2d=1.913 sort=0.267 d2h=1.356) | gpu-only=0.2667s | ds.sort().materialize() wall=6.524s
+trial 2: full=3.622s (h2d=2.035 sort=0.230 d2h=1.356) | gpu-only=0.2303s | ds.sort().materialize() wall=6.701s
+
+=== RESULT ===
+dataset: 64.00 GiB (1,073,741,824 rows x 16 int32 cols)
+FULL  RAM->VRAM->sort->VRAM->RAM (best): 3.383 s  (18.9 GiB/s, 317,438,742 rows/s)
+   phase means: h2d=1.913s  gpu_sort=0.243s  d2h=1.356s
+   H2D (best): 1.792 s -> 35.7 GiB/s   (mean 33.5 GiB/s)
+   D2H (best): 1.356 s -> 47.2 GiB/s   (mean 47.2 GiB/s)
+GPU-ONLY in-VRAM->sorted-in-VRAM (best): 0.2303 s  (278.0 GiB/s, 4,663,321,862 rows/s)
+ds.sort().materialize() wall (best): 6.376 s
+
+ray cpu baseline: 45.691 s
+speedup vs cpu (FULL incl. transfers): 13.5x
+speedup vs cpu (GPU-only): 198.4x

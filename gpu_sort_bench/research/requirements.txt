@@ -1,0 +1,39 @@
+# Dependencies for the Ray CPU-vs-GPU sort benchmark.
+#
+# The RAPIDS wheels (cudf / rmm / ucxx / rapidsmpf, all the *-cu12 packages) are
+# NOT on PyPI -- install them from the NVIDIA index. They must all be on the SAME
+# RAPIDS release line (here 26.02 / ucxx 0.48):
+#
+#   pip install --extra-index-url=https://pypi.nvidia.com \
+#       "cudf-cu12==26.2.*" "rmm-cu12==26.2.*" "dask-cuda==26.2.*" \
+#       "ucxx-cu12==0.48.*" "rapidsmpf-cu12==26.2.*" \
+#       ray[data]==2.55.1 "cupy-cuda12x==14.*" pyarrow numpy
+#
+# rapidsmpf is REQUIRED by the general GPU sort backend (gpu_sort_general.py):
+# it provides the distributed all-to-all Shuffler that runs over UCXX / NVLink.
+# CUDA 12.x, Python 3.10. Hardware: a single multi-GPU node (16x V100 here).
+
+# --- core ---
+ray==2.55.1
+pyarrow==24.0.0
+numpy==2.2.6
+
+# --- RAPIDS (install via --extra-index-url=https://pypi.nvidia.com) ---
+cudf-cu12==26.2.1
+pylibcudf-cu12==26.2.1
+libcudf-cu12==26.2.1
+rmm-cu12==26.2.0
+librmm-cu12==26.2.0
+cupy-cuda12x==14.1.1
+cuda-python==12.9.7
+
+# distributed all-to-all shuffle for the general GPU sort (REQUIRED)
+rapidsmpf-cu12==26.2.0
+librapidsmpf-cu12==26.2.0
+
+# UCXX communicator + transports used by the rapidsmpf Shuffler (NVLink/CUDA-IPC)
+ucxx-cu12==0.48.0
+libucxx-cu12==0.48.0
+libucx-cu12==1.19.0
+distributed-ucxx-cu12==0.48.0
+dask-cuda==26.2.0

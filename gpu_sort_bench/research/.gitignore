@@ -1,0 +1,16 @@
+# Virtualenv is not tracked, EXCEPT the specific Ray files we patched for the
+# GPU sort (force-added with `git add -f`):
+#   ray/data/_internal/planner/gpu_sort.py          (tuned int32 engine)
+#   ray/data/_internal/planner/gpu_sort_general.py  (general cuDF + rapidsmpf engine)
+#   ray/data/_internal/planner/sort.py              (gpu/backend routing)
+#   ray/data/_internal/planner/plan_all_to_all_op.py(threads the gpu flag in)
+#   ray/data/_internal/logical/operators/all_to_all_operator.py (Sort.gpu field)
+#   ray/data/_internal/logical/rules/combine_shuffles.py (preserves gpu on combine)
+#   ray/data/dataset.py                             (Dataset.sort(gpu=/backend=))
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/

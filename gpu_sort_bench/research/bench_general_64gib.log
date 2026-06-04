@@ -1,0 +1,39 @@
+
+=== CPU: fresh process + fresh ray.init() ===
+   [CPU] dataset ready (1,073,741,824 rows, 64 GiB). warming up...
+   [CPU] warmup:   45.506 s (not counted)
+   [CPU] run 1/3:   33.456 s
+   [CPU] run 2/3:   40.377 s
+   [CPU] run 3/3:   34.295 s
+   [CPU] checking the result is actually sorted...
+   [CPU] sorted=True  rows=1,073,741,824(ok)  key_sum=ok  min/max=ok  -> PASS
+
+=== GPU-TUNED: fresh process + fresh ray.init() ===
+   [GPU-TUNED] dataset ready (1,073,741,824 rows, 64 GiB). warming up...
+   [GPU-TUNED] warmup:  141.426 s (not counted)
+   [GPU-TUNED] run 1/3:    7.507 s  [full=3.748 h2d=2.083 gpu=0.250 shuf=0.000 d2h=1.414]
+   [GPU-TUNED] run 2/3:   17.504 s  [full=3.671 h2d=2.004 gpu=0.265 shuf=0.000 d2h=1.401]
+   [GPU-TUNED] run 3/3:    7.667 s  [full=3.799 h2d=2.162 gpu=0.235 shuf=0.000 d2h=1.401]
+   [GPU-TUNED] checking the result is actually sorted...
+   [GPU-TUNED] sorted=True  rows=1,073,741,824(ok)  key_sum=ok  min/max=ok  -> PASS
+
+=== GPU-GENERAL: fresh process + fresh ray.init() ===
+   [GPU-GENERAL] dataset ready (1,073,741,824 rows, 64 GiB). warming up...
+   [GPU-GENERAL] warmup:   48.278 s (not counted)
+   [GPU-GENERAL] run 1/3:    5.672 s  [full=5.456 h2d=1.511 gpu=0.371 shuf=0.109 d2h=3.548]
+   [GPU-GENERAL] run 2/3:   18.484 s  [full=18.258 h2d=1.510 gpu=0.366 shuf=0.103 d2h=16.355]
+   [GPU-GENERAL] run 3/3:    5.585 s  [full=5.384 h2d=1.530 gpu=0.377 shuf=0.115 d2h=3.453]
+   [GPU-GENERAL] checking the result is actually sorted...
+   [GPU-GENERAL] sorted=True  rows=1,073,741,824(ok)  key_sum=ok  min/max=ok  -> PASS
+
+==========================================================================
+  dataset: 64 GiB (1,073,741,824 rows x 16 int32)
+  CPU baseline (documented): 45.691 s
+--------------------------------------------------------------------------
+  CPU          best   33.456 s   mean   36.043 s   warmup  45.506 s   sorted=PASS     1.0x vs CPU
+  GPU-TUNED    best    7.507 s   mean   10.893 s   warmup 141.426 s   sorted=PASS     4.5x vs CPU
+               FULL 3.748s  (h2d 2.083, d2h 1.414)   GPU-only 0.250s
+  GPU-GENERAL  best    5.585 s   mean    9.914 s   warmup  48.278 s   sorted=PASS     6.0x vs CPU
+               FULL 5.384s  (h2d 1.530, shuffle 0.115, d2h 3.453)   GPU-only 0.377s
+==========================================================================
+

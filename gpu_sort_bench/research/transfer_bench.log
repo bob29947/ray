@@ -1,0 +1,17 @@
+2026-06-02 20:19:36,316	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+=== transfer_bench: 1,073,741,824 rows x 16 int32 = 64.0 GiB across 16 GPUs ===
+per-GPU payload: 4.00 GiB   numa_bind=True
+design                       host                        H2D                     D2H
+1x single-GPU (no contention) pageable  H2D    801.0 ms     5.0 GiB/s   D2H   2559.6 ms     1.6 GiB/s
+1x single-GPU (no contention) pinned   H2D    365.3 ms    11.0 GiB/s   D2H    328.4 ms    12.2 GiB/s
+16x single-GPU actors        pageable  H2D   1397.5 ms    45.8 GiB/s   D2H   2937.9 ms    21.8 GiB/s
+16x single-GPU actors        pinned   H2D   1396.4 ms    45.8 GiB/s   D2H   1309.7 ms    48.9 GiB/s
+1x 16-GPU actor (threads)    pageable  H2D   1456.9 ms    43.9 GiB/s   D2H   4065.9 ms    15.7 GiB/s
+1x 16-GPU actor (threads)    pinned   H2D   1396.5 ms    45.8 GiB/s   D2H   1309.0 ms    48.9 GiB/s
+
+=== host marshalling cost (single process, one GPU's share) ===
+row-major transpose assembly :   8164.5 ms  (  0.49 GiB/s)
+column-major contiguous copy :   1617.2 ms  (  2.47 GiB/s)
+zero-copy column views       :      0.0 ms  (just .to_numpy handles)

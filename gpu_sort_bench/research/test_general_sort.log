@@ -1,0 +1,7 @@
+2026-06-03 22:43:54,791	INFO worker.py:2012 -- Started a local Ray instance.
+[general-test] 4,000,000 rows x 5 cols, keys=['s', 'f', 'g'] descending=[False, True, False], 16 GPUs
+[general-test] rows: gpu_out=4,000,000 in=4,000,000 (ok)
+[general-test] global key order == independent pandas oracle: PASS
+[general-test] payload/row integrity preserved: PASS
+
+[general-test] RESULT: PASS

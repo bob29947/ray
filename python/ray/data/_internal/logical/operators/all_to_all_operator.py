@@ -211,6 +211,11 @@ class Sort(AbstractAllToAll, LogicalOperatorSupportsPredicatePassThrough):
 
     sort_key: SortKey
     batch_format: Optional[str] = "default"
+    # Experimental opt-in for the multi-GPU sort backend (cuDF + rapidsmpf),
+    # plumbed from ``Dataset.sort(gpu=...)`` / ``backend="gpu"``. ``None`` keeps
+    # the default CPU sort; ``True``/``False`` force GPU/CPU respectively. See
+    # ``ray.data._internal.planner.sort._resolve_gpu_impl``.
+    gpu: Optional[bool] = None
     ray_remote_args: Dict[str, Any] = field(default_factory=dict)
     sub_progress_bar_names: Optional[List[str]] = None
     input_dependencies: List[LogicalOperator] = field(repr=False, kw_only=True)

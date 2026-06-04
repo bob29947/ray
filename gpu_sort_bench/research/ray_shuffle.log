@@ -1,0 +1,92 @@
+=== shuffle_bench backend=ray ===
+rows=1,073,741,824 cols=16 -> 64.00 GiB
+2026-06-02 18:18:34,868	INFO worker.py:2012 -- Started a local Ray instance.
+/bobbwang/projects/sort_iso_bench/.venv/lib/python3.10/site-packages/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+building 256 blocks (64.00 GiB) in object store...
+warmup shuffle...
+2026-06-02 18:19:14,751	INFO logging.py:416 -- Registered dataset logger for dataset dataset_4_0
+2026-06-02 18:19:14,764	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_4_0. Full logs are in /tmp/ray/session_2026-06-02_18-18-32_050230_656617/logs/ray-data
+2026-06-02 18:19:14,764	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_4_0: InputDataBuffer[Input] -> AllToAllOperator[RandomShuffle]
+2026-06-02 18:19:14,768	INFO __init__.py:56 -- Progress will be logged because stdout is a non-interactive terminal.
+2026-06-02 18:19:15,667	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_4_0 =======
+2026-06-02 18:19:15,667	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:19:15,667	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:19:15,668	INFO logging_progress.py:181 -- 
+2026-06-02 18:19:15,668	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:19:15,668	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:19:15,668	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 18:19:15,668	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 18:19:15,668	INFO logging_progress.py:192 -- ============================================
+[36m(map pid=657176)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.
+[36m(map pid=657212)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 96x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(map pid=657211)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 102x across cluster][0m
+[36m(map pid=657196)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 25x across cluster][0m
+2026-06-02 18:19:56,258	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_4_0 =======
+2026-06-02 18:19:56,259	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:19:56,259	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:19:56,259	INFO logging_progress.py:181 -- 
+2026-06-02 18:19:56,259	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:19:56,259	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 0 (0.0B); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:19:56,259	INFO logging_progress.py:231 --     - Shuffle Map: 1073741824/1
+2026-06-02 18:19:56,259	INFO logging_progress.py:231 --     - Shuffle Reduce: 1073741824/1
+2026-06-02 18:19:56,259	INFO logging_progress.py:192 -- ============================================
+2026-06-02 18:19:56,301	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_4_0 execution finished in 41.53 seconds
+2026-06-02 18:19:56,797	INFO logging.py:416 -- Registered dataset logger for dataset dataset_7_0
+2026-06-02 18:19:56,799	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_7_0. Full logs are in /tmp/ray/session_2026-06-02_18-18-32_050230_656617/logs/ray-data
+2026-06-02 18:19:56,799	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_7_0: InputDataBuffer[Input] -> AllToAllOperator[RandomShuffle]
+2026-06-02 18:19:56,852	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_7_0 =======
+2026-06-02 18:19:56,852	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:19:56,852	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:19:56,852	INFO logging_progress.py:181 -- 
+2026-06-02 18:19:56,852	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:19:56,852	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:19:56,852	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 18:19:56,853	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 18:19:56,853	INFO logging_progress.py:192 -- ============================================
+[36m(map pid=657157)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 33x across cluster][0m
+[36m(map pid=657150)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 106x across cluster][0m
+[36m(map pid=657207)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 87x across cluster][0m
+2026-06-02 18:20:28,014	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_7_0 =======
+2026-06-02 18:20:28,015	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:20:28,015	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:20:28,015	INFO logging_progress.py:181 -- 
+2026-06-02 18:20:28,015	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:20:28,015	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 0 (0.0B); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:20:28,015	INFO logging_progress.py:231 --     - Shuffle Map: 1073741824/1
+2026-06-02 18:20:28,015	INFO logging_progress.py:231 --     - Shuffle Reduce: 1073741824/1
+2026-06-02 18:20:28,015	INFO logging_progress.py:192 -- ============================================
+2026-06-02 18:20:28,059	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_7_0 execution finished in 31.26 seconds
+trial 0: 31.325 s   2.04 GiB/s (dataset)
+2026-06-02 18:20:28,754	INFO logging.py:416 -- Registered dataset logger for dataset dataset_10_0
+2026-06-02 18:20:28,757	INFO streaming_executor.py:166 -- Starting execution of Dataset dataset_10_0. Full logs are in /tmp/ray/session_2026-06-02_18-18-32_050230_656617/logs/ray-data
+2026-06-02 18:20:28,757	INFO streaming_executor.py:167 -- Execution plan of Dataset dataset_10_0: InputDataBuffer[Input] -> AllToAllOperator[RandomShuffle]
+2026-06-02 18:20:28,807	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_10_0 =======
+2026-06-02 18:20:28,807	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:20:28,807	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:20:28,807	INFO logging_progress.py:181 -- 
+2026-06-02 18:20:28,807	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:20:28,807	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 256 (256.0MiB); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:20:28,808	INFO logging_progress.py:231 --     - Shuffle Map: 0/1
+2026-06-02 18:20:28,808	INFO logging_progress.py:231 --     - Shuffle Reduce: 0/1
+2026-06-02 18:20:28,808	INFO logging_progress.py:192 -- =============================================
+[36m(map pid=657159)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 63x across cluster][0m
+[36m(map pid=657199)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 98x across cluster][0m
+[36m(map pid=657209)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 94x across cluster][0m
+2026-06-02 18:21:00,012	INFO logging_progress.py:174 -- ======= Running Dataset: dataset_10_0 =======
+2026-06-02 18:21:00,013	INFO logging_progress.py:225 -- Total Progress: 0/?
+2026-06-02 18:21:00,013	INFO logging_progress.py:227 -- Active & requested resources: 0/96 CPU, 0.0B/256.0GiB object store
+2026-06-02 18:21:00,013	INFO logging_progress.py:181 -- 
+2026-06-02 18:21:00,013	INFO logging_progress.py:231 -- RandomShuffle: 0/1
+2026-06-02 18:21:00,013	INFO logging_progress.py:233 --   Tasks: 0; Actors: 0; Queued blocks: 0 (0.0B); Resources: 0.0 CPU, 0.0B object store; 0 rows output
+2026-06-02 18:21:00,013	INFO logging_progress.py:231 --     - Shuffle Map: 1073741824/1
+2026-06-02 18:21:00,013	INFO logging_progress.py:231 --     - Shuffle Reduce: 1073741824/1
+2026-06-02 18:21:00,014	INFO logging_progress.py:192 -- =============================================
+2026-06-02 18:21:00,060	INFO streaming_executor.py:294 -- ✔️  Dataset dataset_10_0 execution finished in 31.30 seconds
+trial 1: 31.375 s   2.04 GiB/s (dataset)
+
+=== ray object-store shuffle ===
+dataset: 64.00 GiB
+best: 31324.895 ms   mean: 31350.063 ms
+dataset throughput (best): 2.04 GiB/s
+[36m(map pid=657499)[0m Input block to map task has size 256MiB, which exceeds DataContext.get_current().target_shuffle_max_block_size=128MiB. This can lead to out-of-memory errors and can happen when map tasks are fused to the shuffle operation. To prevent fusion, call Dataset.materialize() on the dataset before shuffling.[32m [repeated 63x across cluster][0m
