@@ -18,13 +18,69 @@ from ray.data._internal.util import unify_ref_bundles_schema
 from ray.data.context import DataContext, ShuffleStrategy
 
 
+def _resolve_gpu_impl(gpu: Optional[bool]) -> Optional[str]:
+    """Decide whether (and which) experimental GPU sort backend to use.
+
+    Returns ``None`` (CPU sort, the default), ``"general"`` (the cuDF +
+    rapidsmpf range-partition engine in ``gpu_sort_general.py``) or ``"tuned"``
+    (the hand-tuned int32 engine in ``gpu_sort.py``).
+
+    Precedence (backwards compatible with the original env-var opt-in):
+      * ``ds.sort(..., gpu=True)``  -> GPU; backend = ``RAY_DATA_GPU_SORT_IMPL``
+        or ``"general"`` (the user-facing flag defaults to the general engine).
+      * ``ds.sort(..., gpu=False)`` -> always CPU (explicit opt-out).
+      * flag unset (``gpu is None``):
+          - ``RAY_DATA_GPU_SORT=1``        -> GPU; backend = impl env or ``"tuned"``.
+          - ``RAY_DATA_GPU_SORT_IMPL`` set -> GPU with that backend.
+          - otherwise                      -> CPU (default, unchanged behavior).
+    """
+    import os
+
+    impl_env = os.environ.get("RAY_DATA_GPU_SORT_IMPL")
+    if impl_env not in (None, "tuned", "general"):
+        impl_env = None
+    env_on = os.environ.get("RAY_DATA_GPU_SORT") == "1"
+
+    if gpu is False:
+        return None
+    if gpu is True:
+        return impl_env or "general"
+    if env_on:
+        return impl_env or "tuned"
+    if impl_env in ("tuned", "general"):
+        return impl_env
+    return None
+
+
 def generate_sort_fn(
     sort_key: SortKey,
     batch_format: str,
     data_context: DataContext,
     _debug_limit_shuffle_execution_to_num_blocks: Optional[int] = None,
+    gpu: Optional[bool] = None,
 ) -> AllToAllTransformFn:
-    """Generate function to sort blocks by the specified key column or key function."""
+    """Generate function to sort blocks by the specified key column or key function.
+
+    ``gpu`` is the user-facing opt-in plumbed from ``Dataset.sort(gpu=...)`` /
+    ``backend="gpu"``. It selects an experimental end-to-end multi-GPU sort
+    (cuDF + rapidsmpf); the CPU sort remains the default when ``gpu`` is unset.
+    """
+    import os
+
+    impl = _resolve_gpu_impl(gpu)
+    if impl is not None:
+        num_gpus = int(os.environ.get("RAY_DATA_GPU_SORT_NUM_GPUS", "16"))
+        if impl == "general":
+            from ray.data._internal.planner.gpu_sort_general import (
+                generate_gpu_sort_general_fn,
+            )
+
+            return generate_gpu_sort_general_fn(
+                sort_key, data_context, num_gpus=num_gpus
+            )
+        from ray.data._internal.planner.gpu_sort import generate_gpu_sort_fn
+
+        return generate_gpu_sort_fn(sort_key, data_context, num_gpus=num_gpus)
 
     def fn(
         sort_key: SortKey,

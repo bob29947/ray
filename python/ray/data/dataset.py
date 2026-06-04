@@ -3703,6 +3703,9 @@ class Dataset:
         key: Union[str, List[str]],
         descending: Union[bool, List[bool]] = False,
         boundaries: List[Union[int, float]] = None,
+        *,
+        gpu: Optional[bool] = None,
+        backend: Optional[str] = None,
     ) -> "Dataset":
         """Sort the dataset by the specified key column or key function.
         The `key` parameter must be specified (i.e., it cannot be `None`).
@@ -3750,6 +3753,14 @@ class Dataset:
                 will be divided into the third block. If not provided, the
                 boundaries will be sampled from the input blocks. This feature
                 only supports numeric columns right now.
+            gpu: Experimental. If ``True``, run the sort end-to-end on the local
+                GPUs using the cuDF + rapidsmpf backend (requires the RAPIDS
+                stack to be installed). If ``False``, force the CPU sort. If
+                ``None`` (default), use the CPU sort unless enabled via the
+                ``RAY_DATA_GPU_SORT`` / ``RAY_DATA_GPU_SORT_IMPL`` env vars.
+            backend: Experimental. Alternative to ``gpu``: ``"gpu"`` is
+                equivalent to ``gpu=True`` and ``"cpu"`` to ``gpu=False``. It is
+                an error to pass both ``gpu`` and ``backend``.
 
         Returns:
             A new, sorted :class:`Dataset`.
@@ -3759,9 +3770,18 @@ class Dataset:
         """
         if key is None:
             raise ValueError("The 'key' parameter cannot be None for sorting.")
+        if backend is not None:
+            if backend not in ("cpu", "gpu"):
+                raise ValueError(
+                    f"sort(backend=...) must be 'cpu' or 'gpu', got {backend!r}."
+                )
+            if gpu is not None:
+                raise ValueError("Pass only one of sort(gpu=...) or sort(backend=...).")
+            gpu = backend == "gpu"
         sort_key = SortKey(key, descending, boundaries)
         op = Sort(
             sort_key=sort_key,
+            gpu=gpu,
             input_dependencies=[self._logical_plan.dag],
         )
         logical_plan = LogicalPlan(op, self.context)
