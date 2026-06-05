@@ -21,8 +21,8 @@ range, so concatenating output blocks in partition order is globally sorted —
 for any schema, key set, sort direction, and null placement.
 
 The engine lives in `python/ray/data/_internal/planner/gpu_sort_general.py`
-(`"general"` backend). A second hand-tuned int32 engine (`gpu_sort.py`,
-`"tuned"`) is selectable via `RAY_DATA_GPU_SORT_IMPL=tuned` for A/B comparison.
+(the `"general"` backend), selected by `ds.sort(..., gpu=True)` /
+`backend="gpu"` or `RAY_DATA_GPU_SORT=1`.
 
 ## Surface area (the whole diff)
 
@@ -31,7 +31,7 @@ The engine lives in `python/ray/data/_internal/planner/gpu_sort_general.py`
 * `Sort.gpu` logical-op field (`all_to_all_operator.py`).
 * `generate_sort_fn(..., gpu=...)` + `_resolve_gpu_impl()` routing
   (`planner/sort.py`); `plan_all_to_all_op.py` forwards `op.gpu`.
-* `planner/gpu_sort_general.py`, `planner/gpu_sort.py` — the two engines.
+* `planner/gpu_sort_general.py` — the GPU sort engine.
 
 CPU sort control flow is **untouched** when `gpu` is unset/`False` (see
 zero-regression below).

@@ -10,7 +10,6 @@ Backends (all sort the SAME dataset; only the sort path differs):
     cpu          ds.sort("c0").materialize()              # default pyarrow CPU sort
     polars       ds.sort("c0").materialize()              # ctx.use_polars_sort=True
     gpu_general  ds.sort("c0", gpu=True).materialize()    # cuDF + rapidsmpf engine
-    gpu_tuned    ds.sort("c0", gpu=True).materialize()    # RAY_DATA_GPU_SORT_IMPL=tuned
 
 This is the Ray-3.0 / forked-Ray port of ``sort_iso_bench/cpu_vs_gpu_general.py``.
 The only behavioral change vs that harness is how the polars Ray-CPU baseline is
@@ -35,10 +34,9 @@ import sys
 import time
 
 RESULT_PREFIX = "RESULT_JSON:"
-ALL_BACKENDS = ("cpu", "polars", "gpu_general", "gpu_tuned")
+ALL_BACKENDS = ("cpu", "polars", "gpu_general")
 DEFAULT_BACKENDS = ("cpu", "polars", "gpu_general")
-TAG = {"cpu": "CPU", "polars": "POLARS", "gpu_general": "GPU-GENERAL",
-       "gpu_tuned": "GPU-TUNED"}
+TAG = {"cpu": "CPU", "polars": "POLARS", "gpu_general": "GPU-GENERAL"}
 # Documented Ray Data pyarrow CPU baseline on the 16xV100 reference box.
 CPU_BASELINE_S = 45.691
 
@@ -52,13 +50,11 @@ def object_store_bytes():
 # WORKER: runs ONE backend in its own process, with its own Ray.
 # =========================================================================
 def run_worker(backend, rows, cols, blocks, trials, gpus):
-    use_gpu = backend in ("gpu_tuned", "gpu_general")
+    use_gpu = backend == "gpu_general"
     # Select the GPU engine BEFORE importing ray so shuffle worker processes
     # inherit it (the engine reads these env vars at runtime).
     if use_gpu:
-        os.environ["RAY_DATA_GPU_SORT_IMPL"] = (
-            "tuned" if backend == "gpu_tuned" else "general"
-        )
+        os.environ["RAY_DATA_GPU_SORT_IMPL"] = "general"
         os.environ["RAY_DATA_GPU_SORT_NUM_GPUS"] = str(gpus)
     os.environ["RAY_DATA_GPU_SORT"] = "0"  # use the ds.sort(gpu=True) flag
     if backend == "polars":
@@ -108,9 +104,6 @@ def run_worker(backend, rows, cols, blocks, trials, gpus):
         return ds.sort("c0").materialize()
 
     def phase_stats():
-        if backend == "gpu_tuned":
-            from ray.data._internal.planner.gpu_sort import LAST_RUN_STATS
-            return dict(LAST_RUN_STATS)
         if backend == "gpu_general":
             from ray.data._internal.planner.gpu_sort_general import LAST_RUN_STATS
             return dict(LAST_RUN_STATS)
@@ -177,11 +170,6 @@ def run_worker(backend, rows, cols, blocks, trials, gpus):
          "phase": phase_best or {}}), flush=True)
 
     # Release the GPUs / detached actors promptly.
-    try:
-        from ray.data._internal.planner.gpu_sort import _SORTER_NAME
-        ray.kill(ray.get_actor(_SORTER_NAME))
-    except Exception:
-        pass
     try:
         from ray.data._internal.planner.gpu_sort_general import kill_actor_pool
         kill_actor_pool(gpus)

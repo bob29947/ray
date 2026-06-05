@@ -3757,7 +3757,7 @@ class Dataset:
                 GPUs using the cuDF + rapidsmpf backend (requires the RAPIDS
                 stack to be installed). If ``False``, force the CPU sort. If
                 ``None`` (default), use the CPU sort unless enabled via the
-                ``RAY_DATA_GPU_SORT`` / ``RAY_DATA_GPU_SORT_IMPL`` env vars.
+                ``RAY_DATA_GPU_SORT`` env var.
             backend: Experimental. Alternative to ``gpu``: ``"gpu"`` is
                 equivalent to ``gpu=True`` and ``"cpu"`` to ``gpu=False``. It is
                 an error to pass both ``gpu`` and ``backend``.

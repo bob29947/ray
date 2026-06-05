@@ -1,8 +1,7 @@
 """General end-to-end multi-GPU sort wired into Ray Data's ``ds.sort()`` path.
 
-Unlike the hand-tuned ``gpu_sort.py`` (which is hardcoded to a dense
-``(rows, 16)`` int32 matrix and moves rows as fixed byte strides), this backend
-is *general*: it represents blocks as columnar cuDF tables and therefore handles
+This backend is *general*: it represents blocks as columnar cuDF tables (rather
+than a hardcoded dense int32 matrix) and therefore handles
 
     * arbitrary column dtypes (int / float / bool / string / datetime / ...),
     * multiple sort keys, each ascending or descending,
@@ -31,10 +30,9 @@ Output partition ``p`` holds the p-th global key range in sorted order, so the
 concatenation of output blocks (ordered by partition id) is globally sorted --
 for any schema, key set, sort direction and null placement.
 
-This backend is selected by ``ds.sort(..., gpu=True)`` (or ``backend="gpu"``),
-by ``RAY_DATA_GPU_SORT=1`` together with ``RAY_DATA_GPU_SORT_IMPL=general``, or
-directly by ``RAY_DATA_GPU_SORT_IMPL=general``. The tuned int32 engine remains
-available via ``RAY_DATA_GPU_SORT_IMPL=tuned`` (default of the env-var path).
+This backend is selected by ``ds.sort(..., gpu=True)`` (or ``backend="gpu"``) or
+by setting ``RAY_DATA_GPU_SORT=1`` in the environment; the CPU sort remains the
+default otherwise.
 """
 
 from __future__ import annotations
@@ -140,6 +138,10 @@ def _build_actor_class():
             self.stats = None
             self._mr = None
             self.last_stats: dict = {}
+            # Sorted output blocks (host Arrow) held here until the executor
+            # pulls each one via emit_block(); kept off ray.put so the EXECUTOR,
+            # not this GPU actor, owns the output ObjectRefs.
+            self._out_blocks: dict = {}
 
         # -- one-time per-process device setup ---------------------------- #
         def setup_worker(self, root_address_bytes: bytes) -> None:
@@ -207,7 +209,13 @@ def _build_actor_class():
             self.col_names = list(df.columns)
             n = len(df)
             stride = max(1, n // max(1, sample_size))
-            sample = df[key_cols].iloc[::stride].to_arrow()
+            # reset_index(drop=True): a strided ``iloc[::stride]`` leaves a
+            # non-range cuDF index that ``to_arrow()`` would serialize as an
+            # extra ``index`` column. Ranks with different strides (uneven row
+            # counts) would then emit samples with mismatched schemas and the
+            # driver's ``pa.concat_tables(samples)`` would fail. Dropping the
+            # index keeps every rank's sample exactly ``key_cols``.
+            sample = df[key_cols].iloc[::stride].reset_index(drop=True).to_arrow()
             cp.cuda.runtime.deviceSynchronize()
             return sample, n, time.perf_counter() - t0
 
@@ -330,7 +338,14 @@ def _build_actor_class():
             cp.cuda.runtime.deviceSynchronize()
             ts3 = time.perf_counter()
 
-            # ---- D2H: sorted cuDF -> Arrow back in the object store ----
+            # ---- D2H: sorted cuDF -> Arrow, held on the actor ----
+            # Crucially we do NOT ``ray.put`` here: that would make this GPU
+            # actor the *owner* of the output blocks, so the actor could not be
+            # torn down (to free its GPU) without invalidating them
+            # (OwnerDiedError). Instead each block is returned later by
+            # emit_block() as a task RESULT, so the executor (the caller) owns
+            # it -- the Ray-native ownership for an all-to-all op.
+            self._out_blocks = {}
             for pid in sorted(sorted_dfs):
                 df = sorted_dfs[pid]
                 tbl = df.to_arrow()
@@ -338,11 +353,10 @@ def _build_actor_class():
                 # (e.g. an all-null string partition -> proper `string` type).
                 if self.schema_in is not None and not tbl.schema.equals(self.schema_in):
                     tbl = tbl.cast(self.schema_in)
-                ref = ray.put(tbl)
                 meta = BlockAccessor.for_block(tbl).get_metadata()
+                self._out_blocks[int(pid)] = tbl
                 out_meta.append({
                     "pid": int(pid),
-                    "ref": ref,
                     "meta": meta,
                     "nrows": int(len(df)),
                 })
@@ -365,11 +379,23 @@ def _build_actor_class():
             self.last_stats = stats
             return out_meta, schema, stats
 
+        def emit_block(self, pid: int):
+            """Return the sorted output block for ``pid`` as this task's return
+            value, so the *caller* (the executor running the sort transform fn)
+            becomes the owner of the resulting ObjectRef. The bytes live in this
+            node's object store and survive this actor being torn down -- which
+            is what lets the sort release its GPUs while the sorted dataset stays
+            valid. The block is dropped from the actor once emitted to free host
+            memory.
+            """
+            return self._out_blocks.pop(int(pid))
+
         def get_last_stats(self) -> dict:
             return self.last_stats
 
         def release(self) -> None:
             self.df = None
+            self._out_blocks = {}
 
     return _GeneralGpuSorter
 
@@ -415,6 +441,28 @@ def kill_actor_pool(num_gpus: int) -> None:
             ray.kill(ray.get_actor(name, namespace="rmpf_gpu_sort"))
         except Exception:
             pass
+
+
+def release_gpu_sort_pool(num_gpus: int, timeout_s: float = 30.0) -> bool:
+    """Tear down the detached GPU sorter actors and wait (bounded) for their
+    GPUs to be reclaimed, so a downstream op can use them.
+
+    This is only safe once the sort's output blocks have been emitted as task
+    results (the executor owns them; the bytes live in node-local plasma and
+    survive the actors going away). Returns ``True`` if the GPUs came back
+    within ``timeout_s``.
+    """
+    before = ray.available_resources().get("GPU", 0.0)
+    kill_actor_pool(num_gpus)
+    # Killing is async: the raylet reclaims the GPUs once the actor processes
+    # actually exit. Poll until availability rises by ~num_gpus (the pool size).
+    target = before + num_gpus - 0.5
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if ray.available_resources().get("GPU", 0.0) >= target:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -480,26 +528,38 @@ def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: int = 16):
         )
         t3 = time.perf_counter()
 
-        # Collect (pid, ref, meta) from all ranks; output blocks ordered by
+        # Collect (rank, pid, meta) from all ranks; output blocks ordered by
         # partition id == global key-range order -> concatenation is sorted.
         entries = []
         schema_out = None
-        for out_meta, schema, _stats in part_res:
+        for rank, (out_meta, schema, _stats) in enumerate(part_res):
             schema_out = schema_out or schema
-            entries.extend(out_meta)
+            for m in out_meta:
+                entries.append({"rank": rank, **m})
         entries.sort(key=lambda e: e["pid"])
+
+        # Pull each sorted block out of its producing GPU actor as a task
+        # RESULT, so the EXECUTOR (this process, the caller) owns the resulting
+        # ObjectRef -- not the GPU actor. The bytes live in node-local plasma and
+        # survive the actor being torn down, exactly like a normal Ray Data task
+        # output. ``ray.wait`` (without fetching the bytes here) ensures every
+        # block is materialized before the caller may release the GPU actors.
+        block_refs = [actors[e["rank"]].emit_block.remote(e["pid"]) for e in entries]
+        if block_refs:
+            ray.wait(block_refs, num_returns=len(block_refs), fetch_local=False)
+        t4 = time.perf_counter()
 
         out = []
         stats_list = []
         rows_out = 0
         block_rows = []
-        for e in entries:
+        for e, block_ref in zip(entries, block_refs):
             stats_list.append(e["meta"].to_stats())
             rows_out += e["nrows"]
             block_rows.append(e["nrows"])
             out.append(
                 RefBundle(
-                    [(e["ref"], e["meta"])], owns_blocks=True, schema=schema_out
+                    [(block_ref, e["meta"])], owns_blocks=True, schema=schema_out
                 )
             )
 
@@ -517,14 +577,25 @@ def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: int = 16):
             "final_sort_s": _max("final_sort_s"),
             "gpu_only_s": _max("gpu_only_s"),
             "d2h_s": _max("d2h_s"),
-            "full_s": t3 - t0,            # RAM->VRAM->sort->VRAM->RAM
-            "wall_fn_s": t3 - t0,
+            "emit_s": t4 - t3,            # pull blocks to the executor + ray.wait
+            "full_s": t4 - t0,            # RAM->VRAM->sort->VRAM->RAM (+emit)
+            "wall_fn_s": t4 - t0,
             "rows_in": in_rows,
             "rows_out": rows_out,
             "num_output_blocks": len(out),
             "block_rows": block_rows,
             "num_gpus": n,
         })
+
+        # Opt-in: release the GPU sorter actors now so a downstream GPU op
+        # (e.g. an encoder) can use all the GPUs. Safe because the output
+        # blocks were emitted as task results above and ray.wait confirmed they
+        # are materialized -- they are owned by the executor, not these actors,
+        # so they survive the teardown. Default OFF preserves the across-trials
+        # pool reuse the sort microbenchmark relies on.
+        if os.environ.get("RAY_DATA_GPU_SORT_RELEASE") == "1":
+            release_gpu_sort_pool(n)
+
         return out, {"GPUSortGeneral": stats_list}
 
     return fn

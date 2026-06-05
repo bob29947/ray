@@ -157,8 +157,8 @@ def run_worker(backend, rows, cols, blocks, trials, gpus):
 
     # release the GPUs promptly (also happens on process exit)
     try:
-        from ray.data._internal.planner.gpu_sort import _SORTER_NAME
-        ray.kill(ray.get_actor(_SORTER_NAME))
+        from ray.data._internal.planner.gpu_sort_general import kill_actor_pool
+        kill_actor_pool(gpus)
     except Exception:
         pass
     ray.shutdown()

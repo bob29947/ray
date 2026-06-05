@@ -72,13 +72,15 @@ class TestResolveGpuImpl:
         monkeypatch.setenv("RAY_DATA_GPU_SORT_IMPL", "general")
         assert _resolve_gpu_impl(False) is None
 
-    def test_flag_true_honors_impl_env(self, monkeypatch):
+    def test_flag_true_always_general(self, monkeypatch):
+        # The tuned int32 engine was removed; gpu=True always selects the
+        # general engine, ignoring any stale RAY_DATA_GPU_SORT_IMPL value.
         monkeypatch.setenv("RAY_DATA_GPU_SORT_IMPL", "tuned")
-        assert _resolve_gpu_impl(True) == "tuned"
+        assert _resolve_gpu_impl(True) == "general"
 
-    def test_legacy_env_on_defaults_to_tuned(self, monkeypatch):
+    def test_legacy_env_on_selects_general(self, monkeypatch):
         monkeypatch.setenv("RAY_DATA_GPU_SORT", "1")
-        assert _resolve_gpu_impl(None) == "tuned"
+        assert _resolve_gpu_impl(None) == "general"
 
     def test_impl_env_alone_selects_backend(self, monkeypatch):
         monkeypatch.setenv("RAY_DATA_GPU_SORT_IMPL", "general")
@@ -312,6 +314,65 @@ def test_matches_ray_cpu_sort_order(ray_cluster):
     cpu = [r["c0"] for r in ray.data.from_arrow(blocks).sort("c0").take_all()]
     gpu = [r["c0"] for r in ray.data.from_arrow(blocks).sort("c0", gpu=True).take_all()]
     assert gpu == cpu
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2b: GPU release -- the sort frees its GPUs after sorting, and the
+# executor-owned output blocks survive the actor-pool teardown.
+# --------------------------------------------------------------------------- #
+@requires_gpu
+def test_release_frees_gpus_and_output_survives(ray_cluster, monkeypatch):
+    import time
+
+    # With RAY_DATA_GPU_SORT_RELEASE=1 the sort tears down its GPU actor pool
+    # after sorting. The output blocks are emitted as task results (owned by the
+    # executor, not the GPU actors), so they stay readable, and the GPUs are
+    # returned for a downstream op.
+    monkeypatch.setenv("RAY_DATA_GPU_SORT_RELEASE", "1")
+    rng = np.random.default_rng(11)
+    n = 1_000_000
+    tbl = pa.table(
+        {
+            "c0": rng.integers(0, 2**31 - 1, n, dtype=np.int64),
+            "id": np.arange(n, dtype=np.int64),
+        }
+    )
+    # NGPU + 1 blocks -> uneven per-rank row counts (also regression-tests the
+    # mixed-stride key-sample schema fix).
+    parts = NGPU + 1
+    blocks = [tbl.slice(i * (n // parts), n // parts) for i in range(parts)]
+    out = ray.data.from_arrow(blocks).sort("c0", gpu=True).materialize()
+
+    # GPUs came back (the sort pool was released).
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if ray.available_resources().get("GPU", 0) >= NGPU - 0.5:
+            break
+        time.sleep(0.2)
+    assert ray.available_resources().get("GPU", 0) >= NGPU - 0.5
+
+    # The sorted output is still fully readable after the pool is gone, and is
+    # globally sorted with every input row preserved.
+    got = [r["c0"] for r in out.take_all()]
+    assert got == sorted(got)
+    assert len(got) == sum(b.num_rows for b in blocks)
+
+
+@requires_gpu
+def test_two_sequential_sorts_with_release(ray_cluster, monkeypatch):
+    # Releasing the pool after each sort must not break a later sort: the pool
+    # is transparently re-created (get_if_exists) on the next call.
+    monkeypatch.setenv("RAY_DATA_GPU_SORT_RELEASE", "1")
+    rng = np.random.default_rng(12)
+    for _ in range(2):
+        n = 300_000
+        tbl = pa.table({"c0": rng.integers(0, 2**31 - 1, n, dtype=np.int64)})
+        blocks = [tbl.slice(i * (n // NGPU), n // NGPU) for i in range(NGPU)]
+        got = [
+            r["c0"]
+            for r in ray.data.from_arrow(blocks).sort("c0", gpu=True).take_all()
+        ]
+        assert got == sorted(got)
 
 
 if __name__ == "__main__":
