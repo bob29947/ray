@@ -37,6 +37,7 @@ default otherwise.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,8 @@ from typing import Dict, List, Optional, Tuple
 import ray
 from ray.data._internal.execution.interfaces import RefBundle, TaskContext
 from ray.data.block import BlockAccessor
+
+logger = logging.getLogger(__name__)
 
 # Populated on the driver after each general GPU sort so a benchmark/driver can
 # read the detailed phase timings and the on-GPU correctness summary (mirrors
@@ -61,6 +64,90 @@ _OP_COUNTER = [0]
 
 def actor_names(num_gpus: int) -> List[str]:
     return [f"{_ACTOR_PREFIX}{i}" for i in range(num_gpus)]
+
+
+# --------------------------------------------------------------------------- #
+# Cluster topology + resolution helpers
+#
+# These let the sort adapt to a multi-node cluster instead of the original
+# single-DGX-2 assumptions: the rank count is derived from the cluster's GPU
+# total (not hardcoded to 16), and device->host spill is gated on topology so a
+# single node keeps the in-VRAM fast path while a multi-node run is OOM-safe.
+# --------------------------------------------------------------------------- #
+def _cluster_gpu_count() -> int:
+    """Total number of GPUs visible in the cluster (best-effort, 0 if unknown)."""
+    try:
+        from ray.data._internal.execution.operators.hash_shuffle import (
+            _get_total_cluster_resources,
+        )
+
+        return int(_get_total_cluster_resources().gpu or 0)
+    except Exception:
+        try:
+            return int(ray.cluster_resources().get("GPU", 0))
+        except Exception:
+            return 0
+
+
+def _cluster_node_count() -> int:
+    """Number of alive nodes exposing GPU resources (best-effort, >=1)."""
+    try:
+        nodes = [
+            n
+            for n in ray.nodes()
+            if n.get("Alive", False)
+            and float(n.get("Resources", {}).get("GPU", 0)) > 0
+        ]
+        return max(1, len(nodes))
+    except Exception:
+        return 1
+
+
+def resolve_num_gpus() -> int:
+    """Resolve the number of one-GPU sort ranks to use.
+
+    Precedence: ``RAY_DATA_GPU_SORT_NUM_GPUS`` (explicit override) else the
+    cluster's total GPU count. Every rank must join the shuffle, so requesting
+    more ranks than the cluster has GPUs would hang forever -- we raise instead.
+    """
+    cluster = _cluster_gpu_count()
+    env = os.environ.get("RAY_DATA_GPU_SORT_NUM_GPUS")
+    if env is not None:
+        want = max(1, int(env))
+    else:
+        want = max(1, cluster)
+    if cluster > 0 and want > cluster:
+        raise ValueError(
+            f"GPU sort requested {want} rank(s) but the cluster only exposes "
+            f"{cluster} GPU(s). Lower RAY_DATA_GPU_SORT_NUM_GPUS (or unset it to "
+            f"auto-detect) or add GPUs to the cluster."
+        )
+    return want
+
+
+# Default device-memory limit (as a fraction of total VRAM) when spill is
+# auto-enabled on a multi-node cluster. Mirrors the gpu_shuffle backend's
+# ``"auto"`` (spill once device use approaches the pool cap).
+_AUTO_SPILL_FRAC = 0.80
+_SPILL_OFF_TOKENS = {"", "none", "off", "0", "disable", "disabled", "false", "no"}
+
+
+def _resolve_spill_frac() -> Optional[float]:
+    """Topology-gated device->host spill threshold (fraction of VRAM).
+
+    Returns ``None`` to disable spilling. Precedence:
+      * ``RAY_DATA_GPU_SORT_SPILL_FRAC`` set -> explicit (a recognized "off"
+        token disables; otherwise the float is used), regardless of topology.
+      * unset -> spill OFF on a single node (preserve the in-VRAM fast path that
+        the DGX-2 numbers were measured with), auto-ON across >1 node so a large
+        per-rank share spills to host instead of a hard cudaMalloc OOM.
+    """
+    env = os.environ.get("RAY_DATA_GPU_SORT_SPILL_FRAC")
+    if env is not None:
+        if env.strip().lower() in _SPILL_OFF_TOKENS:
+            return None
+        return float(env)
+    return _AUTO_SPILL_FRAC if _cluster_node_count() > 1 else None
 
 
 def _plc_order_null(ascending, na_position):
@@ -102,6 +189,14 @@ def _plc_order_null(ascending, na_position):
 # tcp       -> bootstrap / control plane (and a last-resort fallback).
 # Without cuda_ipc the shuffle would fall back to host staging and crater
 # toward the ~46 GiB/s PCIe wall instead of the NVLink fabric.
+#
+# Cluster / cross-node note: cuda_ipc and sm are INTRA-NODE only. Across nodes
+# the data falls back to ``tcp`` (correct, but ENA/TCP-bound). To use RDMA on EC2
+# EFA-capable instances, override the transport list, e.g.
+#   RAY_DATA_GPU_SORT_UCX_TLS=cuda_copy,cuda_ipc,sm,rc,ud,tcp   (IB/RoCE verbs)
+# plus the appropriate UCX/libfabric EFA provider env. This is left pluggable but
+# is NOT validated here (requires real EFA hardware); the default keeps the
+# intra-node fast path and a TCP cross-node fallback.
 # --------------------------------------------------------------------------- #
 def _ucx_env() -> Dict[str, str]:
     return {
@@ -124,13 +219,17 @@ def _build_actor_class():
         """Owns ONE GPU; holds its slice of the dataset as a cuDF table and
         cooperates in a rapidsmpf range-partition shuffle + local sort."""
 
-        def __init__(self, nranks: int, index: int):
+        def __init__(self, nranks: int, index: int, spill_frac: Optional[float] = None):
             super().__init__(nranks)
             # Make sure UCX picks NVLink even if the actor's runtime_env didn't
             # carry the vars (defensive; runtime_env is the primary path).
             for k, v in _ucx_env().items():
                 os.environ.setdefault(k, v)
             self.index = index
+            # Topology-gated device->host spill threshold (fraction of VRAM),
+            # resolved on the driver: None disables spilling (single-node fast
+            # path), a float enables it (multi-node OOM-safety).
+            self._spill_frac = spill_frac
             self.df = None
             self.col_names: Optional[List[str]] = None
             self.schema_in = None  # pyarrow schema of the input blocks
@@ -171,7 +270,9 @@ def _build_actor_class():
             )
             rmm.mr.set_current_device_resource(self._mr)
 
-            spill_frac = os.environ.get("RAY_DATA_GPU_SORT_SPILL_FRAC")
+            # Spill is gated on topology by the driver (see _resolve_spill_frac):
+            # off single-node, on across nodes. An explicit env still wins.
+            spill_frac = self._spill_frac
             mem_available = None
             if spill_frac is not None:
                 limit = int(total * float(spill_frac))
@@ -180,6 +281,21 @@ def _build_actor_class():
                 }
             self.stats = Statistics(enable=False, mr=self._mr)
             self.br = BufferResource(self._mr, memory_available=mem_available)
+
+            # One-time, per-rank transport/placement log so cluster runs are
+            # diagnosable (which UCX transports were selected, and where this
+            # rank landed). cuda_ipc/sm are intra-node only; cross-node falls to
+            # tcp unless an RDMA/EFA transport is added via RAY_DATA_GPU_SORT_UCX_TLS.
+            try:
+                logger.info(
+                    "GPU sort rank %d ready on node %s: UCX_TLS=%s spill=%s",
+                    self.index,
+                    ray.util.get_node_ip_address(),
+                    os.environ.get("UCX_TLS"),
+                    "off" if spill_frac is None else f"{spill_frac:g} of VRAM",
+                )
+            except Exception:
+                pass
 
         def is_ready(self) -> bool:
             return self.is_initialized() and self.br is not None
@@ -416,6 +532,9 @@ def _get_actor_pool(num_gpus: int):
     cls = _get_actor_class()
     names = actor_names(num_gpus)
     env = {"env_vars": _ucx_env()}
+    # Topology-gated spill, resolved here on the driver and passed into each
+    # actor (so the actor process doesn't need to re-inspect the cluster).
+    spill_frac = _resolve_spill_frac()
     actors = [
         cls.options(
             name=names[i],
@@ -424,14 +543,34 @@ def _get_actor_pool(num_gpus: int):
             namespace="rmpf_gpu_sort",
             runtime_env=env,
             num_gpus=1,
-        ).remote(num_gpus, i)
+            # SPREAD so single-GPU nodes each get exactly one rank and
+            # multi-GPU nodes pack one rank per GPU -- required for a cluster.
+            scheduling_strategy="SPREAD",
+        ).remote(num_gpus, i, spill_frac)
         for i in range(num_gpus)
     ]
     ready = ray.get([a.is_ready.remote() for a in actors])
     if not all(ready):
-        # Fresh cluster: elect actors[0] as root, connect all workers.
-        _, root_addr = ray.get(actors[0].setup_root.remote())
-        ray.get([a.setup_worker.remote(root_addr) for a in actors])
+        # Fresh cluster: elect actors[0] as root, connect all workers. Bound the
+        # UCXX handshake so a mis-sized cluster / bad network fails loudly
+        # instead of hanging forever.
+        timeout_s = float(os.environ.get("RAY_DATA_GPU_SORT_SETUP_TIMEOUT_S", "120"))
+        try:
+            _, root_addr = ray.get(
+                actors[0].setup_root.remote(), timeout=timeout_s
+            )
+            ray.get(
+                [a.setup_worker.remote(root_addr) for a in actors],
+                timeout=timeout_s,
+            )
+        except ray.exceptions.GetTimeoutError as e:
+            raise TimeoutError(
+                f"GPU sort UCXX setup did not complete within {timeout_s}s "
+                f"across {num_gpus} rank(s). Check that all {num_gpus} GPUs are "
+                f"schedulable, GPU/network health, and UCX transport settings "
+                f"(RAY_DATA_GPU_SORT_UCX_TLS). Set "
+                f"RAY_DATA_GPU_SORT_SETUP_TIMEOUT_S to extend the deadline."
+            ) from e
     return actors
 
 
@@ -468,10 +607,18 @@ def release_gpu_sort_pool(num_gpus: int, timeout_s: float = 30.0) -> bool:
 # --------------------------------------------------------------------------- #
 # Ray Data transform fn (the ds.sort() hook), general backend.
 # --------------------------------------------------------------------------- #
-def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: int = 16):
+def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: Optional[int] = None):
     """Return an AllToAllTransformFn that sorts all input blocks across GPUs
-    using cuDF (columnar) + a rapidsmpf range-partition shuffle."""
+    using cuDF (columnar) + a rapidsmpf range-partition shuffle.
+
+    ``num_gpus`` is the number of one-GPU ranks. When ``None`` it is derived
+    from the cluster's GPU total (see :func:`resolve_num_gpus`) so the sort
+    scales from a single DGX-2 to a multi-node cluster without a hardcoded count.
+    """
     import pyarrow as pa
+
+    if num_gpus is None:
+        num_gpus = resolve_num_gpus()
 
     key_cols = list(sort_key.get_columns())
     descending = list(sort_key.get_descending())

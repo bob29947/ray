@@ -58,15 +58,15 @@ def generate_sort_fn(
     ``backend="gpu"``. It selects an experimental end-to-end multi-GPU sort
     (cuDF + rapidsmpf); the CPU sort remains the default when ``gpu`` is unset.
     """
-    import os
-
     if _resolve_gpu_impl(gpu) is not None:
-        num_gpus = int(os.environ.get("RAY_DATA_GPU_SORT_NUM_GPUS", "16"))
         from ray.data._internal.planner.gpu_sort_general import (
             generate_gpu_sort_general_fn,
         )
 
-        return generate_gpu_sort_general_fn(sort_key, data_context, num_gpus=num_gpus)
+        # num_gpus is derived from the cluster's GPU total inside the backend
+        # (RAY_DATA_GPU_SORT_NUM_GPUS overrides). Avoids the old hardcoded 16,
+        # which would hang on a cluster with fewer GPUs.
+        return generate_gpu_sort_general_fn(sort_key, data_context)
 
     def fn(
         sort_key: SortKey,

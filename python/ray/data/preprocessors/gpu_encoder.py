@@ -8,6 +8,8 @@ encoders remain the default; you opt in by using the ``Gpu*`` class explicitly.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Callable, Dict, List
 
 from ray.data.preprocessors.encoder import OrdinalEncoder
@@ -18,6 +20,15 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from ray.data.dataset import Dataset
+
+logger = logging.getLogger(__name__)
+
+# Soft guardrail: the fitted vocabulary is replicated as a cuDF categorical on
+# *every* GPU rank (see ``_make_build_state``), so a very large cardinality can
+# OOM each GPU and bloat the driver-side merge. We warn past this many distinct
+# categories (override with ``RAY_DATA_GPU_PREPROC_MAX_VOCAB_WARN``); the encode
+# still proceeds. A future device-side / sharded-broadcast path would lift this.
+_DEFAULT_MAX_VOCAB_WARN = 5_000_000
 
 
 def _make_build_state(
@@ -145,7 +156,34 @@ class GpuOrdinalEncoder(OrdinalEncoder):
             sorted_values = pc.take(values, pc.sort_indices(values))
             codes = pa.array(range(len(sorted_values)), type=pa.int64())
             self.stats_[f"unique_values({col})"] = (sorted_values, codes)
+            self._warn_if_vocab_large(col, len(sorted_values))
         return self
+
+    @staticmethod
+    def _warn_if_vocab_large(column: str, n_categories: int) -> None:
+        """Warn when a column's vocabulary is large enough to risk per-GPU OOM.
+
+        The vocabulary is broadcast to and materialized as a categorical on every
+        GPU rank, so cardinality (not row count) is the scaling limit here.
+        """
+        try:
+            threshold = int(
+                os.environ.get(
+                    "RAY_DATA_GPU_PREPROC_MAX_VOCAB_WARN",
+                    _DEFAULT_MAX_VOCAB_WARN,
+                )
+            )
+        except (TypeError, ValueError):
+            threshold = _DEFAULT_MAX_VOCAB_WARN
+        if n_categories > threshold:
+            logger.warning(
+                "GpuOrdinalEncoder: column %r has %d distinct categories, which "
+                "is replicated on every GPU rank and merged on the driver; this "
+                "may OOM at high cardinality. Consider hash encoding, or raise "
+                "RAY_DATA_GPU_PREPROC_MAX_VOCAB_WARN to silence.",
+                column,
+                n_categories,
+            )
 
     def _transform(
         self,

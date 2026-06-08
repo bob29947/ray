@@ -56,8 +56,25 @@ def record_phase(name: str):
 
 
 def env_num_gpus(default: int = 1) -> int:
-    """Number of one-GPU workers to use (``RAY_DATA_GPU_PREPROC_NUM_GPUS``)."""
-    return int(os.environ.get("RAY_DATA_GPU_PREPROC_NUM_GPUS", default))
+    """Number of one-GPU workers to use for the GPU preprocessors.
+
+    ``RAY_DATA_GPU_PREPROC_NUM_GPUS`` is an explicit override. When unset, the
+    concurrency defaults to the cluster's total GPU count so the preprocessors
+    scale across a multi-node cluster instead of pinning to a single GPU (the
+    old default of 1). Falls back to ``default`` if the cluster size is unknown.
+    """
+    env = os.environ.get("RAY_DATA_GPU_PREPROC_NUM_GPUS")
+    if env is not None:
+        return max(1, int(env))
+    try:
+        import ray
+
+        gpus = int(ray.cluster_resources().get("GPU", 0))
+        if gpus > 0:
+            return gpus
+    except Exception:
+        pass
+    return default
 
 
 def env_batch_size(default: int = 1 << 20) -> int:
