@@ -39,21 +39,117 @@ if TYPE_CHECKING:
 
     from ray.data.dataset import Dataset
 
-# Populated on the driver after each GPU fit/transform so a benchmark or driver
-# can read detailed phase timings without instrumenting the operator itself
-# (mirrors ``gpu_sort_general.LAST_RUN_STATS``).
+# Populated on the driver (via :func:`collect_phase_stats`) after a profiled GPU
+# transform so a benchmark can read the H2D / compute / D2H split that the
+# device-resident projection needs (mirrors ``gpu_sort_general.LAST_RUN_STATS``).
 LAST_RUN_STATS: Dict[str, Any] = {}
+
+# Per-batch phase profiling is OFF by default (zero overhead on the normal,
+# headline-timed path). Turn it on with ``RAY_DATA_GPU_PREPROC_PROFILE=1`` to
+# measure the transfer-vs-compute split: worker processes device-synchronize and
+# accumulate per-phase wall into ``_PHASE_ACCUM``, and :class:`_GpuBatchActor`
+# pushes per-batch deltas to a tiny detached actor the driver reads.
+_PHASE_ACCUM: Dict[str, float] = {}
+_PHASE_STATS_NAMESPACE = "ray_data_gpu_preproc"
+_PHASE_STATS_ACTOR_NAME = "__gpu_preproc_phase_stats__"
+
+
+def profile_enabled() -> bool:
+    return os.environ.get("RAY_DATA_GPU_PREPROC_PROFILE", "0") == "1"
 
 
 @contextmanager
 def record_phase(name: str):
-    """Accumulate wall time for ``name`` into :data:`LAST_RUN_STATS`."""
+    """Accumulate device-synchronized wall time for ``name`` into the worker's
+    process-global phase accumulator. A no-op (pure pass-through, no CUDA sync)
+    unless ``RAY_DATA_GPU_PREPROC_PROFILE=1`` -- so the normal transform path is
+    untouched and only an explicit profiling pass pays the synchronize cost."""
+    if not profile_enabled():
+        yield
+        return
+    import cupy as cp
+
+    cp.cuda.runtime.deviceSynchronize()
     start = time.perf_counter()
     try:
         yield
     finally:
-        phases = LAST_RUN_STATS.setdefault("phases", {})
-        phases[name] = phases.get(name, 0.0) + (time.perf_counter() - start)
+        cp.cuda.runtime.deviceSynchronize()
+        _PHASE_ACCUM[name] = _PHASE_ACCUM.get(name, 0.0) + (
+            time.perf_counter() - start
+        )
+
+
+def _get_phase_stats_actor():
+    """Get-or-create the detached actor that aggregates per-batch phase deltas
+    from every GPU worker (so the driver can read one combined snapshot)."""
+    import ray
+
+    @ray.remote(num_cpus=0)
+    class _PreprocPhaseStats:
+        def __init__(self) -> None:
+            self._acc: Dict[str, float] = {}
+            self._batches = 0
+
+        def add(self, delta: Dict[str, float], nbatches: int = 0) -> None:
+            for k, v in delta.items():
+                self._acc[k] = self._acc.get(k, 0.0) + v
+            self._batches += nbatches
+
+        def snapshot(self) -> Dict[str, Any]:
+            return {"phases": dict(self._acc), "batches": self._batches}
+
+        def reset(self) -> None:
+            self._acc = {}
+            self._batches = 0
+
+    return _PreprocPhaseStats.options(
+        name=_PHASE_STATS_ACTOR_NAME,
+        namespace=_PHASE_STATS_NAMESPACE,
+        get_if_exists=True,
+        lifetime="detached",
+    ).remote()
+
+
+def reset_phase_stats() -> None:
+    """Driver-side: clear the detached phase accumulator before a profiled pass."""
+    if not profile_enabled():
+        return
+    try:
+        import ray
+
+        ray.get(_get_phase_stats_actor().reset.remote())
+    except Exception:
+        pass
+
+
+def collect_phase_stats() -> Dict[str, Any]:
+    """Driver-side: pull the aggregated worker phase stats into LAST_RUN_STATS
+    and return them (``{"phases": {h2d, compute, d2h}, "batches": N}``)."""
+    if not profile_enabled():
+        return {}
+    try:
+        import ray
+
+        snap = ray.get(_get_phase_stats_actor().snapshot.remote())
+        LAST_RUN_STATS.clear()
+        LAST_RUN_STATS.update(snap)
+        return snap
+    except Exception:
+        return {}
+
+
+def kill_phase_stats_actor() -> None:
+    try:
+        import ray
+
+        ray.kill(
+            ray.get_actor(
+                _PHASE_STATS_ACTOR_NAME, namespace=_PHASE_STATS_NAMESPACE
+            )
+        )
+    except Exception:
+        pass
 
 
 def env_num_gpus(default: int = 1) -> int:
@@ -151,9 +247,27 @@ class _GpuBatchActor:
 
         self._apply = apply_fn
         self._state = build_state()
+        # Per-batch phase profiling (opt-in). When on, push the delta of this
+        # worker's phase accumulator after each batch to the detached stats
+        # actor (fire-and-forget, so it never blocks the transform).
+        self._profile = profile_enabled()
+        self._stats_actor = _get_phase_stats_actor() if self._profile else None
+        self._last_accum: Dict[str, float] = {}
 
     def __call__(self, batch: "pa.Table") -> "pa.Table":
-        return self._apply(self._state, batch)
+        out = self._apply(self._state, batch)
+        if self._profile and self._stats_actor is not None:
+            delta = {
+                k: _PHASE_ACCUM.get(k, 0.0) - self._last_accum.get(k, 0.0)
+                for k in _PHASE_ACCUM
+            }
+            self._last_accum = dict(_PHASE_ACCUM)
+            if any(v for v in delta.values()):
+                try:
+                    self._stats_actor.add.remote(delta, 1)
+                except Exception:
+                    pass
+        return out
 
 
 def gpu_transform(

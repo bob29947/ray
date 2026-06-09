@@ -261,6 +261,11 @@ def _build_actor_class():
             frac_max = float(os.environ.get("RAY_DATA_GPU_SORT_POOL_FRAC", "0.80"))
             pool_max = (int(total * frac_max) // 256) * 256
             pool_init = (int(total * 0.5) // 256) * 256
+            # Remember the device total + pool cap so mem_stats()/the per-sort
+            # stats can report headroom (peak vs cap vs total) for the memory-
+            # pressure analysis -- this is the biggest dataset we sort.
+            self._total_vram = int(total)
+            self._pool_max = int(pool_max)
             self._mr = RmmResourceAdaptor(
                 rmm.mr.PoolMemoryResource(
                     rmm.mr.CudaMemoryResource(),
@@ -379,6 +384,12 @@ def _build_actor_class():
                 pylibcudf_to_cudf_dataframe,
             )
 
+            # Device bytes currently resident before any sort work == this
+            # rank's H2D-loaded input partition (the "per-rank partition size").
+            resident_bytes = (
+                int(self._mr.current_allocated) if self._mr is not None else 0
+            )
+
             nranks = self.nranks()
             names = self.col_names
             key_idx = [names.index(k) for k in key_cols]
@@ -484,6 +495,16 @@ def _build_actor_class():
                 # Canonical (input) schema -- all output blocks are cast to it.
                 schema = BlockAccessor.for_block(self.schema_in.empty_table()).schema()
 
+            # Per-rank memory-pressure snapshot. ``peak_vram_bytes`` is the RMM
+            # adaptor's lifetime high-water mark (resets only when the actor /
+            # pool is recreated), so across reused trials it is the worst-case
+            # peak -- the conservative number to report for "did it fit?".
+            peak_bytes = (
+                int(self._mr.get_main_record().peak()) if self._mr is not None else 0
+            )
+            cur_bytes = (
+                int(self._mr.current_allocated) if self._mr is not None else 0
+            )
             stats = {
                 "local_sort_s": ts1 - ts0,
                 "shuffle_s": ts2 - ts1,
@@ -491,6 +512,13 @@ def _build_actor_class():
                 "gpu_only_s": ts3 - ts0,   # VRAM->sorted-VRAM (excl. final D2H)
                 "d2h_s": ts4 - ts3,
                 "rows_out": sum(m["nrows"] for m in out_meta),
+                "rows_in_rank": int(n_rows),
+                "resident_bytes": resident_bytes,
+                "peak_vram_bytes": peak_bytes,
+                "current_vram_bytes": cur_bytes,
+                "pool_max_bytes": int(getattr(self, "_pool_max", 0)),
+                "total_vram_bytes": int(getattr(self, "_total_vram", 0)),
+                "spill_frac": self._spill_frac,
             }
             self.last_stats = stats
             return out_meta, schema, stats
@@ -508,6 +536,26 @@ def _build_actor_class():
 
         def get_last_stats(self) -> dict:
             return self.last_stats
+
+        def mem_stats(self) -> dict:
+            """Current device-memory snapshot for this rank (peak/current vs the
+            RMM pool cap and the device total), plus the resolved spill setting.
+            Used by the benchmark to report per-rank VRAM pressure / headroom and
+            whether device spill is even enabled. Safe to call any time after
+            ``setup_worker``; ``get_main_record().peak()`` is the lifetime
+            high-water mark."""
+            if self._mr is None:
+                return {"index": self.index, "ready": False}
+            rec = self._mr.get_main_record()
+            return {
+                "index": self.index,
+                "ready": True,
+                "peak_vram_bytes": int(rec.peak()),
+                "current_vram_bytes": int(self._mr.current_allocated),
+                "pool_max_bytes": int(getattr(self, "_pool_max", 0)),
+                "total_vram_bytes": int(getattr(self, "_total_vram", 0)),
+                "spill_frac": self._spill_frac,
+            }
 
         def release(self) -> None:
             self.df = None
@@ -715,6 +763,16 @@ def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: Optional[int]
         def _max(key):
             return max(s[key] for _, _, s in part_res)
 
+        def _collect(key):
+            return [s.get(key) for _, _, s in part_res]
+
+        def _first(key, default=None):
+            for _, _, s in part_res:
+                if key in s:
+                    return s[key]
+            return default
+
+        peak_list = [p for p in _collect("peak_vram_bytes") if p is not None]
         LAST_RUN_STATS.clear()
         LAST_RUN_STATS.update({
             "h2d_s": h2d_s,
@@ -732,6 +790,17 @@ def generate_gpu_sort_general_fn(sort_key, data_context, num_gpus: Optional[int]
             "num_output_blocks": len(out),
             "block_rows": block_rows,
             "num_gpus": n,
+            # Memory-pressure snapshot (per-rank + aggregate), so a driver/bench
+            # can report whether the per-rank partition fit in VRAM and the
+            # headroom vs the RMM pool cap -- no extra ray.get of the actors,
+            # these ride back on the sort_partition result before any release.
+            "peak_vram_bytes_per_rank": _collect("peak_vram_bytes"),
+            "peak_vram_bytes_max": max(peak_list, default=0),
+            "resident_bytes_per_rank": _collect("resident_bytes"),
+            "rows_in_per_rank": _collect("rows_in_rank"),
+            "pool_max_bytes": _first("pool_max_bytes", 0),
+            "total_vram_bytes": _first("total_vram_bytes", 0),
+            "spill_frac": _first("spill_frac", None),
         })
 
         # Opt-in: release the GPU sorter actors now so a downstream GPU op

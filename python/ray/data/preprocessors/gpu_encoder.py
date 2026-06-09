@@ -56,29 +56,37 @@ def _make_apply(
     def apply(dtypes: Dict, batch: "pa.Table") -> "pa.Table":
         import cudf
 
-        from ray.data.preprocessors._gpu import attach_arrow_columns
+        from ray.data.preprocessors._gpu import attach_arrow_columns, record_phase
 
         # Move only the input columns across the bus (payload columns stay host).
-        gdf = cudf.DataFrame.from_arrow(batch.select(columns))
-        new_columns = {}
-        for input_col, output_col in zip(columns, output_columns):
-            series = gdf[input_col]
-            # Match the CPU encoder: null *inputs* raise; unseen (non-null)
-            # categories map to null (-> NaN in pandas), via cat.codes == -1.
-            if series.null_count:
-                raise ValueError(
-                    f"Unable to transform column {input_col!r} because it "
-                    "contains null values. Consider imputing missing values "
-                    "first."
+        # The three phases (H2D / compute / D2H) are wrapped in record_phase so
+        # an opt-in profiling pass can report the transfer-vs-compute split; with
+        # profiling off these are pure pass-throughs (no behavior change).
+        with record_phase("h2d"):
+            gdf = cudf.DataFrame.from_arrow(batch.select(columns))
+        codes_by_col = {}
+        with record_phase("compute"):
+            for input_col, output_col in zip(columns, output_columns):
+                series = gdf[input_col]
+                # Match the CPU encoder: null *inputs* raise; unseen (non-null)
+                # categories map to null (-> NaN in pandas), via cat.codes == -1.
+                if series.null_count:
+                    raise ValueError(
+                        f"Unable to transform column {input_col!r} because it "
+                        "contains null values. Consider imputing missing values "
+                        "first."
+                    )
+                dtype = dtypes[input_col]
+                n_categories = len(dtype.categories)
+                codes = series.astype(dtype).cat.codes.astype("int64")
+                # Unseen categories map to a sentinel that cuDF stores in an
+                # unsigned code type (so -1 reads back as e.g. 255). Mask anything
+                # outside the valid code range to null -> NaN (CPU-encoder parity).
+                codes_by_col[output_col] = codes.mask(
+                    (codes < 0) | (codes >= n_categories)
                 )
-            dtype = dtypes[input_col]
-            n_categories = len(dtype.categories)
-            codes = series.astype(dtype).cat.codes.astype("int64")
-            # Unseen categories map to a sentinel that cuDF stores in an unsigned
-            # code type (so -1 reads back as e.g. 255). Mask anything outside the
-            # valid code range to null -> NaN, matching the CPU encoder.
-            codes = codes.mask((codes < 0) | (codes >= n_categories))
-            new_columns[output_col] = codes.to_arrow()
+        with record_phase("d2h"):
+            new_columns = {k: v.to_arrow() for k, v in codes_by_col.items()}
         return attach_arrow_columns(batch, new_columns)
 
     return apply
