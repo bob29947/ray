@@ -1,0 +1,8 @@
+# Extra dependencies for the real-data GPU preprocessor benchmark
+# (gpu_preproc_bench/bench_imputer_yambda.py + yambda.py).
+#
+# The Ray fork itself does NOT depend on these; they are only used to download
+# and read the yandex/yambda parquet files from the Hugging Face Hub. The
+# loader uses huggingface_hub + ray.data.read_parquet (no `datasets`).
+huggingface_hub
+hf_xet

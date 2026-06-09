@@ -28,6 +28,7 @@ never requires cuDF/CUDA on a CPU-only install.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -225,6 +226,97 @@ def gpu_sum_count(
             totals[col][0] += float(sum(data[f"{col}|sum"]))
             totals[col][1] += int(sum(data[f"{col}|cnt"]))
     return {col: (totals[col][0], totals[col][1]) for col in columns}
+
+
+def gpu_mean_std(
+    ds: "Dataset",
+    columns: List[str],
+    *,
+    ddof: int = 0,
+    batch_size: Optional[int] = None,
+    concurrency: Optional[int] = None,
+) -> Dict[str, "tuple"]:
+    """Global per-column ``(mean, std)`` over non-null values, computed on GPU.
+
+    Each block emits a tiny ``[M2, mean, count]`` partial per column (the cuDF
+    block mean and the sum of squared deviations from it); the partials are
+    merged on the driver with the **same parallel/Welford algorithm** as the CPU
+    :class:`~ray.data.aggregate.Std` aggregator, so the result matches the CPU
+    ``Mean`` / ``Std(ddof=ddof)`` path. With ``ddof=0`` this is the population
+    standard deviation -- exactly what :class:`StandardScaler` fits.
+
+    Returns ``{column: (mean, std)}``. A column with no non-null values yields
+    ``(nan, nan)``, and ``std`` is ``nan`` whenever ``count - ddof <= 0`` (this
+    mirrors ``Mean`` / ``Std`` ``finalize``).
+    """
+    bs = batch_size if batch_size is not None else env_batch_size()
+    conc = concurrency if concurrency is not None else env_num_gpus()
+
+    def per_block(batch: "pa.Table") -> Dict[str, "Any"]:
+        import cudf
+        import numpy as np
+
+        gdf = cudf.DataFrame.from_arrow(batch.select(columns))
+        out: Dict[str, Any] = {}
+        for col in columns:
+            series = gdf[col]
+            count = int(series.count())
+            if count:
+                mean = float(series.mean())
+                # Sum of squared deviations from the block mean (= var_pop * N).
+                # This is the numerically stable per-block form the parallel
+                # merge below expects (mirrors CPU sum_of_squared_diffs_from_mean).
+                m2 = float(((series - mean) ** 2).sum())
+            else:
+                mean = 0.0
+                m2 = 0.0
+            out[f"{col}|m2"] = np.array([m2], dtype="float64")
+            out[f"{col}|mean"] = np.array([mean], dtype="float64")
+            out[f"{col}|cnt"] = np.array([count], dtype="int64")
+        return out
+
+    partials = ds.map_batches(
+        per_block,
+        batch_format="pyarrow",
+        zero_copy_batch=True,
+        num_gpus=1,
+        batch_size=bs,
+        concurrency=conc,
+    )
+
+    # Driver-side parallel merge of the per-block [M2, mean, count] accumulators.
+    acc: Dict[str, list] = {col: [0.0, 0.0, 0] for col in columns}
+    for block in partials.iter_batches(batch_format="pyarrow", batch_size=None):
+        data = block.to_pydict()
+        for col in columns:
+            for m2_b, mean_b, count_b in zip(
+                data[f"{col}|m2"], data[f"{col}|mean"], data[f"{col}|cnt"]
+            ):
+                count_b = int(count_b)
+                if count_b == 0:
+                    continue
+                m2_a, mean_a, count_a = acc[col]
+                if count_a == 0:
+                    acc[col] = [float(m2_b), float(mean_b), count_b]
+                    continue
+                delta = float(mean_b) - mean_a
+                count = count_a + count_b
+                # The pooled-mean form is more stable than mean_a + delta * k / n
+                # and matches the CPU Std.combine (avoids ~15th-decimal drift).
+                mean = (mean_a * count_a + float(mean_b) * count_b) / count
+                m2 = m2_a + float(m2_b) + (delta * delta) * count_a * count_b / count
+                acc[col] = [m2, mean, count]
+
+    out: Dict[str, tuple] = {}
+    for col in columns:
+        m2, mean, count = acc[col]
+        if count == 0:
+            out[col] = (float("nan"), float("nan"))
+        elif count - ddof <= 0:
+            out[col] = (mean, float("nan"))
+        else:
+            out[col] = (mean, math.sqrt(m2 / (count - ddof)))
+    return out
 
 
 def _group_columns_by_type(

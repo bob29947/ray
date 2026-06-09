@@ -13,6 +13,7 @@ from ray.data.preprocessors.encoder import (
 )
 from ray.data.preprocessors.gpu_encoder import GpuOrdinalEncoder
 from ray.data.preprocessors.gpu_imputer import GpuSimpleImputer
+from ray.data.preprocessors.gpu_scaler import GpuStandardScaler
 from ray.data.preprocessors.hasher import FeatureHasher
 from ray.data.preprocessors.imputer import SimpleImputer
 from ray.data.preprocessors.normalizer import Normalizer
@@ -34,6 +35,7 @@ __all__ = [
     "FeatureHasher",
     "GpuOrdinalEncoder",
     "GpuSimpleImputer",
+    "GpuStandardScaler",
     "HashingVectorizer",
     "LabelEncoder",
     "MaxAbsScaler",

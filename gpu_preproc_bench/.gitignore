@@ -1,0 +1,4 @@
+# Local benchmark artifacts (downloaded datasets, caches) -- never commit these.
+data/
+__pycache__/
+*.pyc
