@@ -35,12 +35,27 @@ the same columns for parity). sort / encode / scale are the GPU-acceleration
 targets; impute stays on CPU on purpose (host-staged GPU imputation is not worth
 it for this dataset).
 
-Run (single day):
-    .venv/bin/python benchmarks/criteo/cpu_pipeline.py --days 1
+The SAME script runs locally (start a local Ray) and on an AWS CPU Ray cluster
+(attach with ``--ray-address auto``, read/write ``s3://`` via ``--data-root`` /
+``--out``). See ``benchmarks/criteo/README.md`` and ``cluster/ray-cpu.yaml``.
 
-Run (multi-day / all 30):
+Run (local, single day):
+    .venv/bin/python benchmarks/criteo/cpu_pipeline.py \
+        --days 1 \
+        --data-root /bobbwang/datasets/CriteoPrivateAd/data \
+        --out benchmarks/criteo/data/criteo_days1_cpu_baseline \
+        --ray-address local
+
+Run (local, multi-day / all 30):
     .venv/bin/python benchmarks/criteo/cpu_pipeline.py --days 1-30 \
         --out benchmarks/criteo/data/criteo_days1_30_cpu_baseline
+
+Run (AWS CPU Ray cluster, via ray exec):
+    cd /home/ray/benchmarks/criteo && python cpu_pipeline.py \
+        --days 1 \
+        --data-root s3://TODO_REQUIRED/criteo-private-ad/data \
+        --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_baseline_days1 \
+        --ray-address auto
 """
 
 from __future__ import annotations
@@ -52,7 +67,7 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -198,6 +213,89 @@ def _resolve_object_store_bytes(object_store_gb: Any) -> int:
         return 200 * 1024 ** 3
 
 
+def _git_commit(here: str) -> str:
+    """Short git commit of the worktree, or 'unknown' (e.g. on a mounted copy
+    on the cluster, which is not a git repo)."""
+    import subprocess
+
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=here,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "unknown"
+
+
+def _print_startup(
+    *, days_label, days, data_root, out_dir, ray_address,
+    object_store_setting, rows, no_write, enabled_stages, here,
+) -> None:
+    """One banner that makes the local-vs-cloud run fully self-describing."""
+    P("=" * 78)
+    P("benchmark      : CriteoPrivateAd CPU preprocessing E2E (cpu_pipeline.py)")
+    P(f"git commit     : {_git_commit(here)}")
+    P(f"ray version    : {ray.__version__}")
+    P(f"ray file       : {ray.__file__}")
+    P(f"ray_address    : {ray_address}")
+    P(f"data_root      : {data_root}")
+    P(f"out            : {'(--no-write: not saved)' if no_write else out_dir}")
+    P(f"days           : {days_label}  ({len(days)} day_int partition(s))")
+    P(f"row limit      : {rows if rows else 'none (full)'}")
+    P(f"object store   : {object_store_setting}")
+    P(f"stages         : {', '.join(enabled_stages)}  (+ TOTAL)")
+    P("=" * 78)
+
+
+def _prepare_output_dir(out_dir: str, *, overwrite: bool) -> None:
+    """Make ``out_dir`` ready for ``ds.write_parquet`` -- local OR ``s3://``.
+
+    Local: remove any existing dir and recreate (preserves current behavior).
+    S3: never use os.path / shutil / glob / makedirs; if the prefix already has
+    objects, fail clearly unless ``overwrite`` (then delete the prefix contents
+    first). ``ds.write_parquet`` creates the prefix, so no mkdir is needed on S3.
+    """
+    if criteo.is_s3(out_dir):
+        import pyarrow.fs as pafs
+
+        fs, path = pafs.FileSystem.from_uri(out_dir)
+        existing = fs.get_file_info(
+            pafs.FileSelector(path, recursive=False, allow_not_found=True)
+        )
+        if existing:
+            if not overwrite:
+                raise RuntimeError(
+                    f"S3 output already exists: {out_dir} ({len(existing)} "
+                    f"entries). Refusing to overwrite; pass --overwrite or "
+                    f"choose a new --out."
+                )
+            fs.delete_dir_contents(path, missing_dir_ok=True)
+        return
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+
+def _write_manifest(out_dir: str, manifest: Dict[str, Any]) -> None:
+    """Write ``manifest.json`` next to the output -- local OR ``s3://`` (via the
+    pyarrow filesystem, never the builtin ``open`` for S3)."""
+    blob = json.dumps(manifest, indent=2, default=_jsonable).encode("utf-8")
+    if criteo.is_s3(out_dir):
+        import pyarrow.fs as pafs
+
+        fs, path = pafs.FileSystem.from_uri(out_dir)
+        with fs.open_output_stream(f"{path}/manifest.json") as fh:
+            fh.write(blob)
+    else:
+        with open(os.path.join(out_dir, "manifest.json"), "wb") as fh:
+            fh.write(blob)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -228,11 +326,47 @@ def main() -> None:
         "--object-store-gb",
         type=float,
         default=None,
-        help="Ray object-store size in GiB. Default: ~85%% of /dev/shm so the whole "
-        "100M-row pipeline (incl. the sort shuffle) stays in RAM and never spills "
-        "to the small local disk. Spilling here would exhaust /tmp.",
+        help="Ray object-store size in GiB (LOCAL ray-address only). Default: "
+        "~85%% of /dev/shm so the whole 100M-row pipeline (incl. the sort "
+        "shuffle) stays in RAM and never spills to the small local disk. "
+        "Ignored when --ray-address attaches to a cluster.",
+    )
+    ap.add_argument(
+        "--data-root",
+        default=None,
+        help="Dataset root. Local example: /bobbwang/datasets/CriteoPrivateAd/"
+        "data ; cloud example: s3://.../CriteoPrivateAd/data. Default: keep "
+        "criteo.DATA_ROOT (the local DGX path).",
+    )
+    ap.add_argument(
+        "--ray-address",
+        default="local",
+        help="'local' -> start a local Ray as today (preserves current "
+        "behavior incl. --object-store-gb). 'auto' (or any address) -> attach "
+        "to an existing cluster via ray.init(address=...). Default: local.",
+    )
+    ap.add_argument(
+        "--skip-saved-sort-verify",
+        action="store_true",
+        help="Skip the saved-output global-sortedness verification (escape "
+        "hatch for first S3 smoke runs). The write still happens unless "
+        "--no-write is also passed.",
+    )
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="For an s3:// --out: delete the existing output prefix before "
+        "writing. Local always overwrites; without this an existing S3 prefix "
+        "is an error (never a silent overwrite).",
     )
     args = ap.parse_args()
+
+    # Point the loader at the requested dataset root (local path or s3:// URI)
+    # BEFORE any discovery. With no --data-root we keep criteo.DATA_ROOT (local),
+    # preserving current behavior.
+    if args.data_root:
+        criteo.set_data_root(args.data_root)
+    data_root = criteo.DATA_ROOT
 
     available = criteo.discover_days()
     if args.days is not None:
@@ -250,12 +384,25 @@ def main() -> None:
 
     import logging
 
-    osm_bytes = _resolve_object_store_bytes(args.object_store_gb)
-    ray.init(
-        logging_level="ERROR",
-        include_dashboard=False,
-        object_store_memory=osm_bytes,
-    )
+    # Ray init: --ray-address local starts a local Ray (current behavior, incl.
+    # the in-RAM object-store sizing). Anything else (e.g. "auto") ATTACHES to an
+    # already-running cluster and lets the cluster own cpus/gpus/object-store --
+    # so we deliberately do NOT pass num_cpus/num_gpus/object_store_memory/
+    # include_dashboard in that path.
+    if args.ray_address == "local":
+        osm_bytes = _resolve_object_store_bytes(args.object_store_gb)
+        ray.init(
+            logging_level="ERROR",
+            include_dashboard=False,
+            object_store_memory=osm_bytes,
+        )
+        object_store_setting = (
+            f"{osm_bytes / 1024 ** 3:.0f} GiB (local, in-RAM /dev/shm)"
+        )
+    else:
+        osm_bytes = None
+        ray.init(address=args.ray_address, logging_level="ERROR")
+        object_store_setting = f"cluster-managed (address={args.ray_address})"
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     ctx = ray.data.DataContext.get_current()
     ctx.enable_rich_progress_bars = False
@@ -265,19 +412,30 @@ def main() -> None:
     # order by default.
     ctx.execution_options.preserve_order = True
 
+    enabled_stages = ["read", "prep", "sort", "impute", "encode", "scale"]
+    if not args.no_write:
+        enabled_stages.append("write")
+    _print_startup(
+        days_label=days_label,
+        days=days,
+        data_root=data_root,
+        out_dir=out_dir,
+        ray_address=args.ray_address,
+        object_store_setting=object_store_setting,
+        rows=args.rows,
+        no_write=args.no_write,
+        enabled_stages=enabled_stages,
+        here=here,
+    )
+
     roles = criteo.column_roles_multi(
         days, null_indicator_threshold=args.null_indicator_threshold
     )
 
-    P("=" * 78)
-    P(f"CriteoPrivateAd CPU preprocessing baseline  days={days_label} "
-      f"({len(days)} day_int partition(s))")
-    P("=" * 78)
+    P("-" * 78)
     blocks_label = "auto" if args.blocks is None else str(args.blocks)
     P(f"rows (metadata): {roles.total_rows:,}   blocks={blocks_label}   "
       f"null_indicator_threshold={args.null_indicator_threshold}")
-    P(f"object store: {osm_bytes / 1024**3:.0f} GiB (in-RAM /dev/shm; sized to "
-      f"avoid disk spill)")
     P(f"feature roles: {len(roles.categorical)} categorical, "
       f"{len(roles.numeric_features)} numeric "
       f"({len(roles.numeric_raw)} raw + {len(roles.list_len_cols)} list-len), "
@@ -373,9 +531,7 @@ def main() -> None:
     # ---- write (the ONLY saved dataset: final processed parquet) ---------- #
     if not args.no_write:
         with m.stage("write", ncols) as rec:
-            if os.path.isdir(out_dir):
-                shutil.rmtree(out_dir)
-            os.makedirs(out_dir, exist_ok=True)
+            _prepare_output_dir(out_dir, overwrite=args.overwrite)
             ds.write_parquet(out_dir)
             rec.update(rows=rows_in, out_cols=ncols, gib=gib)
 
@@ -383,16 +539,21 @@ def main() -> None:
     # Re-read the written parquet and check global sortedness block-by-block
     # without ever loading all keys into local pandas. For --no-write smoke runs
     # we run the same scalable check on the in-memory final dataset instead.
-    if not args.no_write:
+    if args.skip_saved_sort_verify:
+        verify = None
+        P("\nskipping saved-output sortedness verification "
+          "(--skip-saved-sort-verify)")
+    elif not args.no_write:
         P(f"\nverifying saved-output global sortedness over {roles.sort_key} ...")
         verify = _verify_saved_sorted(out_dir, roles.sort_key, rows_in)
     else:
         verify = _verify_dataset_sorted(ds, roles.sort_key, rows_in)
-    P(f"  verification: sorted={verify['globally_sorted']} "
-      f"rows_counted={verify['rows_counted']:,}/{verify['expected_rows']:,} "
-      f"blocks={verify['n_blocks']} "
-      f"(in_block_sorted={verify['all_blocks_internally_sorted']}, "
-      f"boundaries_ok={verify['adjacent_boundaries_ok']})")
+    if verify is not None:
+        P(f"  verification: sorted={verify['globally_sorted']} "
+          f"rows_counted={verify['rows_counted']:,}/{verify['expected_rows']:,} "
+          f"blocks={verify['n_blocks']} "
+          f"(in_block_sorted={verify['all_blocks_internally_sorted']}, "
+          f"boundaries_ok={verify['adjacent_boundaries_ok']})")
 
     # ---- sanity checks (sampled) ------------------------------------------ #
     checks = _sanity_checks(ds, roles, rows_in, verify, out_dir, args.no_write)
@@ -406,8 +567,7 @@ def main() -> None:
             args, days, roles, rows_in, m, scaler, encoder, num_imputer,
             cat_imputer, n_blocks, verify, osm_bytes,
         )
-        with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
-            json.dump(manifest, fh, indent=2, default=_jsonable)
+        _write_manifest(out_dir, manifest)
         P(f"\nwrote output parquet + manifest.json -> {out_dir}")
 
     ray.shutdown()
@@ -535,9 +695,22 @@ def _verify_saved_sorted(out_dir: str, sort_key: List[str], expected_rows: int) 
     are named ``..._<task_index:06>-...parquet`` in global-sort order, so path
     order == sort order -- making the adjacent-block boundary check exact and
     independent of how Ray schedules the read."""
-    import glob
+    if criteo.is_s3(out_dir):
+        import pyarrow.fs as pafs
 
-    files = sorted(glob.glob(os.path.join(out_dir, "*.parquet")))
+        fs, path = pafs.FileSystem.from_uri(out_dir)
+        infos = fs.get_file_info(
+            pafs.FileSelector(path, recursive=True, allow_not_found=True)
+        )
+        files = sorted(
+            "s3://" + i.path
+            for i in infos
+            if i.type == pafs.FileType.File and i.path.endswith(".parquet")
+        )
+    else:
+        import glob
+
+        files = sorted(glob.glob(os.path.join(out_dir, "*.parquet")))
     if not files:
         raise RuntimeError(f"no parquet files found under {out_dir}")
     vds = ray.data.read_parquet(files, columns=list(sort_key), include_paths=True)
@@ -555,8 +728,8 @@ def _verify_dataset_sorted(ds, sort_key: List[str], expected_rows: int) -> Dict[
     return res
 
 
-def _sanity_checks(ds, roles, rows_in: int, verify: Dict[str, Any], out_dir: str,
-                   no_write: bool) -> Dict[str, bool]:
+def _sanity_checks(ds, roles, rows_in: int, verify: Optional[Dict[str, Any]],
+                   out_dir: str, no_write: bool) -> Dict[str, bool]:
     # Dtype checks use the Arrow schema (Ray returns pyarrow-backed pandas dtypes
     # like "double[pyarrow]", so checking str(pandas dtype) is unreliable).
     sch = ds.schema()
@@ -596,20 +769,24 @@ def _sanity_checks(ds, roles, rows_in: int, verify: Dict[str, Any], out_dir: str
         except Exception:
             reload_ok = False
 
-    return {
+    checks: Dict[str, bool] = {
         "row_count_preserved": ds.count() == rows_in,
         "final_parquet_reloads": reload_ok,
-        "saved_output_globally_sorted": bool(verify["globally_sorted"]),
-        "saved_output_row_count_matches": bool(verify["rows_match"]),
-        "no_nulls_in_features": no_null_features,
-        "encoded_cols_integer": encoded_integer,
-        "scaled_cols_float": scaled_float,
-        "indicators_binary": indicators_binary and indicators_int,
-        "targets_present": targets_present,
-        "metadata_keys_present_not_features": bool(
-            meta_present and meta_not_features and meta_no_null
-        ),
     }
+    # The saved-output sortedness checks only exist when verification ran
+    # (--skip-saved-sort-verify omits them rather than reporting a false PASS).
+    if verify is not None:
+        checks["saved_output_globally_sorted"] = bool(verify["globally_sorted"])
+        checks["saved_output_row_count_matches"] = bool(verify["rows_match"])
+    checks["no_nulls_in_features"] = no_null_features
+    checks["encoded_cols_integer"] = encoded_integer
+    checks["scaled_cols_float"] = scaled_float
+    checks["indicators_binary"] = indicators_binary and indicators_int
+    checks["targets_present"] = targets_present
+    checks["metadata_keys_present_not_features"] = bool(
+        meta_present and meta_not_features and meta_no_null
+    )
+    return checks
 
 
 def _gpu_target_subtotal(m: Metrics) -> float:
@@ -634,13 +811,17 @@ def _print_report(m: Metrics, roles, checks, verify, scaler, encoder, num_impute
     pct = (sub / total * 100.0) if total else 0.0
     P(f"  {'GPU-tgt':<8} {sub:>9.2f}   (sort + encode + scale = {pct:.1f}% of TOTAL)")
 
-    P("\nsaved-output sortedness verification:")
-    P(f"  globally_sorted = {verify['globally_sorted']}  "
-      f"(in_block_sorted={verify['all_blocks_internally_sorted']}, "
-      f"boundaries_ok={verify['adjacent_boundaries_ok']})")
-    P(f"  rows_counted = {verify['rows_counted']:,} / expected {verify['expected_rows']:,}  "
-      f"(match={verify['rows_match']}), blocks={verify['n_blocks']}, "
-      f"key={verify['sort_key']}, method={verify['method']}")
+    if verify is None:
+        P("\nsaved-output sortedness verification: SKIPPED "
+          "(--skip-saved-sort-verify)")
+    else:
+        P("\nsaved-output sortedness verification:")
+        P(f"  globally_sorted = {verify['globally_sorted']}  "
+          f"(in_block_sorted={verify['all_blocks_internally_sorted']}, "
+          f"boundaries_ok={verify['adjacent_boundaries_ok']})")
+        P(f"  rows_counted = {verify['rows_counted']:,} / expected {verify['expected_rows']:,}  "
+          f"(match={verify['rows_match']}), blocks={verify['n_blocks']}, "
+          f"key={verify['sort_key']}, method={verify['method']}")
 
     P("\nsanity checks:")
     for name, ok in checks.items():
@@ -703,7 +884,11 @@ def _build_manifest(args, days, roles, rows_in, m, scaler, encoder, num_imputer,
         "rows_metadata_total": roles.total_rows,
         "blocks_setting": "auto" if args.blocks is None else args.blocks,
         "num_blocks_read": n_blocks,
-        "object_store_gib": round(osm_bytes / 1024 ** 3, 1),
+        "ray_address": args.ray_address,
+        "data_root": criteo.DATA_ROOT,
+        "object_store_gib": (
+            round(osm_bytes / 1024 ** 3, 1) if osm_bytes else None
+        ),
         "sort_key": roles.sort_key,
         "null_indicator_threshold": args.null_indicator_threshold,
         "columns": {
@@ -737,7 +922,7 @@ def _build_manifest(args, days, roles, rows_in, m, scaler, encoder, num_imputer,
         "stage_timings_s": {rec["name"]: round(rec["secs"], 3) for rec in m.stages},
         "gpu_target_stages": sorted(GPU_TARGET_STAGES),
         "gpu_target_subtotal_s": round(_gpu_target_subtotal(m), 3),
-        "verification": verify,
+        "verification": verify if verify is not None else {"skipped": True},
     }
 
 

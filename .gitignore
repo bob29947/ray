@@ -9,6 +9,9 @@
 /python/ray/cpp/
 /python/build
 /python/dist
+# Root-level wheel output dir used by ./build-wheel.sh (mounted to the Ray
+# cluster in cluster/ray-cpu.yaml); a build artifact -- never commit it.
+/dist
 /python/python-driver-*
 /python/ray/serve/generated
 /thirdparty/pkg/

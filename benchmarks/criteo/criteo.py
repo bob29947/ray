@@ -1,8 +1,11 @@
 """Loader + column-role logic for the CriteoPrivateAd CPU preprocessing baseline.
 
-Analogous to ``yambda.py`` but for the locally-staged CriteoPrivateAd parquet
-dataset (``/bobbwang/datasets/CriteoPrivateAd/data``, Hive-partitioned by
-``day_int``). One row = one ad impression (banner display).
+Analogous to ``yambda.py`` but for the CriteoPrivateAd parquet dataset
+(Hive-partitioned by ``day_int``). The root defaults to the local DGX copy
+(``/bobbwang/datasets/CriteoPrivateAd/data``) and can be repointed to any local
+path or ``s3://`` URI via :func:`set_data_root` (used by the benchmark's
+``--data-root``), so the SAME loader serves both the local box and an AWS Ray
+cluster reading from S3. One row = one ad impression (banner display).
 
 This module only decides *roles* (which column is a target / categorical /
 numeric / list / dropped) from the parquet schema and the per-column null
@@ -77,13 +80,83 @@ ALL_NULL_THRESHOLD = 0.999
 
 
 # --------------------------------------------------------------------------- #
+# Data root + filesystem helpers (local path OR ``s3://`` URI)
+# --------------------------------------------------------------------------- #
+def is_s3(path: str) -> bool:
+    """True if ``path`` is an ``s3://`` URI (vs a local filesystem path)."""
+    return str(path).startswith("s3://")
+
+
+def set_data_root(path: str) -> None:
+    """Point the loader at a new dataset root: a local path or an ``s3://`` URI.
+
+    The benchmark calls this once (from ``--data-root``) before any discovery,
+    so the SAME code reads either the local DGX copy or an S3-staged copy of
+    CriteoPrivateAd. ``s3://`` roots are normalized without a trailing slash.
+    """
+    global DATA_ROOT
+    DATA_ROOT = str(path).rstrip("/") if is_s3(path) else str(path)
+
+
+def _s3_fs_and_path(uri: str):
+    """``(pyarrow.fs.FileSystem, fs_native_path)`` for an ``s3://`` URI."""
+    import pyarrow.fs as pafs
+
+    return pafs.FileSystem.from_uri(uri)
+
+
+def _s3_children(uri: str):
+    """Immediate children of an ``s3://`` "directory" as
+    ``(child_s3_uri, is_dir, is_file)`` tuples. Uses ``pyarrow.fs`` -- never
+    local ``glob`` / ``os.path`` -- so it is safe for object storage."""
+    import pyarrow.fs as pafs
+
+    fs, path = pafs.FileSystem.from_uri(uri)
+    selector = pafs.FileSelector(path, recursive=False, allow_not_found=True)
+    out = []
+    for info in fs.get_file_info(selector):
+        out.append(
+            (
+                "s3://" + info.path,
+                info.type == pafs.FileType.Directory,
+                info.type == pafs.FileType.File,
+            )
+        )
+    return out
+
+
+def _parquet_metadata(path: str):
+    """Parquet footer metadata for a local path OR an ``s3://`` URI."""
+    if is_s3(path):
+        fs, p = _s3_fs_and_path(path)
+        return pq.ParquetFile(p, filesystem=fs).metadata
+    return pq.ParquetFile(path).metadata
+
+
+def _read_schema(path: str):
+    """Parquet schema for a local path OR an ``s3://`` URI."""
+    if is_s3(path):
+        fs, p = _s3_fs_and_path(path)
+        return pq.read_schema(p, filesystem=fs)
+    return pq.read_schema(path)
+
+
+# --------------------------------------------------------------------------- #
 # Paths / IO
 # --------------------------------------------------------------------------- #
 def day_path(day: int) -> str:
+    if is_s3(DATA_ROOT):
+        return f"{DATA_ROOT}/day_int={day}"
     return os.path.join(DATA_ROOT, f"day_int={day}")
 
 
 def parquet_paths(day: int) -> List[str]:
+    if is_s3(DATA_ROOT):
+        return sorted(
+            uri
+            for uri, _is_dir, is_file in _s3_children(day_path(day))
+            if is_file and uri.endswith(".parquet")
+        )
     return sorted(glob.glob(os.path.join(day_path(day), "*.parquet")))
 
 
@@ -95,8 +168,17 @@ def parquet_paths_days(days: List[int]) -> List[str]:
 
 
 def discover_days() -> List[int]:
-    """All ``day_int=<n>`` partitions physically present under ``DATA_ROOT``."""
+    """All ``day_int=<n>`` partitions present under ``DATA_ROOT`` (local or s3)."""
     days: List[int] = []
+    if is_s3(DATA_ROOT):
+        for uri, is_dir, _is_file in _s3_children(DATA_ROOT):
+            base = uri.rstrip("/").rsplit("/", 1)[-1]
+            if is_dir and base.startswith("day_int="):
+                try:
+                    days.append(int(base.split("=", 1)[1]))
+                except (IndexError, ValueError):
+                    continue
+        return sorted(days)
     for p in glob.glob(os.path.join(DATA_ROOT, "day_int=*")):
         if os.path.isdir(p):
             try:
@@ -137,7 +219,7 @@ def parse_days(spec: str, available: Optional[List[int]] = None) -> List[int]:
 def _first_nonempty(paths: List[str]) -> str:
     """First shard with >0 rows (day 1 ships an empty 0-row placeholder)."""
     for p in paths:
-        if pq.ParquetFile(p).metadata.num_rows > 0:
+        if _parquet_metadata(p).num_rows > 0:
             return p
     return paths[0]
 
@@ -146,7 +228,7 @@ def _first_nonempty_across(days: List[int]) -> str:
     """First >0-row shard across all selected days (schema is uniform)."""
     for d in days:
         for p in parquet_paths(d):
-            if pq.ParquetFile(p).metadata.num_rows > 0:
+            if _parquet_metadata(p).num_rows > 0:
                 return p
     return parquet_paths(days[0])[0]
 
@@ -225,12 +307,12 @@ def null_fractions_days(days: List[int]) -> Tuple[Dict[str, float], int]:
     populated later, so the all-null drop and the null-indicator threshold must
     be decided on the *full* selected dataset, not on a single day.
     """
-    schema = pq.read_schema(_first_nonempty_across(days))
+    schema = _read_schema(_first_nonempty_across(days))
     total = 0
     nulls = dict.fromkeys(schema.names, 0)
     for d in days:
         for path in parquet_paths(d):
-            md = pq.ParquetFile(path).metadata
+            md = _parquet_metadata(path)
             total += md.num_rows
             for rg in range(md.num_row_groups):
                 rgm = md.row_group(rg)
@@ -342,7 +424,7 @@ def column_roles_multi(
     """
     days = list(days)
     fracs, total = null_fractions_days(days)
-    schema = pq.read_schema(_first_nonempty_across(days))
+    schema = _read_schema(_first_nonempty_across(days))
     multi = len(days) > 1
 
     roles = ColumnRoles(

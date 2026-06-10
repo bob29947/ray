@@ -1,0 +1,202 @@
+# Generic, reusable CPU-only Ray cluster on AWS (not benchmark-specific).
+#
+# It ships and installs the Ray WHEEL BUILT FROM THIS WORKTREE (mounted from
+# ./dist) so the cloud cluster tests exactly the Ray you built here -- it does
+# NOT mount the Ray source tree. Run all commands below from the worktree root
+# (so the relative file_mounts "dist" and "benchmarks" resolve correctly).
+#
+# Build wheel:
+#   ./build-wheel.sh 3.10 ./dist
+#
+# Launch:
+#   ray up cluster/ray-cpu.yaml -y
+#
+# Verify installed Ray:
+#   ray exec cluster/ray-cpu.yaml 'python -c "import ray; print(ray.__version__); print(ray.__file__)"'
+#
+# Verify Ray resources:
+#   ray exec cluster/ray-cpu.yaml 'python -c "import ray; ray.init(address=\"auto\"); print(ray.cluster_resources())"'
+#
+# CPU benchmark smoke example:
+#   ray exec cluster/ray-cpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --rows 100000 --data-root s3://TODO_REQUIRED/criteo-private-ad/data --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_smoke_days1 --ray-address auto --skip-saved-sort-verify'
+#
+# CPU benchmark full-day example:
+#   ray exec cluster/ray-cpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --data-root s3://TODO_REQUIRED/criteo-private-ad/data --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_baseline_days1 --ray-address auto'
+#
+# Tear down:
+#   ray down cluster/ray-cpu.yaml -y
+
+# A unique identifier for the head node and workers of this cluster.
+cluster_name: ray-cpu-e2e-bobbwang
+
+# Cluster size (CPU only).
+#
+# Total cluster nodes = 1 head + N workers.
+# For 2 total nodes, set N = 1:
+#   top-level max_workers: 1
+#   ray.worker.default min_workers: 1
+#   ray.worker.default max_workers: 1
+#
+# For X total nodes, set N = X - 1:
+#   top-level max_workers: X - 1
+#   ray.worker.default min_workers: X - 1
+#   ray.worker.default max_workers: X - 1
+max_workers: 1
+
+# Scale up the cluster in chunks of upscaling_speed * currently_running_nodes.
+upscaling_speed: 1.0
+
+# Run all node commands inside this Docker container. CPU image only -- no
+# RAPIDS (cudf/cupy/rmm), no --gpus=all, no --runtime=nvidia.
+docker:
+    image: "rayproject/ray:nightly-py310"
+    container_name: "ray_container"
+    # If true, always pull the latest version of the image.
+    pull_before_run: True
+    run_options:   # Extra options passed to "docker run" (CPU only).
+        - --ulimit nofile=65536:65536
+
+# If a node is idle for this many minutes, it will be removed.
+idle_timeout_minutes: 60
+
+# Cloud-provider specific configuration.
+provider:
+    type: aws
+    region: us-west-2
+    # Availability zone(s), comma-separated, that nodes may be launched in.
+    availability_zone: us-west-2a,us-west-2b
+    # Terminate (don't stop/reuse) nodes on `ray down` so we never pay for or
+    # accidentally reuse stopped instances.
+    cache_stopped_nodes: False
+
+# How Ray authenticates with newly launched nodes.
+auth:
+    ssh_user: ubuntu
+
+# Allowed node types and the resources they provide.
+available_node_types:
+    ray.head.default:
+        # CPU/GPU resources are auto-detected from the AWS instance type.
+        resources: {}
+        node_config:
+            InstanceType: m5dn.4xlarge
+            # Default Ray AMI for us-west-2.
+            ImageId: ami-008fe2fc65df48dac
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            # Root volume. 300 GiB gp3 is plenty for a 1-day CPU smoke/baseline.
+            # For full multi-day Criteo runs or heavy shuffle/write spill, raise
+            # this toward the manager benchmark settings, e.g.:
+            #   VolumeSize: 1000
+            #   VolumeType: gp3
+            #   Iops: 80000
+            #   Throughput: 2000
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 300
+                      VolumeType: gp3
+            # Ownership tags on the EC2 instance and its EBS volume(s).
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: cpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-cpu-e2e-bobbwang }
+                - ResourceType: volume
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: cpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-cpu-e2e-bobbwang }
+    ray.worker.default:
+        # Keep exactly 1 worker (see the scaling note on top-level max_workers).
+        min_workers: 1
+        max_workers: 1
+        resources: {}
+        node_config:
+            InstanceType: m5dn.4xlarge
+            ImageId: ami-008fe2fc65df48dac
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            # See the head note above for scaling this volume for full runs.
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 300
+                      VolumeType: gp3
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: cpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-cpu-e2e-bobbwang }
+                - ResourceType: volume
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: cpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-cpu-e2e-bobbwang }
+
+# Specify the node type of the head node (as configured above).
+head_node_type: ray.head.default
+
+# Files/directories to copy to the head and worker nodes (REMOTE: LOCAL).
+# We mount only the built wheel and the benchmarks -- NOT the Ray source tree.
+file_mounts: {
+    "/home/ray/ray_wheels": "dist",
+    "/home/ray/benchmarks": "benchmarks",
+}
+
+# Keep rsync fast and avoid shipping local junk. We deliberately do NOT use
+# `rsync_filter: [".gitignore"]`: that would couple what gets shipped to
+# .gitignore and could silently drop the wheel under ./dist. Exclude only
+# known-junk paths instead, so the wheel always ships.
+rsync_exclude:
+    - "**/.git"
+    - "**/.git/**"
+    - "**/__pycache__"
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - "**/criteo/data"
+    - "**/criteo/data/**"
+
+# Run before `setup_commands`, outside the container, before Docker is set up.
+# (Manager's "install Docker if missing" block, kept verbatim.)
+initialization_commands:
+    - |
+       if ! docker --version; then
+         curl -fsSL https://get.docker.com -o get-docker.sh
+         sudo sh get-docker.sh
+         sudo usermod -aG docker $USER
+         sudo systemctl restart docker -f
+       fi
+
+# Set up nodes: install the locally-built Ray wheel (from the mounted ./dist),
+# then the CPU benchmark deps. No RAPIDS / GPU packages.
+setup_commands:
+    - python -m pip uninstall -y ray || true
+    - WHEEL=$(ls /home/ray/ray_wheels/ray-*.whl | head -n1); python -m pip install -U "ray[default] @ file://$WHEEL"
+    - python -m pip install -U numpy pandas pyarrow scipy s3fs fsspec pytest fire
+
+# Custom commands run on the head/workers after common setup.
+head_setup_commands: []
+worker_setup_commands: []
+
+# Command to start ray on the head node. (Manager's commands, kept verbatim.)
+head_start_ray_commands:
+    - ray stop
+    - ray start --head --port=6379 --object-manager-port=8076 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
+
+# Command to start ray on worker nodes. (Manager's commands, kept verbatim.)
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --object-manager-port=8076
