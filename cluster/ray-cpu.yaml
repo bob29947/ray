@@ -19,11 +19,11 @@
 #
 # CPU benchmark smoke example:
 #   ray exec cluster/ray-cpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --rows 100000 --data-root s3://TODO_REQUIRED/criteo-private-ad/data --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_smoke_days1 --ray-address auto --skip-saved-sort-verify'
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --rows 100000 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_smoke_days1 --ray-address auto --skip-saved-sort-verify'
 #
 # CPU benchmark full-day example:
 #   ray exec cluster/ray-cpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --data-root s3://TODO_REQUIRED/criteo-private-ad/data --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_baseline_days1 --ray-address auto'
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_baseline_days1 --ray-address auto'
 #
 # Tear down:
 #   ray down cluster/ray-cpu.yaml -y

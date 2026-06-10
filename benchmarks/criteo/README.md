@@ -79,11 +79,28 @@ ray exec cluster/ray-cpu.yaml 'python -c "import ray; print(ray.__version__); pr
 ray exec cluster/ray-cpu.yaml 'python -c "import ray; ray.init(address=\"auto\"); print(ray.cluster_resources())"'
 ```
 
+### Stage the dataset to S3 (one-time)
+
+The benchmark reads from `s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data`
+(us-west-2). Upload the local dataset there once. **Run this from a shell with
+AWS write access** — the agent/automation sandbox has read-only network egress
+(GET allowed, PUT/POST blocked), so it cannot create buckets or upload:
+
+```bash
+aws s3 mb s3://bobbwang-ray-e2e-criteo --region us-west-2
+aws s3api put-public-access-block --bucket bobbwang-ray-e2e-criteo \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3 sync /bobbwang/datasets/CriteoPrivateAd/data \
+  s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data
+# verify:
+aws s3 ls s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data/
+```
+
 ### Run the benchmark on the cluster
 
-> Replace the `s3://TODO_REQUIRED/...` placeholders with your real private
-> CriteoPrivateAd dataset/output buckets. They are intentionally **not** filled
-> in here.
+> Outputs are written under
+> `s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/...`. Make sure the
+> dataset has been staged to S3 (see above) first.
 
 Smoke (row-capped; skips S3 sort-verify while you confirm S3 wiring):
 
@@ -91,8 +108,8 @@ Smoke (row-capped; skips S3 sort-verify while you confirm S3 wiring):
 ray exec cluster/ray-cpu.yaml \
   'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py \
     --days 1 --rows 100000 \
-    --data-root s3://TODO_REQUIRED/criteo-private-ad/data \
-    --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_smoke_days1 \
+    --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data \
+    --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_smoke_days1 \
     --ray-address auto \
     --skip-saved-sort-verify'
 ```
@@ -103,8 +120,8 @@ Full single day:
 ray exec cluster/ray-cpu.yaml \
   'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py \
     --days 1 \
-    --data-root s3://TODO_REQUIRED/criteo-private-ad/data \
-    --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_baseline_days1 \
+    --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data \
+    --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_baseline_days1 \
     --ray-address auto'
 ```
 
@@ -118,8 +135,9 @@ ray down cluster/ray-cpu.yaml -y
 
 ## Notes
 
-- **S3 paths** are `s3://TODO_REQUIRED/...` placeholders. Fill in the real
-  private dataset (`--data-root`) and output (`--out`) buckets before running.
+- **S3 paths** use the bucket `s3://bobbwang-ray-e2e-criteo` (us-west-2): data at
+  `/criteo-private-ad/data`, outputs at `/criteo-private-ad/outputs`. Stage the
+  dataset once (see "Stage the dataset to S3") before any cloud run.
 - **S3 output safety**: an existing `s3://` `--out` prefix is an error (never a
   silent overwrite). Pass `--overwrite` to delete it first, or choose a new
   `--out`. Local output always overwrites (current behavior).

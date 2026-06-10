@@ -53,8 +53,8 @@ Run (local, multi-day / all 30):
 Run (AWS CPU Ray cluster, via ray exec):
     cd /home/ray/benchmarks/criteo && python cpu_pipeline.py \
         --days 1 \
-        --data-root s3://TODO_REQUIRED/criteo-private-ad/data \
-        --out s3://TODO_REQUIRED/criteo-private-ad/outputs/cpu_baseline_days1 \
+        --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data \
+        --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_baseline_days1 \
         --ray-address auto
 """
 
