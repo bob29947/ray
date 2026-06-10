@@ -1,0 +1,4 @@
+# Local benchmark artifacts (processed parquet output, manifests, caches).
+data/
+__pycache__/
+*.pyc
