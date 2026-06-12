@@ -125,6 +125,53 @@ def test_write_parquet_handles_per_block_column_reorder(
     ]
 
 
+def test_write_parquet_preserves_row_order_when_preserve_order(
+    ray_start_regular_shared, tmp_path, restore_data_context
+):
+    # ``pyarrow.dataset.write_dataset`` does NOT preserve the input row order
+    # within a file: (a) with ``use_threads=True`` it writes ~128K-row scan
+    # batches concurrently, and (b) even single-threaded it reorders *multi-chunk*
+    # tables that span more than one row group. An actor-pool fused
+    # ``map_batches`` rebatch produces exactly such large, multi-chunk blocks, so
+    # a globally-sorted dataset was silently written out of order on disk while
+    # the in-memory blocks were correct. With ``preserve_order`` set,
+    # ParquetDatasink must coalesce chunks and write single-threaded so each file
+    # preserves the (sorted) block's row order.
+    from ray.data._internal.datasource.parquet_datasink import (
+        WRITE_UUID_KWARG_NAME,
+        ParquetDatasink,
+    )
+    from ray.data._internal.execution.interfaces import TaskContext
+
+    restore_data_context.execution_options.preserve_order = True
+
+    # Globally-sorted, MULTI-CHUNK block larger than one parquet row group
+    # (pyarrow default 1 << 20 rows), with uneven chunk boundaries -- the shape a
+    # coalescing rebatch produces. Pre-fix, ``ds.write_dataset`` reorders this.
+    n = 1_500_000
+    bounds = [0, 137_003, 410_101, 900_007, 1_200_011, n]
+    subs = [
+        pa.table({"id": pa.array(range(bounds[i], bounds[i + 1]), pa.int64())})
+        for i in range(len(bounds) - 1)
+    ]
+    table = pa.concat_tables(subs)
+    assert table.column("id").num_chunks > 1
+
+    sink = ParquetDatasink(path=str(tmp_path))
+    ctx = TaskContext(task_idx=0, op_name="Write")
+    ctx.kwargs = {WRITE_UUID_KWARG_NAME: "wuid"}
+    sink.write([table], ctx)
+
+    # Read each file back independently (no Ray reader bin-packing) in filename
+    # order; the concatenation must exactly equal the input row order.
+    files = sorted(str(p) for p in pathlib.Path(tmp_path).glob("*.parquet"))
+    assert files
+    written_ids = []
+    for f in files:
+        written_ids.extend(pq.read_table(f, columns=["id"]).column("id").to_pylist())
+    assert written_ids == list(range(n))
+
+
 def test_write_parquet_supports_gzip(ray_start_regular_shared, tmp_path):
     ray.data.range(1).write_parquet(tmp_path, compression="gzip")
 

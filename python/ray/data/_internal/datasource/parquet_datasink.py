@@ -278,6 +278,39 @@ class ParquetDatasink(_FileDatasink):
 
         row_group_size = write_kwargs.pop("row_group_size", None)
 
+        # Row-order preservation within a file. ``pyarrow.dataset.write_dataset``
+        # does NOT preserve the input row order in two distinct ways, both of
+        # which silently reorder rows on disk even though the in-memory blocks
+        # are correctly ordered:
+        #   1. ``use_threads=True`` scans each table into ~128K-row batches and
+        #      writes them concurrently, reordering any block that spans more
+        #      than one scan batch.
+        #   2. Even single-threaded, it reorders *multi-chunk* tables (a block
+        #      assembled from several upstream blocks, e.g. an actor-pool fused
+        #      ``map_batches`` rebatch, is multi-chunk): the dataset scanner
+        #      re-batches the fragment across chunk boundaries out of order.
+        # Honor Ray Data's ``preserve_order`` contract: when it is set, coalesce
+        # each table into a single contiguous chunk and write single-threaded so
+        # the saved file's row order matches the (globally-ordered) block.
+        # ``arrow_parquet_args`` may still force ``use_threads`` explicitly.
+        use_threads = write_kwargs.pop("use_threads", None)
+        try:
+            preserve_order = self._data_context.execution_options.preserve_order
+        except AttributeError:
+            preserve_order = False
+        if use_threads is None:
+            use_threads = not preserve_order
+        if preserve_order:
+            # Single-chunk tables write in order; multi-chunk ones do not. Only
+            # coalesce when some column actually has >1 chunk (avoids a needless
+            # copy for already-contiguous blocks).
+            tables = [
+                table.combine_chunks()
+                if any(col.num_chunks > 1 for col in table.columns)
+                else table
+                for table in tables
+            ]
+
         # We set this to "overwrite_or_ignore", to avoid the race condition seen in parallel writes when this is set to "error". The driver already handles the save mode check in on_write_start.
         existing_data_behavior = "overwrite_or_ignore"
 
@@ -304,7 +337,7 @@ class ParquetDatasink(_FileDatasink):
             format=FILE_FORMAT,
             existing_data_behavior=existing_data_behavior,
             partitioning_flavor=partitioning_flavor,
-            use_threads=True,
+            use_threads=use_threads,
             min_rows_per_group=min_rows_per_group,
             max_rows_per_group=max_rows_per_group,
             max_rows_per_file=max_rows_per_file,

@@ -3,92 +3,42 @@
 These mirror the host-staged design of the experimental GPU sort: blocks start
 and end in RAM (Arrow), and only the operator's input columns are moved to a GPU
 (as cuDF) for the encode, then re-attached to the original Arrow block. The CPU
-encoders remain the default; you opt in by using the ``Gpu*`` class explicitly.
+encoders remain the default; you opt in by using the ``Gpu*`` class explicitly,
+or transparently when a ``Chain(..., backend="gpu")`` fuses it with neighbouring
+GPU ops into a single device-resident pass.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Callable, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
+from ray.data.preprocessors._gpu_fused import DeviceFusable, FitRequest
 from ray.data.preprocessors.encoder import OrdinalEncoder
 from ray.data.preprocessors.version_support import SerializablePreprocessor
 from ray.util.annotations import PublicAPI
 
 if TYPE_CHECKING:
-    import pyarrow as pa
+    import cudf
 
     from ray.data.dataset import Dataset
 
 logger = logging.getLogger(__name__)
 
 # Soft guardrail: the fitted vocabulary is replicated as a cuDF categorical on
-# *every* GPU rank (see ``_make_build_state``), so a very large cardinality can
+# *every* GPU rank (see ``_device_build_state``), so a very large cardinality can
 # OOM each GPU and bloat the driver-side merge. We warn past this many distinct
 # categories (override with ``RAY_DATA_GPU_PREPROC_MAX_VOCAB_WARN``); the encode
 # still proceeds. A future device-side / sharded-broadcast path would lift this.
 _DEFAULT_MAX_VOCAB_WARN = 5_000_000
 
 
-def _make_build_state(
-    columns: List[str], keys_by_col: Dict[str, "pa.Array"]
-) -> Callable[[], Dict]:
-    """Build a closure that moves the fitted vocabularies to the device once."""
-
-    def build() -> Dict:
-        import cudf
-
-        dtypes = {}
-        for col in columns:
-            cats = cudf.Series.from_arrow(keys_by_col[col])
-            dtypes[col] = cudf.CategoricalDtype(categories=cats, ordered=True)
-        return dtypes
-
-    return build
-
-
-def _make_apply(
-    columns: List[str], output_columns: List[str]
-) -> Callable[[Dict, "pa.Table"], "pa.Table"]:
-    """Build the per-batch encode closure (Arrow in -> Arrow out)."""
-
-    def apply(dtypes: Dict, batch: "pa.Table") -> "pa.Table":
-        import cudf
-
-        from ray.data.preprocessors._gpu import attach_arrow_columns
-
-        # Move only the input columns across the bus (payload columns stay host).
-        gdf = cudf.DataFrame.from_arrow(batch.select(columns))
-        new_columns = {}
-        for input_col, output_col in zip(columns, output_columns):
-            series = gdf[input_col]
-            # Match the CPU encoder: null *inputs* raise; unseen (non-null)
-            # categories map to null (-> NaN in pandas), via cat.codes == -1.
-            if series.null_count:
-                raise ValueError(
-                    f"Unable to transform column {input_col!r} because it "
-                    "contains null values. Consider imputing missing values "
-                    "first."
-                )
-            dtype = dtypes[input_col]
-            n_categories = len(dtype.categories)
-            codes = series.astype(dtype).cat.codes.astype("int64")
-            # Unseen categories map to a sentinel that cuDF stores in an unsigned
-            # code type (so -1 reads back as e.g. 255). Mask anything outside the
-            # valid code range to null -> NaN, matching the CPU encoder.
-            codes = codes.mask((codes < 0) | (codes >= n_categories))
-            new_columns[output_col] = codes.to_arrow()
-        return attach_arrow_columns(batch, new_columns)
-
-    return apply
-
-
 @PublicAPI(stability="alpha")
 @SerializablePreprocessor(
     version=1, identifier="io.ray.preprocessors.gpu_ordinal_encoder"
 )
-class GpuOrdinalEncoder(OrdinalEncoder):
+class GpuOrdinalEncoder(OrdinalEncoder, DeviceFusable):
     r"""GPU-accelerated, host-staged drop-in for :class:`OrdinalEncoder`.
 
     Computes category vocabularies (``fit``) and maps categories to ordinal
@@ -102,6 +52,13 @@ class GpuOrdinalEncoder(OrdinalEncoder):
     available, or if a target column is list-typed, it transparently falls back
     to the CPU :class:`OrdinalEncoder` implementation, so it stays a faithful
     drop-in.
+
+    When composed in a :class:`~ray.data.preprocessors.Chain` with
+    ``backend="gpu"``, it implements the device-fusion contract so encode shares
+    a single device-resident pass with a preceding impute and a following scale.
+    If a categorical column was most_frequent-imputed earlier in the same fused
+    run, the now-absent null is dropped from its vocabulary (matching the CPU
+    encoder fit on post-impute data) instead of raising.
 
     Concurrency and batch size are controlled by the
     ``RAY_DATA_GPU_PREPROC_NUM_GPUS`` and ``RAY_DATA_GPU_PREPROC_BATCH_SIZE``
@@ -194,6 +151,7 @@ class GpuOrdinalEncoder(OrdinalEncoder):
         concurrency=None,
     ) -> "Dataset":
         from ray.data.preprocessors import _gpu
+        from ray.data.preprocessors._gpu_fused import run_fused_device_transform
 
         if not _gpu.gpu_available() or self._has_list_columns(ds):
             return super()._transform(
@@ -203,38 +161,96 @@ class GpuOrdinalEncoder(OrdinalEncoder):
                 memory=memory,
                 concurrency=concurrency,
             )
-
-        keys_by_col = {
-            col: self._get_arrow_arrays(col)[0] for col in self._columns
-        }
-        build_state = _make_build_state(list(self._columns), keys_by_col)
-        apply_fn = _make_apply(
-            list(self._columns), list(self._output_columns)
-        )
-        return _gpu.gpu_transform(
-            ds,
-            build_state=build_state,
-            apply_fn=apply_fn,
-            batch_size=batch_size,
-            concurrency=concurrency,
+        return run_fused_device_transform(
+            ds, [self], batch_size=batch_size, concurrency=concurrency
         )
 
-    def _has_list_columns(self, ds: "Dataset") -> bool:
-        """True if any target column is list-typed (-> CPU fallback path)."""
+    # --- device-fusion contract -------------------------------------------- #
+    def _device_input_columns(self) -> List[str]:
+        return list(self._columns)
+
+    def _device_output_columns(self) -> List[str]:
+        return list(self._output_columns)
+
+    def _device_build_state(self) -> Dict[str, Any]:
+        import cudf
+
+        dtypes: Dict[str, Any] = {}
+        for col in self._columns:
+            keys = self._get_arrow_arrays(col)[0]
+            cats = cudf.Series.from_arrow(keys)
+            dtypes[col] = cudf.CategoricalDtype(categories=cats, ordered=True)
+        return dtypes
+
+    def _device_step(self, state: Dict[str, Any], gdf: "cudf.DataFrame") -> "cudf.DataFrame":
+        for input_col, output_col in zip(self._columns, self._output_columns):
+            series = gdf[input_col]
+            # Match the CPU encoder: null *inputs* raise; unseen (non-null)
+            # categories map to null (-> NaN in pandas), via cat.codes == -1.
+            if series.null_count:
+                raise ValueError(
+                    f"Unable to transform column {input_col!r} because it "
+                    "contains null values. Consider imputing missing values "
+                    "first."
+                )
+            dtype = state[input_col]
+            n_categories = len(dtype.categories)
+            codes = series.astype(dtype).cat.codes.astype("int64")
+            # Unseen categories map to a sentinel stored in an unsigned code type
+            # (so -1 reads back as e.g. 255). Mask anything outside the valid
+            # code range to null -> NaN, matching the CPU encoder.
+            codes = codes.mask((codes < 0) | (codes >= n_categories))
+            gdf[output_col] = codes
+        return gdf
+
+    def _device_fit_requests(self) -> List[FitRequest]:
+        return [FitRequest("uniques", list(self._columns))]
+
+    def _device_set_fitted(self, ctx) -> None:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        for col in self._columns:
+            values = ctx.uniques(col)
+            if ctx.mode_imputed_before(self, col):
+                # The column was most_frequent-imputed earlier in this fused run,
+                # so post-impute it has no nulls; drop null (do not raise).
+                mask = pc.is_null(values, nan_is_null=True)
+                values = pc.filter(values, pc.invert(mask))
+            elif len(values) and pc.any(
+                pc.is_null(values, nan_is_null=True)
+            ).as_py():
+                raise ValueError(
+                    "Unable to fit column because it contains null values. "
+                    "Consider imputing missing values first."
+                )
+            sorted_values = pc.take(values, pc.sort_indices(values))
+            codes = pa.array(range(len(sorted_values)), type=pa.int64())
+            self.stats_[f"unique_values({col})"] = (sorted_values, codes)
+            self._warn_if_vocab_large(col, len(sorted_values))
+
+    def _device_can_fuse(self, schema) -> bool:
+        """List-typed target columns must use the CPU fallback path."""
         import pyarrow as pa
 
+        if schema is None:
+            return True
         try:
-            schema = ds.schema()
             types = dict(zip(schema.names, schema.types))
         except Exception:
-            return False
+            return True
         for col in self._columns:
             dtype = types.get(col)
-            # ``schema().types`` yields pyarrow types for Arrow-backed datasets
-            # and numpy dtypes for pandas-backed ones; only the former can be a
-            # list type we must route to the CPU fallback.
             if isinstance(dtype, pa.DataType) and (
                 pa.types.is_list(dtype) or pa.types.is_large_list(dtype)
             ):
-                return True
-        return False
+                return False
+        return True
+
+    def _has_list_columns(self, ds: "Dataset") -> bool:
+        """True if any target column is list-typed (-> CPU fallback path)."""
+        try:
+            schema = ds.schema()
+        except Exception:
+            return False
+        return not self._device_can_fuse(schema)

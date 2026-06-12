@@ -72,23 +72,126 @@ class Chain(SerializablePreprocessorBase):
         else:
             return Preprocessor.FitStatus.NOT_FITTABLE
 
-    def __init__(self, *preprocessors: SerializablePreprocessorBase):
+    _VALID_BACKENDS = (None, "cpu", "gpu", "auto")
+
+    def __init__(
+        self,
+        *preprocessors: SerializablePreprocessorBase,
+        backend: Optional[str] = None,
+    ):
         super().__init__()
+        if backend not in self._VALID_BACKENDS:
+            raise ValueError(
+                f"Invalid backend {backend!r}. Expected one of "
+                f"{self._VALID_BACKENDS}."
+            )
         self._preprocessors = preprocessors
+        # Fusion backend. ``None``/``"cpu"`` -> today's per-child CPU behavior
+        # (no change). ``"gpu"``/``"auto"`` -> when a GPU is available, fuse
+        # contiguous runs of device-fusable children into a single
+        # device-resident pass (impute+encode+scale crossing PCIe once); falls
+        # back to the CPU path when no GPU/RAPIDS stack is present.
+        self._backend = backend
 
     @property
     def preprocessors(self) -> Tuple[SerializablePreprocessorBase, ...]:
         return self._preprocessors
 
+    @property
+    def backend(self) -> Optional[str]:
+        return self._backend
+
+    def _gpu_enabled(self) -> bool:
+        """True if this chain should use the fused device-resident GPU path."""
+        if self._backend in (None, "cpu"):
+            return False
+        from ray.data.preprocessors import _gpu
+
+        return _gpu.gpu_available()
+
+    def _upgrade_ops(self) -> Tuple[SerializablePreprocessorBase, ...]:
+        """Replace registered CPU children with their fusable GPU counterparts."""
+        from ray.data.preprocessors._gpu_fused import upgrade_to_device_op
+
+        return tuple(upgrade_to_device_op(op) for op in self._preprocessors)
+
+    @staticmethod
+    def _build_segments(ops, schema):
+        """Group ``ops`` into maximal contiguous fusable runs vs single ops.
+
+        Returns a list of ``("fused", [ops])`` / ``("single", op)`` segments. A
+        run is a maximal span of device-fusable ops that can fuse for the given
+        (input) schema; anything else breaks the run and runs on its own path.
+        """
+        from ray.data.preprocessors._gpu_fused import is_device_fusable
+
+        segments = []
+        run = []
+        for op in ops:
+            if is_device_fusable(op) and op._device_can_fuse(schema):
+                run.append(op)
+            else:
+                if run:
+                    segments.append(("fused", run))
+                    run = []
+                segments.append(("single", op))
+        if run:
+            segments.append(("fused", run))
+        return segments
+
     def _fit(self, ds: "Dataset") -> SerializablePreprocessorBase:
-        for preprocessor in self._preprocessors[:-1]:
-            ds = preprocessor.fit_transform(ds)
-        self._preprocessors[-1].fit(ds)
+        if not self._gpu_enabled():
+            for preprocessor in self._preprocessors[:-1]:
+                ds = preprocessor.fit_transform(ds)
+            self._preprocessors[-1].fit(ds)
+            return self
+
+        from ray.data.preprocessors._gpu_fused import (
+            _safe_schema,
+            fused_fit,
+            run_fused_device_transform,
+        )
+
+        ops = self._upgrade_ops()
+        self._preprocessors = ops
+        segments = self._build_segments(ops, _safe_schema(ds))
+        for i, (kind, payload) in enumerate(segments):
+            is_last = i == len(segments) - 1
+            if kind == "fused":
+                fused_fit(ds, payload)
+                for op in payload:
+                    op._fitted = True
+                if not is_last:
+                    ds = run_fused_device_transform(ds, payload)
+            else:
+                if is_last:
+                    payload.fit(ds)
+                else:
+                    ds = payload.fit_transform(ds)
         return self
 
     def fit_transform(self, ds: "Dataset") -> "Dataset":
-        for preprocessor in self._preprocessors:
-            ds = preprocessor.fit_transform(ds)
+        if not self._gpu_enabled():
+            for preprocessor in self._preprocessors:
+                ds = preprocessor.fit_transform(ds)
+            return ds
+
+        from ray.data.preprocessors._gpu_fused import (
+            _safe_schema,
+            fused_fit,
+            run_fused_device_transform,
+        )
+
+        ops = self._upgrade_ops()
+        self._preprocessors = ops
+        for kind, payload in self._build_segments(ops, _safe_schema(ds)):
+            if kind == "fused":
+                fused_fit(ds, payload)
+                for op in payload:
+                    op._fitted = True
+                ds = run_fused_device_transform(ds, payload)
+            else:
+                ds = payload.fit_transform(ds)
         return ds
 
     def _transform(
@@ -99,14 +202,37 @@ class Chain(SerializablePreprocessorBase):
         memory: Optional[float] = None,
         concurrency: Optional[int] = None,
     ) -> "Dataset":
-        for preprocessor in self._preprocessors:
-            ds = preprocessor.transform(
-                ds,
-                batch_size=batch_size,
-                num_cpus=num_cpus,
-                memory=memory,
-                concurrency=concurrency,
-            )
+        if not self._gpu_enabled():
+            for preprocessor in self._preprocessors:
+                ds = preprocessor.transform(
+                    ds,
+                    batch_size=batch_size,
+                    num_cpus=num_cpus,
+                    memory=memory,
+                    concurrency=concurrency,
+                )
+            return ds
+
+        from ray.data.preprocessors._gpu_fused import (
+            _safe_schema,
+            run_fused_device_transform,
+        )
+
+        for kind, payload in self._build_segments(
+            self._preprocessors, _safe_schema(ds)
+        ):
+            if kind == "fused":
+                ds = run_fused_device_transform(
+                    ds, payload, batch_size=batch_size, concurrency=concurrency
+                )
+            else:
+                ds = payload.transform(
+                    ds,
+                    batch_size=batch_size,
+                    num_cpus=num_cpus,
+                    memory=memory,
+                    concurrency=concurrency,
+                )
         return ds
 
     def _transform_batch(self, df: "DataBatchType") -> "DataBatchType":
@@ -130,11 +256,14 @@ class Chain(SerializablePreprocessorBase):
     def _get_serializable_fields(self) -> Dict[str, Any]:
         return {
             "preprocessors": self._preprocessors,
+            "backend": self._backend,
         }
 
     def _set_serializable_fields(self, fields: Dict[str, Any], version: int):
         # required fields
         self._preprocessors = fields["preprocessors"]
+        # optional fields
+        self._backend = fields.get("backend")
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Handle backwards compatibility for old pickled objects."""
@@ -145,3 +274,6 @@ class Chain(SerializablePreprocessorBase):
                 "_preprocessors": _PublicField(public_field="preprocessors"),
             },
         )
+        # ``backend`` was added later; default to CPU for old pickles.
+        if not hasattr(self, "_backend"):
+            self._backend = None
