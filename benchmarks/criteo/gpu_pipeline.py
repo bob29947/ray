@@ -226,7 +226,26 @@ def main() -> None:
         object_store_setting = f"{osm_bytes / 1024 ** 3:.0f} GiB (local, in-RAM /dev/shm)"
     else:
         osm_bytes = None
-        ray.init(address=args.ray_address, logging_level="ERROR")
+        # The GPU-preprocessor TUNING knobs (RMM pool, arrow compaction, pool
+        # fractions, VRAM override) are read WORKER-side -- inside the fused
+        # actors and fit reductions -- so unlike the driver-side knobs (batch
+        # size, num gpus, which are resolved here and passed as map_batches
+        # kwargs) they must travel to workers on other nodes via runtime_env.
+        # Snapshot whatever RAY_DATA_GPU_PREPROC_* vars the launch environment
+        # set and forward them to every worker for this job.
+        preproc_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith("RAY_DATA_GPU_PREPROC_")
+        }
+        if preproc_env:
+            P(f"propagating to workers (runtime_env): "
+              + ", ".join(sorted(preproc_env)))
+        ray.init(
+            address=args.ray_address,
+            logging_level="ERROR",
+            runtime_env={"env_vars": preproc_env} if preproc_env else None,
+        )
         object_store_setting = f"cluster-managed (address={args.ray_address})"
     logging.getLogger("ray.data").setLevel(logging.ERROR)
     ctx = ray.data.DataContext.get_current()

@@ -79,24 +79,6 @@ def env_batch_size(default: int = 1 << 20) -> int:
     return int(os.environ.get("RAY_DATA_GPU_PREPROC_BATCH_SIZE", default))
 
 
-def env_gpu_fraction(default: float = 1.0) -> float:
-    """Per-actor GPU fraction for the fused transform (``..._GPU_FRACTION``).
-
-    Defaults to ``1.0`` (one fused actor per physical GPU). Setting it ``< 1``
-    (e.g. ``0.5``) lets several fused actors share each physical GPU, so one
-    actor's H2D/D2H transfer overlaps another's compute (the standard way to hide
-    the PCIe tax in a host-staged GPU pipeline). Only the fused *transform* reads
-    this; the fit reductions keep one GPU per actor.
-    """
-    try:
-        v = float(os.environ.get("RAY_DATA_GPU_PREPROC_GPU_FRACTION", default))
-    except (TypeError, ValueError):
-        return default
-    if v <= 0.0 or v > 1.0:
-        return default
-    return v
-
-
 # Auto GPU block (device batch) sizing. The fused pass holds the input columns,
 # the produced columns, and cuDF intermediates on the device at once, so the
 # per-batch device working set scales with ``rows * bytes_per_row``. We pick a
@@ -145,6 +127,85 @@ def per_gpu_vram_bytes(default: int = _L4_VRAM_BYTES) -> int:
     except Exception:
         pass
     return int(default)
+
+
+# --------------------------------------------------------------------------- #
+# Optional per-worker tuning knobs (opt-in; default off so behaviour is
+# unchanged unless explicitly enabled). Each is read at call time so the
+# benchmark / pipeline can A/B them via the environment.
+#
+#   RAY_DATA_GPU_PREPROC_RMM_POOL=1
+#       Install a pooled RMM allocator on each GPU worker. By default cuDF
+#       services every allocation (each intermediate column, each op output) via
+#       cudaMalloc/cudaFree -- synchronous driver calls paid per op, per block.
+#       A pool pre-allocates a slab once and sub-allocates from it, removing that
+#       per-op overhead from BOTH the fit reductions and the fused transform.
+#       The pool starts small and grows on demand (so it never grabs more VRAM
+#       than the non-pooled peak), capped at RMM_MAX_FRACTION of the device.
+# --------------------------------------------------------------------------- #
+_RMM_POOL_READY = False
+
+
+def env_rmm_pool() -> bool:
+    """Whether to install a pooled RMM allocator on each GPU worker."""
+    return os.environ.get("RAY_DATA_GPU_PREPROC_RMM_POOL", "0") == "1"
+
+
+def env_fit_single_pass() -> bool:
+    """Single-pass driver merge for the fit reductions (default ON).
+
+    The per-block unique / value-count partials are concatenated and merged on
+    the driver. The single-pass path collapses the old per-column ``filter +
+    unique`` (one full scan of the concatenated partials *per column*) into ONE
+    ``group_by`` over all columns at once -- strictly fewer passes for >= 2 fit
+    columns, equal-or-lower peak memory, and bit-identical results (uniques keep
+    nulls so the encoder can still reproduce raise-on-null; value counts already
+    drop nulls per block). Set ``RAY_DATA_GPU_PREPROC_FIT_SINGLE_PASS=0`` to
+    restore the per-column path -- a removable escape hatch for a one-time
+    null-parity / pyarrow-version check, NOT a performance knob.
+    """
+    return os.environ.get("RAY_DATA_GPU_PREPROC_FIT_SINGLE_PASS", "1") != "0"
+
+
+def ensure_rmm_pool() -> None:
+    """Install a pooled RMM allocator once per worker process (idempotent).
+
+    No-op when ``RAY_DATA_GPU_PREPROC_RMM_POOL`` is unset, when RMM is missing, or
+    after the first call (a process-global flag keeps it ~free per block). Never
+    raises -- a pool is a pure speedup, so any failure silently leaves the
+    default (cudaMalloc-per-op) allocator in place.
+    """
+    global _RMM_POOL_READY
+    if _RMM_POOL_READY:
+        return
+    # Set the flag first: even on failure we must not retry on every block.
+    _RMM_POOL_READY = True
+    if not env_rmm_pool():
+        return
+    def _envf(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        import rmm
+
+        total = per_gpu_vram_bytes()
+        init_frac = _envf("RAY_DATA_GPU_PREPROC_RMM_INIT_FRACTION", 0.10)
+        max_frac = _envf("RAY_DATA_GPU_PREPROC_RMM_MAX_FRACTION", 0.80)
+        init_bytes = max(1 << 28, int(total * max(0.0, min(init_frac, max_frac))))
+        max_bytes = int(total * max(init_frac, min(max_frac, 1.0)))
+        # 256-byte aligned, as RMM expects.
+        init_bytes -= init_bytes % 256
+        max_bytes -= max_bytes % 256
+        rmm.reinitialize(
+            pool_allocator=True,
+            initial_pool_size=init_bytes,
+            maximum_pool_size=max_bytes,
+        )
+    except Exception:
+        pass
 
 
 def auto_gpu_block_rows(
@@ -278,9 +339,12 @@ class _GpuBatchActor:
         apply_fn: Callable[[Any, "pa.Table"], "pa.Table"],
     ):
         # Touch cuDF here so the CUDA context + RMM initialization is paid once,
-        # at actor construction, instead of on the first batch.
+        # at actor construction, instead of on the first batch. Installing the
+        # pooled allocator (if enabled) here means every subsequent device
+        # allocation in this actor's transforms is served from the pool.
         import cudf  # noqa: F401
 
+        ensure_rmm_pool()
         self._apply = apply_fn
         self._state = build_state()
 
@@ -308,7 +372,7 @@ def gpu_transform(
         fn_constructor_kwargs={"build_state": build_state, "apply_fn": apply_fn},
         batch_format="pyarrow",
         zero_copy_batch=True,
-        num_gpus=env_gpu_fraction(),
+        num_gpus=1,
         batch_size=bs,
         concurrency=conc,
     )
@@ -353,6 +417,11 @@ def from_arrow_robust(table: "pa.Table"):
     """
     import cudf
 
+    # Install the pooled allocator once per worker (no-op unless enabled). This
+    # is the single H2D entry point for BOTH the fit reductions and the fused
+    # transform, so it is the natural place to guarantee the pool is ready.
+    ensure_rmm_pool()
+
     try:
         return cudf.DataFrame.from_arrow(table)
     except RuntimeError:
@@ -392,7 +461,6 @@ def gpu_unique_values(
     Returns ``{column: pyarrow.Array}`` of the global unique values.
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     bs = batch_size if batch_size is not None else env_batch_size()
     conc = concurrency if concurrency is not None else env_num_gpus()
@@ -426,12 +494,7 @@ def gpu_unique_values(
             partials.iter_batches(batch_format="pyarrow", batch_size=None)
         )
         merged = pa.concat_tables(tables) if tables else None
-        for col in group:
-            if merged is None or merged.num_rows == 0:
-                out[col] = pa.array([])
-                continue
-            sub = merged.filter(pc.equal(merged.column("__col"), col))
-            out[col] = pc.unique(_combine(sub.column("value")))
+        out.update(_merge_uniques_table(merged, group))
 
     return out
 
@@ -620,7 +683,6 @@ def gpu_value_counts(
     ties broken by the smallest value).
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
 
     bs = batch_size if batch_size is not None else env_batch_size()
     conc = concurrency if concurrency is not None else env_num_gpus()
@@ -665,36 +727,7 @@ def gpu_value_counts(
             partials.iter_batches(batch_format="pyarrow", batch_size=None)
         )
         merged = pa.concat_tables(tables) if tables else None
-
-        for col in group:
-            if merged is None or merged.num_rows == 0:
-                out[col] = pa.table(
-                    {"value": pa.array([]), "count": pa.array([], pa.int64())}
-                )
-                continue
-            sub = merged.filter(pc.equal(merged.column("__col"), col))
-            if sub.num_rows == 0:
-                out[col] = pa.table(
-                    {"value": pa.array([]), "count": pa.array([], pa.int64())}
-                )
-                continue
-            # Sum counts per distinct value (a value may recur across blocks).
-            grouped = (
-                pa.table(
-                    {
-                        "value": _combine(sub.column("value")),
-                        "count": _combine(sub.column("count")),
-                    }
-                )
-                .group_by("value")
-                .aggregate([("count", "sum")])
-            )
-            out[col] = pa.table(
-                {
-                    "value": grouped.column("value"),
-                    "count": grouped.column("count_sum").cast(pa.int64()),
-                }
-            )
+        out.update(_merge_value_counts_table(merged, group))
     return out
 
 
@@ -803,15 +836,31 @@ def _uniques_partial(gdf, group: List[str]) -> "pa.Table":
 def _merge_uniques_table(
     merged: Optional["pa.Table"], group: List[str]
 ) -> Dict[str, "pa.Array"]:
-    """De-duplicate per-block unique partials (matches :func:`gpu_unique_values`)."""
+    """De-duplicate per-block unique partials (matches :func:`gpu_unique_values`).
+
+    Single pass (default): one ``group_by(["__col", "value"])`` over the
+    concatenated partials yields the distinct ``(col, value)`` pairs in a single
+    scan -- a null value forms its own group, kept exactly as ``pc.unique`` would
+    (the encoder needs it to reproduce raise-on-null). The per-column
+    ``filter + pc.unique`` (one full scan per column) is the escape hatch under
+    ``RAY_DATA_GPU_PREPROC_FIT_SINGLE_PASS=0``. Both produce identical sets.
+    """
     import pyarrow as pa
     import pyarrow.compute as pc
 
+    if merged is None or merged.num_rows == 0:
+        return {col: pa.array([]) for col in group}
+
+    if env_fit_single_pass():
+        distinct = merged.group_by(["__col", "value"]).aggregate([])
+        col_arr = distinct.column("__col")
+        val_arr = distinct.column("value")
+        return {
+            col: _combine(val_arr.filter(pc.equal(col_arr, col))) for col in group
+        }
+
     out: Dict[str, "pa.Array"] = {}
     for col in group:
-        if merged is None or merged.num_rows == 0:
-            out[col] = pa.array([])
-            continue
         sub = merged.filter(pc.equal(merged.column("__col"), col))
         out[col] = pc.unique(_combine(sub.column("value")))
     return out
@@ -843,16 +892,43 @@ def _value_counts_partial(gdf, group: List[str]) -> "pa.Table":
 def _merge_value_counts_table(
     merged: Optional["pa.Table"], group: List[str]
 ) -> Dict[str, "pa.Table"]:
-    """Sum per-block value-count partials (matches :func:`gpu_value_counts`)."""
+    """Sum per-block value-count partials (matches :func:`gpu_value_counts`).
+
+    Single pass (default): one ``group_by(["__col", "value"]).sum(count)`` over
+    the concatenated partials sums counts for every column at once (nulls were
+    already dropped per block via ``value_counts(dropna=True)``). The per-column
+    path (one scan per column) is the escape hatch under
+    ``RAY_DATA_GPU_PREPROC_FIT_SINGLE_PASS=0``. Both produce identical counts.
+    """
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    out: Dict[str, "pa.Table"] = {}
     empty = pa.table({"value": pa.array([]), "count": pa.array([], pa.int64())})
+    if merged is None or merged.num_rows == 0:
+        return {col: empty for col in group}
+
+    if env_fit_single_pass():
+        summed = merged.group_by(["__col", "value"]).aggregate([("count", "sum")])
+        col_arr = summed.column("__col")
+        val_arr = summed.column("value")
+        cnt_arr = summed.column("count_sum")
+        out: Dict[str, "pa.Table"] = {}
+        for col in group:
+            mask = pc.equal(col_arr, col)
+            vals = _combine(val_arr.filter(mask))
+            if len(vals) == 0:
+                out[col] = empty
+                continue
+            out[col] = pa.table(
+                {
+                    "value": vals,
+                    "count": _combine(cnt_arr.filter(mask)).cast(pa.int64()),
+                }
+            )
+        return out
+
+    out: Dict[str, "pa.Table"] = {}
     for col in group:
-        if merged is None or merged.num_rows == 0:
-            out[col] = empty
-            continue
         sub = merged.filter(pc.equal(merged.column("__col"), col))
         if sub.num_rows == 0:
             out[col] = empty

@@ -176,7 +176,6 @@ def _run_gpu_variant(
     num_gpus: int,
     batch_rows: int,
     fit_mode: str,
-    overlap: bool,
     profile_dir: str,
     warmup: int,
     repeats: int,
@@ -192,13 +191,8 @@ def _run_gpu_variant(
     os.environ["RAY_DATA_GPU_PREPROC_BATCH_SIZE"] = str(batch_rows)
     # One-scan vs three-scan fit.
     os.environ["RAY_DATA_GPU_PREPROC_FUSED_FIT"] = "1" if fit_mode == "one" else "0"
-    # Transfer/compute overlap: pack 2 fused transform actors per physical GPU
-    # (GPU_FRACTION=0.5) so one actor's H2D/D2H overlaps another's compute. ``num_gpus``
-    # is the PHYSICAL GPU count; fit keeps one actor per GPU, the transform doubles.
-    frac = 0.5 if overlap else 1.0
-    os.environ["RAY_DATA_GPU_PREPROC_GPU_FRACTION"] = str(frac)
     fit_conc = num_gpus
-    xform_conc = num_gpus if not overlap else int(round(num_gpus / frac))
+    xform_conc = num_gpus
     os.environ["RAY_DATA_GPU_PREPROC_PROFILE"] = "1"
     os.environ["RAY_DATA_GPU_PREPROC_PROFILE_DIR"] = profile_dir
 
@@ -234,9 +228,7 @@ def _run_gpu_variant(
         "num_gpus": num_gpus,
         "batch_rows": batch_rows,
         "fit_mode": fit_mode,
-        "overlap": overlap,
         "xform_concurrency": xform_conc,
-        "gpu_fraction": frac,
         "fit_s": round(statistics.median(fit_s), 3),
         "transform_s": round(statistics.median(tr_s), 3),
         "total_s": round(statistics.median(tot_s), 3),
@@ -337,10 +329,9 @@ def _build_sorted_input(args, roles):
 def _label(v: Dict[str, Any]) -> str:
     if v["kind"] == "cpu":
         return "CPU impute+encode+scale"
-    ov = "+ovlp" if v.get("overlap") else ""
     return (
         f"GPU g={v['num_gpus']:<2} batch={v['batch_rows']/1e6:.2f}M "
-        f"fit={v['fit_mode']:<5}{ov}"
+        f"fit={v['fit_mode']:<5}"
     )
 
 
@@ -406,8 +397,6 @@ def main() -> None:
                     help="comma list of device batch rows; 'auto' = VRAM-aware sizer")
     ap.add_argument("--fit-modes", default="three",
                     help="comma list of fit modes: 'three' (per-kind scans), 'one' (single scan)")
-    ap.add_argument("--overlap-modes", default="off",
-                    help="comma list: 'off','on' (transfer/compute overlap)")
 
     ap.add_argument("--repeats", type=int, default=3, help="timed GPU repeats per variant")
     ap.add_argument("--warmup", type=int, default=1, help="discarded GPU warmup runs per variant")
@@ -458,7 +447,6 @@ def main() -> None:
 
     batch_specs = [s.strip() for s in args.gpu_batch_sizes.split(",") if s.strip()]
     fit_modes = [s.strip() for s in args.fit_modes.split(",") if s.strip()]
-    overlap_modes = [s.strip().lower() == "on" for s in args.overlap_modes.split(",") if s.strip()]
 
     # Resolve column roles (lean today; 'wide' once that lever lands in criteo).
     try:
@@ -492,17 +480,16 @@ def main() -> None:
         P(f"  CPU subtotal median: {cpu_res['total_s']:.2f}s")
 
     gpu_results: List[Dict[str, Any]] = []
-    variants = list(itertools.product(num_gpus_list, batch_specs, fit_modes, overlap_modes))
+    variants = list(itertools.product(num_gpus_list, batch_specs, fit_modes))
     P(f"\nsweeping {len(variants)} GPU variant(s) ...")
-    for num_gpus, batch_spec, fit_mode, overlap in variants:
+    for num_gpus, batch_spec, fit_mode in variants:
         batch_rows = _resolve_batch(batch_spec, sorted_ds, num_gpus)
-        P(f"  -> g={num_gpus} batch={batch_rows:,} fit={fit_mode} "
-          f"overlap={'on' if overlap else 'off'} ...")
+        P(f"  -> g={num_gpus} batch={batch_rows:,} fit={fit_mode} ...")
         try:
             res = _run_gpu_variant(
                 sorted_ds, roles,
                 num_gpus=num_gpus, batch_rows=batch_rows, fit_mode=fit_mode,
-                overlap=overlap, profile_dir=profile_dir,
+                profile_dir=profile_dir,
                 warmup=args.warmup, repeats=args.repeats,
             )
             P(f"     fit={res['fit_s']:.2f}s transform={res['transform_s']:.2f}s "
@@ -511,7 +498,7 @@ def main() -> None:
         except Exception as e:  # keep the sweep going if one config errors
             res = {
                 "kind": "gpu", "num_gpus": num_gpus, "batch_rows": batch_rows,
-                "fit_mode": fit_mode, "overlap": overlap, "total_s": None,
+                "fit_mode": fit_mode, "total_s": None,
                 "error": f"{type(e).__name__}: {e}".splitlines()[0][:200],
             }
             P(f"     FAILED: {res['error']}")
