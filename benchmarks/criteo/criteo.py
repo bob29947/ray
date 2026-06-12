@@ -27,6 +27,7 @@ Targets: ``is_clicked``, ``is_click_landed``, ``is_visit`` (binary) and
 from __future__ import annotations
 
 import glob
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -77,6 +78,80 @@ NOT_AVAILABLE_BUCKET = "features_not_available_"
 
 # A column is treated as "all null" (and dropped) at/above this null fraction.
 ALL_NULL_THRESHOLD = 0.999
+
+# --------------------------------------------------------------------------- #
+# High-cardinality routing (realistic categorical handling)
+# --------------------------------------------------------------------------- #
+# Integer feature columns are categorical, but blindly OrdinalEncoding ALL of
+# them builds a dense vocabulary with one entry per distinct value. At 30-day
+# scale features_ctx_not_constrained_4/5 reach ~8.8M/12.2M distinct values, so
+# their dense vocab (a) is unrealistic (memorizes once-seen IDs) and (b) OOMs
+# (the driver-side vocab merge / per-task vocab). Instead we estimate each
+# integer column's cardinality and route the ultra-high-card ones to a STATELESS
+# HASHING path (value -> hash(value) mod hash_buckets), keeping a bounded
+# bucket-index feature; low/mid-card columns (campaign_id, publisher_id, ...)
+# stay on OrdinalEncoder.
+DEFAULT_MAX_CARDINALITY = 1_000_000
+DEFAULT_HASH_BUCKETS = 1 << 20  # 1,048,576 buckets
+# Fixed 64-bit seed mixed into the avalanche so the hash is deterministic across
+# processes / machines and byte-identical on the CPU vs GPU pipelines (both run
+# the hashing in the shared CPU prep stage). NOT Python's salted hash().
+HASH_SEED = 0x9E3779B97F4A7C15
+# Cardinality is not recorded in parquet footers, so it must be read from the
+# data. ``card_sample_rows = 0`` (default) does an EXACT distinct count over the
+# full dataset; a positive value caps the rows scanned (approximate -- see the
+# caveat in :func:`estimate_cardinalities`). The scan reads ONLY the few integer
+# candidate columns (projection), which is cheap relative to the pipeline's
+# full-width read.
+DEFAULT_CARD_SAMPLE_ROWS = 0
+# Streaming batch size for the distinct scan (rows per batch).
+_CARD_BATCH_ROWS = 2_000_000
+# Collapse each column's accumulated unique values to a running set every N
+# batches, so peak driver memory stays ~the largest column's distinct count.
+_CARD_COLLAPSE_EVERY = 8
+
+
+def hash_indices(
+    values: "pa.Array",
+    num_buckets: int,
+    *,
+    seed: int = HASH_SEED,
+) -> "pa.Array":
+    """Stateless, deterministic hash of an integer column to bucket indices.
+
+    Maps each value ``v`` to ``fmix64(v XOR seed) mod num_buckets`` as an int32
+    bucket-index feature (treated like a categorical index: not scaled, not
+    dropped). Nulls map to bucket 0. ``fmix64`` is MurmurHash3's 64-bit
+    finalizer, applied with numpy uint64 (wrap-around) arithmetic, so it is fast,
+    well-distributed, and -- with the fixed ``seed`` -- byte-identical across
+    processes, machines, and the CPU vs GPU pipelines. Stateless: no fit, no
+    vocabulary.
+    """
+    import numpy as np
+    import pyarrow.compute as pc
+
+    if num_buckets <= 0:
+        raise ValueError(f"num_buckets must be positive, got {num_buckets}")
+    arr = values.combine_chunks() if isinstance(values, pa.ChunkedArray) else values
+    # int bit-pattern -> uint64 (nulls filled with 0 for the math; overwritten
+    # to bucket 0 at the end so a real null is deterministic, not arbitrary).
+    filled = arr.fill_null(0)
+    x = filled.to_numpy(zero_copy_only=False).astype(np.int64, copy=False).view(np.uint64)
+    c1 = np.uint64(0xFF51AFD7ED558CCD)
+    c2 = np.uint64(0xC4CEB9FE1A85EC53)
+    s33 = np.uint64(33)
+    with np.errstate(over="ignore"):
+        h = x ^ np.uint64(seed & 0xFFFFFFFFFFFFFFFF)
+        h ^= h >> s33
+        h *= c1
+        h ^= h >> s33
+        h *= c2
+        h ^= h >> s33
+        buckets = (h % np.uint64(num_buckets)).astype(np.int64)
+    out = pa.array(buckets, type=pa.int32())
+    if arr.null_count:
+        out = pc.if_else(pc.is_null(arr), pa.scalar(0, pa.int32()), out)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -326,6 +401,107 @@ def null_fractions_days(days: List[int]) -> Tuple[Dict[str, float], int]:
 
 
 # --------------------------------------------------------------------------- #
+# Cardinality estimation (exact distinct scan; not in parquet footers)
+# --------------------------------------------------------------------------- #
+def _interleaved_shard_paths(days: List[int]) -> List[str]:
+    """All shard paths for ``days``, interleaved across days (shard i of every
+    day, then shard i+1, ...). So a row-capped scan still spans every day rather
+    than reading only day 1."""
+    per_day = {d: parquet_paths(d) for d in days}
+    maxlen = max((len(v) for v in per_day.values()), default=0)
+    out: List[str] = []
+    for i in range(maxlen):
+        for d in days:
+            shards = per_day[d]
+            if i < len(shards):
+                out.append(shards[i])
+    return out
+
+
+def _open_dataset(paths: List[str]):
+    """A ``pyarrow.dataset`` over ``paths`` (local OR ``s3://``)."""
+    import pyarrow.dataset as pads
+
+    if not paths:
+        return None
+    if is_s3(paths[0]):
+        import pyarrow.fs as pafs
+
+        fs, _ = pafs.FileSystem.from_uri(paths[0])
+        native = [p[len("s3://"):] for p in paths]
+        return pads.dataset(native, filesystem=fs, format="parquet")
+    return pads.dataset(paths, format="parquet")
+
+
+def estimate_cardinalities(
+    days: List[int], columns: List[str], total_rows: int, *, sample_rows: int = 0
+) -> Tuple[Dict[str, int], int]:
+    """Per-column distinct count, read straight from the data (exact by default).
+
+    Returns ``({column: cardinality}, rows_scanned)``. Reads ONLY ``columns``
+    (projection pushdown) in streaming batches and accumulates each column's set
+    of unique values, collapsing periodically so peak memory stays ~the largest
+    column's distinct count.
+
+    ``sample_rows = 0`` (default) scans the full dataset -> EXACT cardinality.
+    A positive ``sample_rows`` stops early after that many rows (shards are
+    interleaved across days so the partial scan still spans the full date range).
+
+    .. note::
+        An exact scan is used by default on purpose: the CriteoPrivateAd shards
+        are clustered by value range (each ~400k-row shard holds only a slice of
+        the global value space), so a partial-read sample severely *under*-counts
+        cardinality and would mis-route an ultra-high-card column to the dense
+        encoder. Reading the handful of narrow integer candidate columns in full
+        is cheap next to the pipeline's full-width read.
+    """
+    import pyarrow.compute as pc
+
+    cols = list(columns)
+    paths = _interleaved_shard_paths(days)
+    dataset = _open_dataset(paths)
+    if dataset is None or not cols:
+        return {c: 0 for c in cols}, 0
+
+    buf: Dict[str, List["pa.Array"]] = {c: [] for c in cols}
+    running: Dict[str, Optional["pa.Array"]] = {c: None for c in cols}
+
+    def _collapse(c: str) -> None:
+        arrs = ([running[c]] if running[c] is not None else []) + buf[c]
+        if arrs:
+            running[c] = pc.unique(pa.concat_arrays(arrs))
+        buf[c] = []
+
+    rows = 0
+    nb = 0
+    for batch in dataset.to_batches(columns=cols, batch_size=_CARD_BATCH_ROWS):
+        if batch.num_rows == 0:
+            continue
+        tbl = pa.Table.from_batches([batch])
+        for c in cols:
+            if c in tbl.column_names:
+                buf[c].append(pc.unique(tbl.column(c).combine_chunks()))
+        rows += batch.num_rows
+        nb += 1
+        if nb % _CARD_COLLAPSE_EVERY == 0:
+            for c in cols:
+                _collapse(c)
+        if sample_rows and rows >= sample_rows:
+            break
+    for c in cols:
+        _collapse(c)
+
+    est: Dict[str, int] = {}
+    for c in cols:
+        u = running[c]
+        if u is None:
+            est[c] = 0
+        else:
+            est[c] = len(u.filter(pc.invert(pc.is_null(u))))
+    return est, rows
+
+
+# --------------------------------------------------------------------------- #
 # Column-role resolution
 # --------------------------------------------------------------------------- #
 def _in_kept_bucket(name: str) -> bool:
@@ -343,10 +519,17 @@ class ColumnRoles:
     targets_binary: List[str] = field(default_factory=list)
     sales_raw: str = SALES_RAW
     categorical: List[str] = field(default_factory=list)  # -> OrdinalEncoder
+    hashed: List[str] = field(default_factory=list)  # -> stateless hashing
     numeric_raw: List[str] = field(default_factory=list)  # double feature cols
     list_features: List[str] = field(default_factory=list)  # -> <col>_len
     dropped: Dict[str, List[str]] = field(default_factory=dict)
     sort_key: List[str] = field(default_factory=list)
+
+    # High-cardinality routing config + the sample-based estimates that drove it.
+    max_cardinality: int = DEFAULT_MAX_CARDINALITY
+    hash_buckets: int = DEFAULT_HASH_BUCKETS
+    card_sample_rows: int = 0  # rows actually sampled (0 = explicit list / none)
+    estimated_cardinalities: Dict[str, int] = field(default_factory=dict)
 
     null_indicator_threshold: float = 0.01
     # "lean" (default): the inference-realistic recipe -- drop the 80
@@ -414,18 +597,26 @@ class ColumnRoles:
 
 def column_roles(
     day: int, *, null_indicator_threshold: float = 0.01, multi_day: bool = False,
-    feature_set: str = "lean",
+    feature_set: str = "lean", max_cardinality: int = DEFAULT_MAX_CARDINALITY,
+    hash_buckets: int = DEFAULT_HASH_BUCKETS,
+    card_sample_rows: int = DEFAULT_CARD_SAMPLE_ROWS,
+    high_card_cols: Optional[List[str]] = None,
 ) -> ColumnRoles:
     """Back-compat single-day wrapper around :func:`column_roles_multi`."""
     return column_roles_multi(
         [day], null_indicator_threshold=null_indicator_threshold,
-        feature_set=feature_set,
+        feature_set=feature_set, max_cardinality=max_cardinality,
+        hash_buckets=hash_buckets, card_sample_rows=card_sample_rows,
+        high_card_cols=high_card_cols,
     )
 
 
 def column_roles_multi(
     days: List[int], *, null_indicator_threshold: float = 0.01,
-    feature_set: str = "lean",
+    feature_set: str = "lean", max_cardinality: int = DEFAULT_MAX_CARDINALITY,
+    hash_buckets: int = DEFAULT_HASH_BUCKETS,
+    card_sample_rows: int = DEFAULT_CARD_SAMPLE_ROWS,
+    high_card_cols: Optional[List[str]] = None,
 ) -> ColumnRoles:
     """Resolve column roles from the selected days' schema + null fractions.
 
@@ -436,11 +627,19 @@ def column_roles_multi(
     ``feature_set``: ``"lean"`` (default) drops the ``features_not_available_*``
     bucket (not available at inference -- the realistic recipe). ``"wide"`` keeps
     that bucket as features, classified by dtype exactly like the kept buckets
-    (list -> ``<col>_len``, floating -> numeric, integer -> categorical),
+    (list -> ``<col>_len``, floating -> numeric, integer -> categorical/hashed),
     all-null columns still dropped. ``"wide"`` roughly doubles the processed
     column count, giving the fused GPU stage a much wider frame to amortize its
     fixed per-batch/launch costs; the steps themselves are unchanged, so the CPU
     and GPU pipelines stay a fair, identical-work comparison.
+
+    Integer feature columns are categorical by nature, but ones whose estimated
+    cardinality exceeds ``max_cardinality`` are routed to a stateless HASHING
+    path (``roles.hashed``) instead of a dense OrdinalEncoder vocabulary --
+    realistic and bounded (see :func:`hash_indices`). Cardinality is estimated
+    from a ``card_sample_rows`` row sample (:func:`estimate_cardinalities`);
+    pass ``high_card_cols`` to skip sampling and force an explicit set instead.
+    ``campaign_id`` / ``publisher_id`` are always kept on OrdinalEncoder.
     """
     if feature_set not in ("lean", "wide"):
         raise ValueError(f"feature_set must be 'lean' or 'wide', got {feature_set!r}")
@@ -456,6 +655,8 @@ def column_roles_multi(
         null_indicator_threshold=null_indicator_threshold,
         feature_set=feature_set,
         sort_key=sort_key(multi_day=multi),
+        max_cardinality=max_cardinality,
+        hash_buckets=hash_buckets,
     )
     dropped = {
         "id": [],
@@ -465,6 +666,13 @@ def column_roles_multi(
         "all_null": [],
     }
     keep_not_available = feature_set == "wide"
+
+    # Integer feature columns eligible for the cardinality-based ordinal-vs-hash
+    # split (campaign_id / publisher_id are excluded: always ordinal). Collected
+    # in schema order; provisionally added to ``categorical`` then moved to
+    # ``hashed`` below if estimated high-cardinality, so both lists stay in
+    # schema order.
+    int_candidates: List[str] = []
 
     for f_ in schema:
         name, typ = f_.name, f_.type
@@ -502,9 +710,27 @@ def column_roles_multi(
                 roles.numeric_raw.append(name)
             elif pa.types.is_integer(typ):
                 roles.categorical.append(name)
+                int_candidates.append(name)
             continue
         # Anything unclassified is conservatively dropped (none expected).
         dropped.setdefault("other", []).append(name)
+
+    # Split the integer categoricals into bounded-vocab ORDINAL vs ultra-high-
+    # cardinality HASHED, using an explicit override list when given, else an
+    # estimate from a row sample.
+    high_card: set = set()
+    if high_card_cols is not None:
+        cand = set(int_candidates)
+        high_card = {c for c in high_card_cols if c in cand}
+    elif int_candidates:
+        cards, scanned = estimate_cardinalities(
+            days, int_candidates, total, sample_rows=card_sample_rows
+        )
+        roles.estimated_cardinalities = cards
+        roles.card_sample_rows = scanned
+        high_card = {c for c, n in cards.items() if n > max_cardinality}
+    roles.hashed = [c for c in int_candidates if c in high_card]
+    roles.categorical = [c for c in roles.categorical if c not in high_card]
 
     roles.dropped = dropped
     return roles

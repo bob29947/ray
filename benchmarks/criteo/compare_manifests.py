@@ -86,9 +86,32 @@ def _check_vocab(gpu_f: Dict, cpu_f: Dict) -> Tuple[bool, str]:
     cols = sorted(set(g) & set(c))
     mism = [(col, g[col], c[col]) for col in cols if g[col] != c[col]]
     ok = not mism
-    detail = f"encoder vocab: {len(cols)} cols, {len(mism)} mismatch"
+    g_max = max(g.values(), default=0)
+    c_max = max(c.values(), default=0)
+    detail = (
+        f"encoder vocab: {len(cols)} cols, {len(mism)} mismatch "
+        f"(max vocab gpu={g_max:,} cpu={c_max:,})"
+    )
     if mism:
         detail += " e.g. " + ", ".join(f"{col}(gpu={a},cpu={b})" for col, a, b in mism[:3])
+    return ok, detail
+
+
+def _check_hashed(gpu: Dict, cpu: Dict) -> Tuple[bool, str]:
+    """Hashed high-card columns + bucket count must match exactly.
+
+    The hashing is stateless and done in the shared CPU prep stage with a fixed
+    seed, so identical (column set, hash_buckets) on both sides guarantees
+    byte-identical hashed indices -- there is no fitted state to drift."""
+    g = sorted(gpu.get("columns", {}).get("hashed", []) or [])
+    c = sorted(cpu.get("columns", {}).get("hashed", []) or [])
+    gb, cb = gpu.get("hash_buckets"), cpu.get("hash_buckets")
+    ok = (g == c) and (gb == cb)
+    detail = (
+        f"hashed cols: gpu={len(g)} cpu={len(c)} "
+        f"(buckets gpu={gb} cpu={cb}); "
+        + ("same set" if g == c else f"DIFFER gpu={g} cpu={c}")
+    )
     return ok, detail
 
 
@@ -163,6 +186,7 @@ def main() -> None:
         _check_scaler(gpu_f, cpu_f, args.rtol),
         _check_vocab(gpu_f, cpu_f),
         _check_imputer(gpu_f, cpu_f, args.rtol),
+        _check_hashed(gpu, cpu),
     ]
     all_ok = True
     for ok, detail in results:

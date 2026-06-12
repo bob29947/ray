@@ -1,9 +1,9 @@
 # GPU Ray cluster on AWS for the fused CriteoPrivateAd preprocessing benchmark.
 #
-# Single-GPU networked nodes (the design target): 8x g6.4xlarge, each 1x NVIDIA
+# Single-GPU networked nodes (the design target): 4x g6.4xlarge, each 1x NVIDIA
 # L4 (24 GB), PCIe Gen4, NO NVLink. This matches the fused, device-resident
 # preprocessing path -- per-block residency (PCIe is the tax), no cross-node GPU
-# shuffle. Compare against the 8x m5dn.4xlarge CPU baseline in cluster/ray-cpu.yaml.
+# shuffle. Compare against the 4x m5dn.4xlarge CPU baseline in cluster/ray-cpu.yaml.
 #
 # Like ray-cpu.yaml, it ships and installs the Ray WHEEL BUILT FROM THIS WORKTREE
 # (mounted from ./dist) plus the RAPIDS stack (cudf/rmm/cupy) needed by the GPU
@@ -30,33 +30,35 @@
 #
 # GPU benchmark full 30-day (the tuned run; everything auto -- Ray sizes
 # read/sort blocks, the fused device batch is VRAM-auto, and the fused worker
-# count defaults to the cluster's 8 GPUs; this is exactly how a real user runs
-# it -- no manual --blocks / --gpu-batch-size / --gpu-num-gpus):
+# count defaults to the cluster's 4 GPUs; this is exactly how a real user runs
+# it -- no manual --blocks / --gpu-batch-size / --gpu-num-gpus). High-card columns
+# are auto-detected (exact distinct scan) and hashed -- no manual config:
 #   ray exec cluster/ray-gpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_8node --ray-address auto --overwrite'
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_4v4 --ray-address auto --overwrite'
 #
 # GPU benchmark full 30-day, WIDE feature set (keep features_not_available_* as
 # features -> ~2x wider fused frame; run the CPU baseline with --feature-set wide
 # too for a fair compare):
 #   ray exec cluster/ray-gpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --feature-set wide --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_8node_wide --ray-address auto --overwrite'
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --feature-set wide --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_4v4_wide --ray-address auto --overwrite'
 #
 # Tear down:
 #   ray down cluster/ray-gpu.yaml -y
 
 cluster_name: ray-gpu-e2e-bobbwang
 
-# Cluster size: 1 COORDINATOR head + N GPU workers = N fused L4 GPUs.
-# TUNED for the benchmark: 8 total nodes = 1 coordinator head (no tasks; see
-# head_start_ray_commands) + 7 g6.4xlarge workers = 7 fused L4 GPUs, matched 1:1
-# against the CPU cluster (cluster/ray-cpu.yaml, also 1 coordinator + 7 workers).
-# The fused impute+encode+scale stage parallelizes across these 7 worker GPUs
-# with no cross-node GPU traffic; the fused worker count auto-defaults to the
-# cluster GPU total (7, since the coordinator advertises 0 GPUs). The head is a
-# pure coordinator because the 30-day driver needs ~38 GiB to merge the fused-fit
-# vocab reductions and must not share its 64 GiB node with sort tasks. For X
-# worker GPUs set top-level max_workers and the worker min/max_workers all to X.
-max_workers: 7
+# Cluster size: TRUE 4v4 -- 1 head + 3 GPU workers = 4 fused L4 GPUs, ALL
+# nodes run tasks (no dedicated coordinator head). The head is a full worker:
+# it advertises its detected {CPU:16, GPU:1} and runs read/sort/fused tasks like
+# the 3 workers. This is safe now that the high-cardinality columns are HASHED in
+# the shared prep stage (criteo.hash_indices): the OrdinalEncoder vocab is bounded
+# (max ~270k vs the old 8.8M/12.2M dense vocab), so the driver-side fused-fit
+# merge is small and no longer needs a 64 GiB node to itself -- the coordinator
+# head + CPU concurrency-cap workaround is removed. Matched 1:1 against the CPU
+# cluster (cluster/ray-cpu.yaml, also 1 head + 3 workers, all running tasks). The
+# fused worker count auto-defaults to the cluster GPU total (4). For X total GPU
+# nodes set top-level max_workers and the worker min/max_workers all to X-1.
+max_workers: 3
 
 upscaling_speed: 1.0
 
@@ -85,17 +87,14 @@ auth:
 
 available_node_types:
     ray.head.default:
-        # DEDICATED COORDINATOR: advertise 0 CPU / 0 GPU so no Ray Data tasks or
-        # fused GPU actors schedule here. Autoscaler v2 turns this `resources`
-        # dict into RAY_OVERRIDE_RESOURCES, which is what ACTUALLY pins the head's
-        # schedulable resources -- the --num-cpus/--num-gpus ray-start flags alone
-        # are overridden by it (with resources:{} the autoscaler injects the
-        # detected {"CPU":16,"GPU":1} and the head runs tasks again). 0/0 frees
-        # the head's 64 GiB for the driver's ~38 GiB fused-fit vocab merge; the L4
-        # is still physically present, just unused by Ray (the 7 workers supply
-        # the 7 fused GPUs). cluster GPU total becomes 7, so the fused worker
-        # count auto-defaults to 7 with no manual --gpu-num-gpus.
-        resources: {"CPU": 0, "GPU": 0}
+        # FULL WORKER (true 4v4): empty `resources` lets Autoscaler v2 inject the
+        # detected {"CPU":16,"GPU":1}, so the head schedules read/sort tasks and a
+        # fused GPU actor exactly like the 3 workers -- 1 head + 3 workers = 4
+        # fused L4 GPUs. The old dedicated-coordinator override ({"CPU":0,"GPU":0})
+        # is removed: with high-card columns now hashed in prep, the driver-side
+        # fused-fit vocab merge is small (bounded vocab), so the head no longer
+        # needs its 64 GiB reserved.
+        resources: {}
         node_config:
             InstanceType: g6.4xlarge
             # GPU AMI with NVIDIA drivers + Docker + nvidia-container-toolkit
@@ -132,9 +131,9 @@ available_node_types:
                       - { Key: Purpose, Value: gpu-tests-and-benchmarks }
                       - { Key: Cluster, Value: ray-gpu-e2e-bobbwang }
     ray.worker.default:
-        # Keep exactly 7 workers (8 total GPU nodes). See top-level max_workers.
-        min_workers: 7
-        max_workers: 7
+        # Keep exactly 3 workers (4 total GPU nodes = 4 L4s). See top-level max_workers.
+        min_workers: 3
+        max_workers: 3
         resources: {}
         node_config:
             InstanceType: g6.4xlarge
@@ -224,22 +223,18 @@ setup_commands:
 head_setup_commands: []
 worker_setup_commands: []
 
-# The head is a DEDICATED COORDINATOR: --num-cpus=0 --num-gpus=0 so no Ray Data
-# tasks (read/sort reduce) or fused GPU actors schedule on it. This reserves the
-# head's 64 GiB RAM for the DRIVER, which at 30-day scale needs ~38 GiB to merge
-# the fused-fit's per-block reductions -- the OrdinalEncoder vocabularies for the
-# very high-cardinality categoricals (features_ctx_not_constrained_4/5 reach tens
-# of millions of distinct values over ~104M rows) are concatenated driver-side.
-# Co-locating that 38 GiB driver with sort `reduce` tasks + the object store on a
-# 64 GiB node OOM-killed the workers, so the head now does nothing but coordinate
-# (the 7 g6.4xlarge workers supply the 7 fused L4 GPUs + all read/sort CPUs).
-# --object-store-memory: 4 GiB on the coordinator (it only stages the driver's
-# fit-partial pulls; everything spills to the 1 TB gp3 disk) vs 10 GiB on workers
-# so the 30-day read+sort working set (~165 GiB read / ~49 GiB sort shuffle)
-# spills to disk instead of pinning RAM.
+# The head is a FULL WORKER (true 4v4): NO --num-cpus=0 / --num-gpus=0, so it
+# advertises its detected 16 CPU + 1 L4 and runs read/sort tasks and a fused GPU
+# actor like the 3 workers. The dedicated-coordinator workaround is gone because
+# the high-cardinality columns are now hashed in the shared prep stage, so the
+# driver-side fused-fit vocab merge is small (bounded OrdinalEncoder vocab,
+# max ~270k) instead of the old ~38 GiB merge of the 8.8M/12.2M dense vocabs that
+# forced the head to sit idle. --object-store-memory: 10 GiB on every node
+# (head matched to workers) so the 30-day read+sort working set spills to the
+# 1 TB gp3 disk instead of pinning RAM.
 head_start_ray_commands:
     - ray stop
-    - ray start --head --port=6379 --object-manager-port=8076 --num-cpus=0 --num-gpus=0 --object-store-memory=4000000000 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
+    - ray start --head --port=6379 --object-manager-port=8076 --object-store-memory=10000000000 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
 
 worker_start_ray_commands:
     - ray stop

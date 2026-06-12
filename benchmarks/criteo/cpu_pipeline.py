@@ -96,9 +96,17 @@ def prep_batch(
     numeric_raw: Tuple[str, ...],
     categorical: Tuple[str, ...],
     list_features: Tuple[str, ...],
+    hashed: Tuple[str, ...] = (),
+    hash_buckets: int = criteo.DEFAULT_HASH_BUCKETS,
 ) -> "pa.Table":
     """Label engineering + column pruning. Output keeps only the columns the
-    sort and the downstream feature transforms need (drops everything else)."""
+    sort and the downstream feature transforms need (drops everything else).
+
+    High-cardinality integer columns (``hashed``) are turned into bounded
+    bucket-index features HERE, in the shared CPU prep stage, so the CPU and GPU
+    pipelines do byte-identical hashing (stateless, fixed-seed) and the fused
+    Chain only has to impute + ordinal-encode the remaining (bounded) categoricals
+    + scale. See :func:`criteo.hash_indices`."""
     cols: Dict[str, Any] = {}
 
     # Binary labels -> int8. is_click_landed is stored as 0.0/1.0 double.
@@ -127,6 +135,12 @@ def prep_batch(
         cols[c] = table.column(c)
     for c in numeric_raw:
         cols[c] = table.column(c)
+
+    # High-cardinality integer columns -> stateless hashed bucket index (int32),
+    # kept under the SAME name (a bounded categorical-like feature: not scaled,
+    # not dropped, no fit / vocab). Identical on CPU and GPU (same code here).
+    for c in hashed:
+        cols[c] = criteo.hash_indices(table.column(c), hash_buckets)
 
     # List feature -> length (null/empty list -> 0). v1 baseline keeps the count
     # signal and drops the raw variable-length list (no MultiHot/Hashing yet).
@@ -252,6 +266,26 @@ def _print_startup(
     P("=" * 78)
 
 
+def _print_high_card(roles) -> None:
+    """Show which integer columns were routed to hashing vs kept ordinal, and
+    the cardinality estimates that drove the split (the realism fix)."""
+    if roles.hashed:
+        est = roles.estimated_cardinalities
+        detail = ", ".join(
+            f"{c}={est.get(c, 0):,}" if est else c for c in roles.hashed
+        )
+        src = (
+            f"distinct scan over {roles.card_sample_rows:,} rows"
+            if roles.card_sample_rows
+            else "explicit --high-card-cols"
+        )
+        P(f"high-card -> HASH ({roles.hash_buckets:,} buckets, cardinality "
+          f"> {roles.max_cardinality:,}; {src}): {detail}")
+    else:
+        P(f"high-card -> HASH: none (no integer column above "
+          f"{roles.max_cardinality:,})")
+
+
 def _prepare_output_dir(out_dir: str, *, overwrite: bool) -> None:
     """Make ``out_dir`` ready for ``ds.write_parquet`` -- local OR ``s3://``.
 
@@ -321,6 +355,37 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=0, help="row cap for a quick smoke run (0 = full)")
     ap.add_argument("--null-indicator-threshold", type=float, default=0.01)
     ap.add_argument(
+        "--max-cardinality",
+        type=int,
+        default=criteo.DEFAULT_MAX_CARDINALITY,
+        help="integer feature columns whose estimated cardinality exceeds this "
+        "are routed to the stateless HASHING path instead of OrdinalEncoder "
+        "(avoids the unrealistic dense vocab + its OOM). Default: 1,000,000.",
+    )
+    ap.add_argument(
+        "--hash-buckets",
+        type=int,
+        default=criteo.DEFAULT_HASH_BUCKETS,
+        help="number of buckets for hashed high-cardinality columns "
+        "(value -> hash(value) mod hash_buckets). Default: 1<<20 = 1,048,576.",
+    )
+    ap.add_argument(
+        "--card-sample-rows",
+        type=int,
+        default=criteo.DEFAULT_CARD_SAMPLE_ROWS,
+        help="rows to scan when estimating cardinality (read only the integer "
+        "candidate columns). 0 (default) = EXACT full-dataset distinct count "
+        "(recommended; the shards are value-clustered so a partial scan "
+        "under-counts). A positive value caps the scan (approximate).",
+    )
+    ap.add_argument(
+        "--high-card-cols",
+        default=None,
+        help="optional comma-separated explicit list of high-cardinality columns "
+        "to hash. When given, cardinality sampling is skipped and exactly these "
+        "(of the eligible integer feature columns) are hashed.",
+    )
+    ap.add_argument(
         "--feature-set",
         choices=["lean", "wide"],
         default="lean",
@@ -359,6 +424,17 @@ def main() -> None:
         help="Skip the saved-output global-sortedness verification (escape "
         "hatch for first S3 smoke runs). The write still happens unless "
         "--no-write is also passed.",
+    )
+    ap.add_argument(
+        "--skip-sort",
+        action="store_true",
+        help="Skip the global sort stage entirely. The sort is CPU in BOTH "
+        "pipelines (so it cancels in the GPU-vs-CPU fusion comparison) and its "
+        "all-to-all shuffle is the memory bottleneck at 30-day scale; skipping "
+        "it isolates the fusion win (GPU fused impute+encode+scale vs the CPU "
+        "subtotal) on a matched cluster. The saved output is NOT globally "
+        "sorted, so sortedness verification is also skipped. impute/encode/scale "
+        "are row-order-independent, so fitted stats + parity are unaffected.",
     )
     ap.add_argument(
         "--overwrite",
@@ -420,7 +496,10 @@ def main() -> None:
     # order by default.
     ctx.execution_options.preserve_order = True
 
-    enabled_stages = ["read", "prep", "sort", "impute", "encode", "scale"]
+    enabled_stages = ["read", "prep"]
+    if not args.skip_sort:
+        enabled_stages.append("sort")
+    enabled_stages += ["impute", "encode", "scale"]
     if not args.no_write:
         enabled_stages.append("write")
     _print_startup(
@@ -436,9 +515,16 @@ def main() -> None:
         here=here,
     )
 
+    high_card_cols = (
+        [c.strip() for c in args.high_card_cols.split(",") if c.strip()]
+        if args.high_card_cols
+        else None
+    )
     roles = criteo.column_roles_multi(
         days, null_indicator_threshold=args.null_indicator_threshold,
-        feature_set=args.feature_set,
+        feature_set=args.feature_set, max_cardinality=args.max_cardinality,
+        hash_buckets=args.hash_buckets, card_sample_rows=args.card_sample_rows,
+        high_card_cols=high_card_cols,
     )
 
     P("-" * 78)
@@ -447,9 +533,11 @@ def main() -> None:
       f"feature_set={roles.feature_set}   "
       f"null_indicator_threshold={args.null_indicator_threshold}")
     P(f"feature roles: {len(roles.categorical)} categorical, "
+      f"{len(roles.hashed)} hashed, "
       f"{len(roles.numeric_features)} numeric "
       f"({len(roles.numeric_raw)} raw + {len(roles.list_len_cols)} list-len), "
       f"{len(roles.indicator_cols)} missing-indicators")
+    _print_high_card(roles)
     P(f"metadata/sort keys (kept raw, not features): {roles.metadata_keys}")
     P(f"dropped: id, {len(roles.dropped['delay_arrays_leakage'])} delay arrays, "
       f"{len(roles.dropped['not_available_at_inference'])} features_not_available_*, "
@@ -460,6 +548,8 @@ def main() -> None:
     numeric_raw = tuple(roles.numeric_raw)
     categorical = tuple(roles.categorical)
     list_features = tuple(roles.list_features)
+    hashed = tuple(roles.hashed)
+    hash_buckets = roles.hash_buckets
     indicator_cols = tuple(roles.indicator_cols)
 
     # ---- read ------------------------------------------------------------- #
@@ -486,7 +576,9 @@ def main() -> None:
     # ---- prep (label engineering + prune; minimizes the sort payload) ------ #
     with m.stage("prep", ncols) as rec:
         ds = ds.map_batches(
-            lambda t: prep_batch(t, numeric_raw, categorical, list_features),
+            lambda t: prep_batch(
+                t, numeric_raw, categorical, list_features, hashed, hash_buckets
+            ),
             batch_format="pyarrow",
             batch_size=None,
         ).materialize()
@@ -498,11 +590,15 @@ def main() -> None:
     # into the saved output as metadata / sort keys; they are NOT dropped here
     # and NOT transformed. No sorted-only intermediate is written -- the sorted
     # rows flow straight into impute/encode/scale and are saved once after scale.
-    with m.stage("sort", ncols) as rec:
-        # This branch's Dataset.sort has no ``backend=`` arg; CPU is the default.
-        ds = ds.sort(roles.sort_key).materialize()
-        _, ncols, gib = ds_stats(ds)
-        rec.update(rows=ds.count(), out_cols=ncols, gib=gib)
+    if args.skip_sort:
+        P(f"\n[--skip-sort] skipping the global sort over {roles.sort_key}; "
+          "output will NOT be globally sorted (fusion-comparison mode)")
+    else:
+        with m.stage("sort", ncols) as rec:
+            # This branch's Dataset.sort has no ``backend=`` arg; CPU is the default.
+            ds = ds.sort(roles.sort_key).materialize()
+            _, ncols, gib = ds_stats(ds)
+            rec.update(rows=ds.count(), out_cols=ncols, gib=gib)
 
     # ---- impute (CPU, not GPU): indicators then mean/most_frequent -------- #
     with m.stage("impute", ncols) as rec:
@@ -549,7 +645,11 @@ def main() -> None:
     # Re-read the written parquet and check global sortedness block-by-block
     # without ever loading all keys into local pandas. For --no-write smoke runs
     # we run the same scalable check on the in-memory final dataset instead.
-    if args.skip_saved_sort_verify:
+    if args.skip_sort:
+        verify = None
+        P("\nskipping sortedness verification (--skip-sort: output is "
+          "intentionally not globally sorted)")
+    elif args.skip_saved_sort_verify:
         verify = None
         P("\nskipping saved-output sortedness verification "
           "(--skip-saved-sort-verify)")
@@ -747,6 +847,7 @@ def _sanity_checks(ds, roles, rows_in: int, verify: Optional[Dict[str, Any]],
     types = dict(zip(sch.names, sch.types))
     num = roles.numeric_features
     cat = roles.categorical
+    hashed = roles.hashed
     inds = [f"{c}_isnull" for c in roles.indicator_cols]
     meta = roles.metadata_keys  # user_id, day_int, display_order (kept raw)
 
@@ -756,7 +857,8 @@ def _sanity_checks(ds, roles, rows_in: int, verify: Optional[Dict[str, Any]],
 
     # Null + value checks on a sample (pandas isnull works on pyarrow dtypes).
     sample = ds.limit(200_000).to_pandas()
-    no_null_features = bool(sample[num + cat].isnull().to_numpy().sum() == 0)
+    # Hashed columns are features too -> must be null-free like num + cat.
+    no_null_features = bool(sample[num + cat + hashed].isnull().to_numpy().sum() == 0)
     indicators_binary = (
         all({int(x) for x in sample[c].dropna().unique()} <= {0, 1} for c in inds)
         if inds
@@ -796,6 +898,19 @@ def _sanity_checks(ds, roles, rows_in: int, verify: Optional[Dict[str, Any]],
     checks["metadata_keys_present_not_features"] = bool(
         meta_present and meta_not_features and meta_no_null
     )
+    # Hashed high-cardinality columns: integer bucket indices within
+    # [0, hash_buckets), null-free, and never scaled (only present when the
+    # cardinality split actually routed columns to hashing).
+    if hashed:
+        hashed_integer = all(pa.types.is_integer(types[c]) for c in hashed)
+        hvals = sample[hashed]
+        hashed_in_range = bool(
+            ((hvals >= 0) & (hvals < roles.hash_buckets)).to_numpy().all()
+        )
+        hashed_not_scaled = all(c not in set(num) for c in hashed)
+        checks["hashed_cols_bounded_int"] = bool(
+            hashed_integer and hashed_in_range and hashed_not_scaled
+        )
     return checks
 
 
@@ -842,9 +957,16 @@ def _print_report(m: Metrics, roles, checks, verify, scaler, encoder, num_impute
         ((c, _vocab_size(encoder.stats_[f"unique_values({c})"])) for c in roles.categorical),
         key=lambda x: -x[1],
     )
+    max_vocab = max((n for _, n in vocabs), default=0)
     P(f"  ordinal-encoder vocab sizes (top 6 of {len(vocabs)}): "
       + ", ".join(f"{c}={n:,}" for c, n in vocabs[:6]))
-    P(f"  total embedding rows (sum of vocab): {sum(n for _, n in vocabs):,}")
+    P(f"  total embedding rows (sum of vocab): {sum(n for _, n in vocabs):,}"
+      f"   max ordinal vocab: {max_vocab:,}")
+    if roles.hashed:
+        est = roles.estimated_cardinalities
+        P(f"  hashed high-card cols ({roles.hash_buckets:,} buckets each, NO dense "
+          f"vocab): " + ", ".join(
+              f"{c}(est~{est.get(c, 0):,})" for c in roles.hashed))
     P(f"  scaled numeric columns: {len(roles.numeric_features)} "
       f"(missing-indicators kept unscaled: {len(roles.indicator_cols)})")
 
@@ -870,7 +992,14 @@ def _decision_log(roles) -> List[str]:
         "RAW in the output as metadata / sort keys (never encoded or scaled), so "
         "the saved parquet stays globally sortable and directly verifiable. "
         "Encoding user_id as a feature is a separate high-cardinality stress mode.",
-        "Encode: OrdinalEncoder integer codes for embedding tables, not one-hot.",
+        f"High-cardinality realism: integer columns with estimated cardinality "
+        f"> {roles.max_cardinality:,} are hashed (value -> hash mod "
+        f"{roles.hash_buckets:,}) into a bounded bucket index instead of a dense "
+        f"OrdinalEncoder vocab. Hashed this run: {roles.hashed or 'none'}. "
+        "Stateless (no fit/vocab), done in the shared CPU prep so CPU and GPU "
+        "indices are byte-identical.",
+        "Encode: OrdinalEncoder integer codes for the remaining (bounded) "
+        "categoricals -- embedding tables, not one-hot.",
         "Scale: StandardScaler (z-score) on numeric features only -- never on the "
         "category codes, the 0/1 indicators, or the sort keys (display_order is a "
         "raw sort key here, not a scaled feature).",
@@ -901,11 +1030,17 @@ def _build_manifest(args, days, roles, rows_in, m, scaler, encoder, num_imputer,
             round(osm_bytes / 1024 ** 3, 1) if osm_bytes else None
         ),
         "sort_key": roles.sort_key,
+        "sort_skipped": bool(args.skip_sort),
         "null_indicator_threshold": args.null_indicator_threshold,
+        "max_cardinality": roles.max_cardinality,
+        "hash_buckets": roles.hash_buckets,
+        "card_sample_rows": roles.card_sample_rows,
+        "estimated_cardinalities": roles.estimated_cardinalities,
         "columns": {
             "targets": roles.targets,
             "metadata_sort_keys": roles.metadata_keys,
             "categorical": roles.categorical,
+            "hashed": roles.hashed,
             "numeric": roles.numeric_features,
             "missing_indicators": [f"{c}_isnull" for c in roles.indicator_cols],
             "list_len": roles.list_len_cols,

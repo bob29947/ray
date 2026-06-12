@@ -118,6 +118,32 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=0, help="row cap for a smoke run (0 = full)")
     ap.add_argument("--null-indicator-threshold", type=float, default=0.01)
     ap.add_argument(
+        "--max-cardinality",
+        type=int,
+        default=criteo.DEFAULT_MAX_CARDINALITY,
+        help="integer feature columns whose estimated cardinality exceeds this "
+        "are hashed (stateless) instead of OrdinalEncoded. Default: 1,000,000.",
+    )
+    ap.add_argument(
+        "--hash-buckets",
+        type=int,
+        default=criteo.DEFAULT_HASH_BUCKETS,
+        help="buckets for hashed high-cardinality columns. Default: 1<<20.",
+    )
+    ap.add_argument(
+        "--card-sample-rows",
+        type=int,
+        default=criteo.DEFAULT_CARD_SAMPLE_ROWS,
+        help="rows to scan for cardinality (integer candidate cols only). "
+        "0 (default) = EXACT full distinct count; positive caps it (approx).",
+    )
+    ap.add_argument(
+        "--high-card-cols",
+        default=None,
+        help="optional comma-separated explicit high-cardinality columns to hash "
+        "(skips cardinality sampling).",
+    )
+    ap.add_argument(
         "--feature-set",
         choices=["lean", "wide"],
         default="lean",
@@ -131,6 +157,15 @@ def main() -> None:
     ap.add_argument("--data-root", default=None, help="dataset root (local path or s3:// URI)")
     ap.add_argument("--ray-address", default="local", help="'local' or 'auto' (attach to cluster)")
     ap.add_argument("--skip-saved-sort-verify", action="store_true")
+    ap.add_argument(
+        "--skip-sort",
+        action="store_true",
+        help="Skip the global sort stage (CPU in both pipelines, so it cancels "
+        "in the fusion comparison; its shuffle is the memory bottleneck at "
+        "30-day scale). Isolates the fused impute+encode+scale win. Output is "
+        "NOT globally sorted; sortedness verification is skipped. Fitted stats / "
+        "parity are unaffected (impute/encode/scale are order-independent).",
+    )
     ap.add_argument("--overwrite", action="store_true", help="for s3:// --out: delete existing prefix first")
     ap.add_argument(
         "--gpu-batch-size",
@@ -200,7 +235,10 @@ def main() -> None:
     ctx.execution_options.preserve_order = True
 
     n_gpus = int(ray.cluster_resources().get("GPU", 0))
-    enabled_stages = ["read", "prep", "sort", "fused"]
+    enabled_stages = ["read", "prep"]
+    if not args.skip_sort:
+        enabled_stages.append("sort")
+    enabled_stages.append("fused")
     if not args.no_write:
         enabled_stages.append("write")
     cpu._print_startup(
@@ -215,22 +253,33 @@ def main() -> None:
     if n_gpus == 0:
         P("WARNING: no GPUs visible to Ray; the fused Chain will fall back to CPU.")
 
+    high_card_cols = (
+        [c.strip() for c in args.high_card_cols.split(",") if c.strip()]
+        if args.high_card_cols
+        else None
+    )
     roles = criteo.column_roles_multi(
         days, null_indicator_threshold=args.null_indicator_threshold,
-        feature_set=args.feature_set,
+        feature_set=args.feature_set, max_cardinality=args.max_cardinality,
+        hash_buckets=args.hash_buckets, card_sample_rows=args.card_sample_rows,
+        high_card_cols=high_card_cols,
     )
     P("-" * 78)
     P(f"rows (metadata): {roles.total_rows:,}   feature_set={roles.feature_set}   "
       f"null_indicator_threshold={args.null_indicator_threshold}")
     P(f"feature roles: {len(roles.categorical)} categorical, "
+      f"{len(roles.hashed)} hashed, "
       f"{len(roles.numeric_features)} numeric, "
       f"{len(roles.indicator_cols)} missing-indicators")
+    cpu._print_high_card(roles)
     P(f"sort key: {roles.sort_key}   (GPU-target stage: fused impute+encode+scale)")
 
     m = cpu.Metrics()
     numeric_raw = tuple(roles.numeric_raw)
     categorical = tuple(roles.categorical)
     list_features = tuple(roles.list_features)
+    hashed = tuple(roles.hashed)
+    hash_buckets = roles.hash_buckets
     indicator_cols = tuple(roles.indicator_cols)
 
     # ---- read ------------------------------------------------------------- #
@@ -248,7 +297,9 @@ def main() -> None:
     # ---- prep ------------------------------------------------------------- #
     with m.stage("prep", ncols) as rec:
         ds = ds.map_batches(
-            lambda t: cpu.prep_batch(t, numeric_raw, categorical, list_features),
+            lambda t: cpu.prep_batch(
+                t, numeric_raw, categorical, list_features, hashed, hash_buckets
+            ),
             batch_format="pyarrow",
             batch_size=None,
         ).materialize()
@@ -256,10 +307,14 @@ def main() -> None:
         rec.update(rows=ds.count(), out_cols=ncols, gib=gib)
 
     # ---- sort (CPU, same as baseline) ------------------------------------- #
-    with m.stage("sort", ncols) as rec:
-        ds = ds.sort(roles.sort_key).materialize()
-        _, ncols, gib = cpu.ds_stats(ds)
-        rec.update(rows=ds.count(), out_cols=ncols, gib=gib)
+    if args.skip_sort:
+        P(f"\n[--skip-sort] skipping the global sort over {roles.sort_key}; "
+          "output will NOT be globally sorted (fusion-comparison mode)")
+    else:
+        with m.stage("sort", ncols) as rec:
+            ds = ds.sort(roles.sort_key).materialize()
+            _, ncols, gib = cpu.ds_stats(ds)
+            rec.update(rows=ds.count(), out_cols=ncols, gib=gib)
 
     # ---- size the fused GPU device batch ---------------------------------- #
     # Read/sort block sizes are left to Ray (no manual repartition by default);
@@ -302,7 +357,11 @@ def main() -> None:
             rec.update(rows=rows_in, out_cols=ncols, gib=gib)
 
     # ---- verify saved output is globally sorted --------------------------- #
-    if args.skip_saved_sort_verify:
+    if args.skip_sort:
+        verify = None
+        P("\nskipping sortedness verification (--skip-sort: output is "
+          "intentionally not globally sorted)")
+    elif args.skip_saved_sort_verify:
         verify = None
         P("\nskipping saved-output sortedness verification (--skip-saved-sort-verify)")
     elif not args.no_write:
@@ -366,8 +425,15 @@ def _print_report(m, roles, checks, verify, scaler, encoder, num_imputer, n_gpus
         ((c, cpu._vocab_size(encoder.stats_[f"unique_values({c})"])) for c in roles.categorical),
         key=lambda x: -x[1],
     )
+    max_vocab = max((n for _, n in vocabs), default=0)
     P(f"  ordinal-encoder vocab sizes (top 6 of {len(vocabs)}): "
       + ", ".join(f"{c}={n:,}" for c, n in vocabs[:6]))
+    P(f"  max ordinal vocab: {max_vocab:,}  (bounded: high-card cols are hashed)")
+    if roles.hashed:
+        est = roles.estimated_cardinalities
+        P(f"  hashed high-card cols ({roles.hash_buckets:,} buckets each, NO dense "
+          f"vocab): " + ", ".join(
+              f"{c}(est~{est.get(c, 0):,})" for c in roles.hashed))
     P(f"  scaled numeric columns: {len(roles.numeric_features)}")
     P(f"\nbackend: GPU fused Chain over {n_gpus} GPU(s); sort=CPU")
 
@@ -397,11 +463,17 @@ def _build_manifest(args, days, roles, rows_in, m, scaler, encoder, num_imputer,
         "data_root": criteo.DATA_ROOT,
         "object_store_gib": round(osm_bytes / 1024 ** 3, 1) if osm_bytes else None,
         "sort_key": roles.sort_key,
+        "sort_skipped": bool(args.skip_sort),
         "null_indicator_threshold": args.null_indicator_threshold,
+        "max_cardinality": roles.max_cardinality,
+        "hash_buckets": roles.hash_buckets,
+        "card_sample_rows": roles.card_sample_rows,
+        "estimated_cardinalities": roles.estimated_cardinalities,
         "columns": {
             "targets": roles.targets,
             "metadata_sort_keys": roles.metadata_keys,
             "categorical": roles.categorical,
+            "hashed": roles.hashed,
             "numeric": roles.numeric_features,
             "missing_indicators": [f"{c}_isnull" for c in roles.indicator_cols],
             "list_len": roles.list_len_cols,

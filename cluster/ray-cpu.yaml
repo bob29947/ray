@@ -28,12 +28,12 @@
 # CPU benchmark full 30-day (the tuned run; everything auto -- no manual
 # --blocks, Ray sizes read/sort blocks; this is how a real user runs it):
 #   ray exec cluster/ray-cpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1-30 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_days1_30_8node --ray-address auto --overwrite'
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1-30 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_days1_30_4v4 --ray-address auto --overwrite'
 #
 # CPU benchmark full 30-day, WIDE feature set (the fair CPU counterpart to the
 # GPU --feature-set wide run):
 #   ray exec cluster/ray-cpu.yaml \
-#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1-30 --feature-set wide --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_days1_30_8node_wide --ray-address auto --overwrite'
+#     'cd /home/ray/benchmarks/criteo && python cpu_pipeline.py --days 1-30 --feature-set wide --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/cpu_days1_30_4v4_wide --ray-address auto --overwrite'
 #
 # Tear down:
 #   ray down cluster/ray-cpu.yaml -y
@@ -54,13 +54,15 @@ cluster_name: ray-cpu-e2e-bobbwang
 #   ray.worker.default min_workers: X - 1
 #   ray.worker.default max_workers: X - 1
 #
-# TUNED for the benchmark: 8 total CPU nodes = 1 coordinator head (no tasks; see
-# head_start_ray_commands) + 7 m5dn.4xlarge workers, matched 1:1 against the GPU
-# cluster (cluster/ray-gpu.yaml, also 1 coordinator + 7 workers) so the CPU
-# baseline and the GPU fused run use the same topology (7 working nodes each;
-# m5dn.4xlarge and g6.4xlarge are both 16 vCPU / 64 GiB, the GPU workers add one
-# L4 each). The driver-heavy vocab fit runs on the reserved coordinator head.
-max_workers: 7
+# TUNED for the benchmark: TRUE 4v4 -- 4 total CPU nodes = 1 head + 3
+# m5dn.4xlarge workers, ALL running tasks (no dedicated coordinator head),
+# matched 1:1 against the GPU cluster (cluster/ray-gpu.yaml, also 1 head + 3
+# workers, all running tasks) so the CPU baseline and the GPU fused run use the
+# same topology (4 working nodes each; m5dn.4xlarge and g6.4xlarge are both 16
+# vCPU / 64 GiB, the GPU workers add one L4 each). The coordinator-head workaround
+# is removed: with high-card columns now hashed, the OrdinalEncoder vocab fit is
+# small and runs fine on a head that also does tasks.
+max_workers: 3
 
 # Scale up the cluster in chunks of upscaling_speed * currently_running_nodes.
 upscaling_speed: 1.0
@@ -95,13 +97,12 @@ auth:
 # Allowed node types and the resources they provide.
 available_node_types:
     ray.head.default:
-        # DEDICATED COORDINATOR: advertise 0 CPU so no Ray Data tasks schedule
-        # here. Autoscaler v2 turns this `resources` dict into
-        # RAY_OVERRIDE_RESOURCES, which is what ACTUALLY pins the head's
-        # schedulable resources (the --num-cpus ray-start flag alone is overridden
-        # by it). Frees the head's 64 GiB for the driver and matches the GPU
-        # cluster's coordinator-head topology (1 coordinator + 7 workers).
-        resources: {"CPU": 0, "GPU": 0}
+        # FULL WORKER (true 4v4): empty `resources` lets Autoscaler v2 inject the
+        # detected {"CPU":16}, so the head runs read/sort/impute/encode/scale
+        # tasks like the 3 workers (1 head + 3 workers = 4 working nodes). The old
+        # dedicated-coordinator override ({"CPU":0,"GPU":0}) is removed now that
+        # the high-card columns are hashed and the vocab fit is small.
+        resources: {}
         node_config:
             InstanceType: m5dn.4xlarge
             # Default Ray AMI for us-west-2.
@@ -139,9 +140,9 @@ available_node_types:
                       - { Key: Purpose, Value: cpu-tests-and-benchmarks }
                       - { Key: Cluster, Value: ray-cpu-e2e-bobbwang }
     ray.worker.default:
-        # Keep exactly 7 workers (8 total CPU nodes). See top-level max_workers.
-        min_workers: 7
-        max_workers: 7
+        # Keep exactly 3 workers (4 total CPU nodes). See top-level max_workers.
+        min_workers: 3
+        max_workers: 3
         resources: {}
         node_config:
             InstanceType: m5dn.4xlarge
@@ -227,17 +228,16 @@ setup_commands:
 head_setup_commands: []
 worker_setup_commands: []
 
-# Command to start ray on the head node. (Manager's commands, kept verbatim.)
-# The head is a DEDICATED COORDINATOR (--num-cpus=0) so no Ray Data tasks
-# schedule on it, reserving its 64 GiB RAM for the driver (the OrdinalEncoder
-# vocab fit for the very high-cardinality categoricals is merged driver-side at
-# 30-day scale) and matching the GPU cluster's 1-coordinator + 7-worker topology
-# for a fair compare. --object-store-memory: 4 GiB on the coordinator vs 10 GiB
-# on workers so the 30-day read+sort working set (~165 GiB read / ~49 GiB sort
-# shuffle) spills to the 1 TB gp3 disk instead of pinning RAM.
+# Command to start ray on the head node. The head is a FULL WORKER (true 4v4):
+# NO --num-cpus=0, so it advertises its 16 vCPU and runs Ray Data tasks like the
+# 3 workers. The dedicated-coordinator workaround is removed now that the
+# high-card columns are hashed (the OrdinalEncoder vocab fit is small and runs
+# fine alongside tasks). --object-store-memory: 10 GiB on every node (head
+# matched to workers) so the 30-day read+sort working set (~165 GiB read /
+# ~49 GiB sort shuffle) spills to the 1 TB gp3 disk instead of pinning RAM.
 head_start_ray_commands:
     - ray stop
-    - ray start --head --port=6379 --object-manager-port=8076 --num-cpus=0 --object-store-memory=4000000000 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
+    - ray start --head --port=6379 --object-manager-port=8076 --object-store-memory=10000000000 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
 
 # Command to start ray on worker nodes. (Manager's commands, kept verbatim.)
 worker_start_ray_commands:
