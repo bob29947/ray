@@ -349,6 +349,12 @@ class ColumnRoles:
     sort_key: List[str] = field(default_factory=list)
 
     null_indicator_threshold: float = 0.01
+    # "lean" (default): the inference-realistic recipe -- drop the 80
+    # ``features_not_available_*`` (not available at serving). "wide": keep that
+    # bucket as additional features (classified by dtype, all-null still
+    # dropped), giving the fused stage a much wider frame. Same steps run on CPU
+    # and GPU either way; this only changes how many columns are processed.
+    feature_set: str = "lean"
 
     @property
     def day(self) -> int:
@@ -407,21 +413,37 @@ class ColumnRoles:
 
 
 def column_roles(
-    day: int, *, null_indicator_threshold: float = 0.01, multi_day: bool = False
+    day: int, *, null_indicator_threshold: float = 0.01, multi_day: bool = False,
+    feature_set: str = "lean",
 ) -> ColumnRoles:
     """Back-compat single-day wrapper around :func:`column_roles_multi`."""
-    return column_roles_multi([day], null_indicator_threshold=null_indicator_threshold)
+    return column_roles_multi(
+        [day], null_indicator_threshold=null_indicator_threshold,
+        feature_set=feature_set,
+    )
 
 
 def column_roles_multi(
-    days: List[int], *, null_indicator_threshold: float = 0.01
+    days: List[int], *, null_indicator_threshold: float = 0.01,
+    feature_set: str = "lean",
 ) -> ColumnRoles:
     """Resolve column roles from the selected days' schema + null fractions.
 
     Null fractions are aggregated across *all* selected days so the all-null drop
     and the null-indicator threshold reflect the full selected dataset. The
     sort key gains ``day_int`` in the middle whenever more than one day is read.
+
+    ``feature_set``: ``"lean"`` (default) drops the ``features_not_available_*``
+    bucket (not available at inference -- the realistic recipe). ``"wide"`` keeps
+    that bucket as features, classified by dtype exactly like the kept buckets
+    (list -> ``<col>_len``, floating -> numeric, integer -> categorical),
+    all-null columns still dropped. ``"wide"`` roughly doubles the processed
+    column count, giving the fused GPU stage a much wider frame to amortize its
+    fixed per-batch/launch costs; the steps themselves are unchanged, so the CPU
+    and GPU pipelines stay a fair, identical-work comparison.
     """
+    if feature_set not in ("lean", "wide"):
+        raise ValueError(f"feature_set must be 'lean' or 'wide', got {feature_set!r}")
     days = list(days)
     fracs, total = null_fractions_days(days)
     schema = _read_schema(_first_nonempty_across(days))
@@ -432,6 +454,7 @@ def column_roles_multi(
         total_rows=total,
         null_fracs=fracs,
         null_indicator_threshold=null_indicator_threshold,
+        feature_set=feature_set,
         sort_key=sort_key(multi_day=multi),
     )
     dropped = {
@@ -441,6 +464,7 @@ def column_roles_multi(
         "not_available_at_inference": [],
         "all_null": [],
     }
+    keep_not_available = feature_set == "wide"
 
     for f_ in schema:
         name, typ = f_.name, f_.type
@@ -458,7 +482,10 @@ def column_roles_multi(
         if name in DELAY_ARRAYS:
             dropped["delay_arrays_leakage"].append(name)
             continue
-        if name.startswith(NOT_AVAILABLE_BUCKET):
+        is_not_available = name.startswith(NOT_AVAILABLE_BUCKET)
+        # lean: drop the not-available-at-inference bucket. wide: keep it as
+        # features (fall through to the dtype-based classification below).
+        if is_not_available and not keep_not_available:
             dropped["not_available_at_inference"].append(name)
             continue
         if fracs.get(name, 0.0) >= ALL_NULL_THRESHOLD:
@@ -468,7 +495,7 @@ def column_roles_multi(
         if name in CATEGORICAL_IDS:
             roles.categorical.append(name)
             continue
-        if _in_kept_bucket(name):
+        if _in_kept_bucket(name) or is_not_available:
             if pa.types.is_list(typ) or pa.types.is_large_list(typ):
                 roles.list_features.append(name)
             elif pa.types.is_floating(typ):

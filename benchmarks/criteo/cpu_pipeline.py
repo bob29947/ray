@@ -320,6 +320,14 @@ def main() -> None:
     )
     ap.add_argument("--rows", type=int, default=0, help="row cap for a quick smoke run (0 = full)")
     ap.add_argument("--null-indicator-threshold", type=float, default=0.01)
+    ap.add_argument(
+        "--feature-set",
+        choices=["lean", "wide"],
+        default="lean",
+        help="lean (default): inference-realistic recipe (drops the 80 "
+        "features_not_available_*). wide: keep that bucket as features (by "
+        "dtype) for a much wider frame -- same steps, more columns.",
+    )
     ap.add_argument("--out", default=None, help="output dir (default: data/criteo_days<lo>_<hi>_cpu_baseline)")
     ap.add_argument("--no-write", action="store_true", help="skip writing parquet + manifest (RAM->RAM only)")
     ap.add_argument(
@@ -429,12 +437,14 @@ def main() -> None:
     )
 
     roles = criteo.column_roles_multi(
-        days, null_indicator_threshold=args.null_indicator_threshold
+        days, null_indicator_threshold=args.null_indicator_threshold,
+        feature_set=args.feature_set,
     )
 
     P("-" * 78)
     blocks_label = "auto" if args.blocks is None else str(args.blocks)
     P(f"rows (metadata): {roles.total_rows:,}   blocks={blocks_label}   "
+      f"feature_set={roles.feature_set}   "
       f"null_indicator_threshold={args.null_indicator_threshold}")
     P(f"feature roles: {len(roles.categorical)} categorical, "
       f"{len(roles.numeric_features)} numeric "
@@ -882,6 +892,7 @@ def _build_manifest(args, days, roles, rows_in, m, scaler, encoder, num_imputer,
         "days_spec": args.days if args.days is not None else str(args.day),
         "rows": rows_in,
         "rows_metadata_total": roles.total_rows,
+        "feature_set": roles.feature_set,
         "blocks_setting": "auto" if args.blocks is None else args.blocks,
         "num_blocks_read": n_blocks,
         "ray_address": args.ray_address,

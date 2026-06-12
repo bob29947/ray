@@ -1,0 +1,246 @@
+# GPU Ray cluster on AWS for the fused CriteoPrivateAd preprocessing benchmark.
+#
+# Single-GPU networked nodes (the design target): 8x g6.4xlarge, each 1x NVIDIA
+# L4 (24 GB), PCIe Gen4, NO NVLink. This matches the fused, device-resident
+# preprocessing path -- per-block residency (PCIe is the tax), no cross-node GPU
+# shuffle. Compare against the 8x m5dn.4xlarge CPU baseline in cluster/ray-cpu.yaml.
+#
+# Like ray-cpu.yaml, it ships and installs the Ray WHEEL BUILT FROM THIS WORKTREE
+# (mounted from ./dist) plus the RAPIDS stack (cudf/rmm/cupy) needed by the GPU
+# preprocessors. Run all commands from the worktree root.
+#
+# Build wheel:
+#   ./build-wheel.sh 3.10 ./dist
+#
+# Launch:
+#   ray up cluster/ray-gpu.yaml -y
+#
+# Verify Ray + GPUs:
+#   ray exec cluster/ray-gpu.yaml 'python -c "import ray; ray.init(address=\"auto\"); print(ray.cluster_resources())"'
+#   ray exec cluster/ray-gpu.yaml 'python -c "from ray.data.preprocessors import _gpu; print(_gpu.gpu_available())"'
+#
+# GPU benchmark smoke (row-capped):
+#   ray exec cluster/ray-gpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1 --rows 100000 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_smoke_days1 --ray-address auto --skip-saved-sort-verify'
+#
+# GPU benchmark full day (block sizes auto: Ray sizes read/sort blocks; the
+# fused device batch is auto-derived from VRAM + row width + GPU count):
+#   ray exec cluster/ray-gpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1 --ray-address auto'
+#
+# GPU benchmark full 30-day (the tuned run; everything auto -- Ray sizes
+# read/sort blocks, the fused device batch is VRAM-auto, and the fused worker
+# count defaults to the cluster's 8 GPUs; this is exactly how a real user runs
+# it -- no manual --blocks / --gpu-batch-size / --gpu-num-gpus):
+#   ray exec cluster/ray-gpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_8node --ray-address auto --overwrite'
+#
+# GPU benchmark full 30-day, WIDE feature set (keep features_not_available_* as
+# features -> ~2x wider fused frame; run the CPU baseline with --feature-set wide
+# too for a fair compare):
+#   ray exec cluster/ray-gpu.yaml \
+#     'cd /home/ray/benchmarks/criteo && python gpu_pipeline.py --days 1-30 --feature-set wide --data-root s3://bobbwang-ray-e2e-criteo/criteo-private-ad/data --out s3://bobbwang-ray-e2e-criteo/criteo-private-ad/outputs/gpu_days1_30_8node_wide --ray-address auto --overwrite'
+#
+# Tear down:
+#   ray down cluster/ray-gpu.yaml -y
+
+cluster_name: ray-gpu-e2e-bobbwang
+
+# Cluster size: 1 COORDINATOR head + N GPU workers = N fused L4 GPUs.
+# TUNED for the benchmark: 8 total nodes = 1 coordinator head (no tasks; see
+# head_start_ray_commands) + 7 g6.4xlarge workers = 7 fused L4 GPUs, matched 1:1
+# against the CPU cluster (cluster/ray-cpu.yaml, also 1 coordinator + 7 workers).
+# The fused impute+encode+scale stage parallelizes across these 7 worker GPUs
+# with no cross-node GPU traffic; the fused worker count auto-defaults to the
+# cluster GPU total (7, since the coordinator advertises 0 GPUs). The head is a
+# pure coordinator because the 30-day driver needs ~38 GiB to merge the fused-fit
+# vocab reductions and must not share its 64 GiB node with sort tasks. For X
+# worker GPUs set top-level max_workers and the worker min/max_workers all to X.
+max_workers: 7
+
+upscaling_speed: 1.0
+
+# GPU Docker image + NVIDIA runtime. Requires the HOST to have NVIDIA drivers and
+# the nvidia-container-toolkit (see initialization_commands); the g6 instances
+# below use a GPU-driver AMI so the container can see the L4 via `--gpus all`.
+docker:
+    image: "rayproject/ray:nightly-py310-gpu"
+    container_name: "ray_container"
+    pull_before_run: True
+    run_options:
+        - --gpus all
+        - --shm-size=32gb
+        - --ulimit nofile=65536:65536
+
+idle_timeout_minutes: 60
+
+provider:
+    type: aws
+    region: us-west-2
+    availability_zone: us-west-2a,us-west-2b
+    cache_stopped_nodes: False
+
+auth:
+    ssh_user: ubuntu
+
+available_node_types:
+    ray.head.default:
+        # DEDICATED COORDINATOR: advertise 0 CPU / 0 GPU so no Ray Data tasks or
+        # fused GPU actors schedule here. Autoscaler v2 turns this `resources`
+        # dict into RAY_OVERRIDE_RESOURCES, which is what ACTUALLY pins the head's
+        # schedulable resources -- the --num-cpus/--num-gpus ray-start flags alone
+        # are overridden by it (with resources:{} the autoscaler injects the
+        # detected {"CPU":16,"GPU":1} and the head runs tasks again). 0/0 frees
+        # the head's 64 GiB for the driver's ~38 GiB fused-fit vocab merge; the L4
+        # is still physically present, just unused by Ray (the 7 workers supply
+        # the 7 fused GPUs). cluster GPU total becomes 7, so the fused worker
+        # count auto-defaults to 7 with no manual --gpu-num-gpus.
+        resources: {"CPU": 0, "GPU": 0}
+        node_config:
+            InstanceType: g6.4xlarge
+            # GPU AMI with NVIDIA drivers + Docker + nvidia-container-toolkit
+            # preinstalled: "Deep Learning Base OSS Nvidia Driver GPU AMI
+            # (Ubuntu 22.04) 20260609" in us-west-2. REQUIRED for g6 L4 nodes:
+            # the plain Ray AMI has no GPU driver, so `--gpus all` fails with
+            # `libnvidia-ml.so.1: cannot open shared object file`.
+            ImageId: ami-0784c1a0dc19c0265
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            # L4 nodes process ~3 GB of resident cuDF per block; 500 GiB gp3 gives
+            # headroom for the read materialization + sort shuffle spill. Raise
+            # (VolumeSize/Iops/Throughput) for full 30-day runs.
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 1000
+                      VolumeType: gp3
+                      Iops: 16000
+                      Throughput: 1000
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: gpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-gpu-e2e-bobbwang }
+                - ResourceType: volume
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: gpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-gpu-e2e-bobbwang }
+    ray.worker.default:
+        # Keep exactly 7 workers (8 total GPU nodes). See top-level max_workers.
+        min_workers: 7
+        max_workers: 7
+        resources: {}
+        node_config:
+            InstanceType: g6.4xlarge
+            ImageId: ami-0784c1a0dc19c0265
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: 1000
+                      VolumeType: gp3
+                      Iops: 16000
+                      Throughput: 1000
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: gpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-gpu-e2e-bobbwang }
+                - ResourceType: volume
+                  Tags:
+                      - { Key: Owner,   Value: bobbwang }
+                      - { Key: User,    Value: bobbwang }
+                      - { Key: Project, Value: ray-e2e }
+                      - { Key: Purpose, Value: gpu-tests-and-benchmarks }
+                      - { Key: Cluster, Value: ray-gpu-e2e-bobbwang }
+
+head_node_type: ray.head.default
+
+# Mount the built wheel, the benchmarks, and the current GPU preprocessor
+# sources (overlaid over the installed wheel in setup_commands, so the cluster
+# runs the exact fused code in this worktree even though it is not yet in the
+# pinned wheel). NOT the full Ray source tree.
+file_mounts: {
+    "/home/ray/ray_wheels": "dist",
+    "/home/ray/benchmarks": "benchmarks",
+    "/home/ray/preproc_overlay": "python/ray/data/preprocessors",
+    # The saved-output order fix lives in a core file (the Parquet datasink),
+    # not the preprocessors, so overlay it too (until it lands in the wheel).
+    "/home/ray/parquet_datasink_overlay.py": "python/ray/data/_internal/datasource/parquet_datasink.py",
+}
+
+rsync_exclude:
+    - "**/.git"
+    - "**/.git/**"
+    - "**/__pycache__"
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - "**/criteo/data"
+    - "**/criteo/data/**"
+
+# Install Docker + the NVIDIA container toolkit (outside the container) if the
+# host AMI doesn't already have them, so `--gpus all` works.
+initialization_commands:
+    - |
+       if ! docker --version; then
+         curl -fsSL https://get.docker.com -o get-docker.sh
+         sudo sh get-docker.sh
+         sudo usermod -aG docker $USER
+         sudo systemctl restart docker -f
+       fi
+    - |
+       if ! docker info 2>/dev/null | grep -qi nvidia; then
+         distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg || true
+         curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list || true
+         sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit || true
+         sudo nvidia-ctk runtime configure --runtime=docker || true
+         sudo systemctl restart docker || true
+       fi
+
+# Install the locally-built Ray wheel, then the benchmark deps AND the RAPIDS
+# stack (cudf/rmm/cupy for CUDA 12) the GPU preprocessors require.
+setup_commands:
+    - python -m pip uninstall -y ray || true
+    - WHEEL=$(ls /home/ray/ray_wheels/ray-*.whl | head -n1); python -m pip install -U "ray[default] @ file://$WHEEL"
+    - python -m pip install -U numpy pandas pyarrow scipy s3fs fsspec pytest fire
+    - python -m pip install -U --extra-index-url https://pypi.nvidia.com "cudf-cu12" "rmm-cu12" "cupy-cuda12x"
+    # Overlay the current GPU preprocessor sources over the installed wheel so
+    # the cluster runs this worktree's fused impute+encode+scale code.
+    - DST=$(python -c "import ray.data.preprocessors as p, os; print(os.path.dirname(p.__file__))"); echo "overlay into $DST"; cp -f /home/ray/preproc_overlay/*.py "$DST/"; python -c "import ray.data.preprocessors._gpu_fused as f; from ray.data.preprocessors import Chain; print('overlay ok fused module present')"
+    # Overlay the patched Parquet datasink (saved-output row-order preservation).
+    - DST=$(python -c "import ray.data._internal.datasource.parquet_datasink as p, os; print(os.path.dirname(p.__file__))"); echo "datasink overlay into $DST"; cp -f /home/ray/parquet_datasink_overlay.py "$DST/parquet_datasink.py"; python -c "import ray.data._internal.datasource.parquet_datasink as p; src=open(p.__file__).read(); assert 'combine_chunks' in src and 'preserve_order' in src, 'datasink order fix missing'; print('datasink overlay ok')"
+
+head_setup_commands: []
+worker_setup_commands: []
+
+# The head is a DEDICATED COORDINATOR: --num-cpus=0 --num-gpus=0 so no Ray Data
+# tasks (read/sort reduce) or fused GPU actors schedule on it. This reserves the
+# head's 64 GiB RAM for the DRIVER, which at 30-day scale needs ~38 GiB to merge
+# the fused-fit's per-block reductions -- the OrdinalEncoder vocabularies for the
+# very high-cardinality categoricals (features_ctx_not_constrained_4/5 reach tens
+# of millions of distinct values over ~104M rows) are concatenated driver-side.
+# Co-locating that 38 GiB driver with sort `reduce` tasks + the object store on a
+# 64 GiB node OOM-killed the workers, so the head now does nothing but coordinate
+# (the 7 g6.4xlarge workers supply the 7 fused L4 GPUs + all read/sort CPUs).
+# --object-store-memory: 4 GiB on the coordinator (it only stages the driver's
+# fit-partial pulls; everything spills to the 1 TB gp3 disk) vs 10 GiB on workers
+# so the 30-day read+sort working set (~165 GiB read / ~49 GiB sort shuffle)
+# spills to disk instead of pinning RAM.
+head_start_ray_commands:
+    - ray stop
+    - ray start --head --port=6379 --object-manager-port=8076 --num-cpus=0 --num-gpus=0 --object-store-memory=4000000000 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0
+
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --object-manager-port=8076 --object-store-memory=10000000000
