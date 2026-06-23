@@ -148,5 +148,5 @@ The committed results behind the tables above live in
 - `bench_scaler_smoke_days1_2M.json` -- the 2M-row smoke.
 - `bench_scaler_all30.log`, `bench_scaler_days1_3.log` -- full console output.
 
-Ad-hoc runs default `--out` to `benchmarks/criteo/data/` (git-ignored); pass an
-explicit `--out benchmarks/criteo/results/...` to commit a curated run.
+Every run writes its results JSON to `benchmarks/criteo/results/` by default
+(override with `--out`).

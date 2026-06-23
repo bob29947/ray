@@ -307,7 +307,8 @@ def main() -> None:
     ap.add_argument("--no-cpu", action="store_true", help="skip the CPU baseline")
     ap.add_argument("--cpu-repeats", type=int, default=1)
     ap.add_argument("--cpu-warmup", type=int, default=0)
-    ap.add_argument("--out", default=None, help="JSON results path")
+    ap.add_argument("--out", default=None,
+                    help="JSON results path (default: benchmarks/criteo/results/)")
     args = ap.parse_args()
 
     if args.data_root:
@@ -422,7 +423,7 @@ def main() -> None:
               + ("" if res["ok"] else f"   {res['detail']}"))
 
     out_path = args.out or os.path.join(
-        here, "data", f"bench_scaler_local_{int(time.time())}.json"
+        here, "results", f"bench_scaler_local_{int(time.time())}.json"
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as fh:
