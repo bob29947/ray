@@ -342,6 +342,31 @@ WIDE-frame comparison, add `--feature-set wide` to **both** the GPU and CPU
 
 ---
 
+## 6. Standalone StandardScaler benchmark (`bench_scaler_local.py`)
+
+`bench_scaler_local.py` isolates **just the scaler**: it materializes
+`read -> prep` into RAM once (untimed), then times only `StandardScaler` (fit +
+transform + materialize back to RAM) on `roles.numeric_features`, modelling an
+isolated GPU scaler in a real pipeline (all overhead kept in the timer). It
+sweeps the GPU side over device batch size x actor count x GPU fraction (the
+fractional-GPU packing uses the `RAY_DATA_GPU_PREPROC_GPU_FRACTION` knob) against
+a default-settings CPU baseline.
+
+```bash
+# pinned to 4 GPUs + 64 CPUs by default; lean recipe scales 44 columns
+.venv/bin/python benchmarks/criteo/bench_scaler_local.py \
+  --days all --gpu-batch-sizes 2000000,4000000 --repeats 2
+```
+
+**Finding:** for an isolated scaler at 4 GPU / 64 CPU, the CPU baseline wins at
+every scale (best tuned GPU ~0.6x at 100M rows). Large batches are the dominant
+GPU lever and fractional packing (~2-4 actors/GPU) helps the transfer-bound
+transform, but the op is too bandwidth-bound for 4 GPUs to beat 64 CPU cores --
+the GPU win in this repo comes from the fused stage (section 4), not scaling
+alone. Full writeup + numbers: [`bench_scaler_local.md`](bench_scaler_local.md).
+
+---
+
 ## Notes
 
 - **S3 paths** use the bucket `s3://bobbwang-ray-e2e-criteo` (us-west-2): data at

@@ -79,6 +79,25 @@ def env_batch_size(default: int = 1 << 20) -> int:
     return int(os.environ.get("RAY_DATA_GPU_PREPROC_BATCH_SIZE", default))
 
 
+def env_gpu_fraction(default: float = 1.0) -> float:
+    """Fraction of a GPU each worker actor requests (``num_gpus`` per actor).
+
+    ``RAY_DATA_GPU_PREPROC_GPU_FRACTION`` packs multiple GPU preprocessor actors
+    onto one physical GPU: with ``0.5`` two actors share a GPU, ``0.25`` four,
+    etc., so ``concurrency`` actors can exceed the physical GPU count. The
+    default ``1.0`` gives one whole GPU per actor -- byte-for-byte the previous
+    hardcoded ``num_gpus=1`` behavior. Packing only helps when a single actor
+    leaves the GPU under-utilized (e.g. a transfer-bound op like the standalone
+    scaler, where overlapping actors' H2D/compute/D2H raises throughput); for a
+    compute-bound op it usually hurts. Clamped to ``> 0``.
+    """
+    try:
+        frac = float(os.environ.get("RAY_DATA_GPU_PREPROC_GPU_FRACTION", default))
+    except (TypeError, ValueError):
+        return default
+    return frac if frac > 0 else default
+
+
 # Auto GPU block (device batch) sizing. The fused pass holds the input columns,
 # the produced columns, and cuDF intermediates on the device at once, so the
 # per-batch device working set scales with ``rows * bytes_per_row``. We pick a
@@ -362,8 +381,10 @@ def gpu_transform(
 ) -> "Dataset":
     """Run a host-staged GPU transform over ``ds`` using a persistent actor pool.
 
-    Each actor owns one GPU (``num_gpus=1``); ``concurrency`` actors run in
-    parallel (defaults to :func:`env_num_gpus`).
+    Each actor requests :func:`env_gpu_fraction` GPUs (``1.0`` by default = one
+    whole GPU per actor); ``concurrency`` actors run in parallel (defaults to
+    :func:`env_num_gpus`). A fraction ``< 1`` packs multiple actors onto each
+    GPU, so ``concurrency`` may exceed the physical GPU count.
     """
     bs = batch_size if batch_size is not None else env_batch_size()
     conc = concurrency if concurrency is not None else env_num_gpus()
@@ -372,7 +393,7 @@ def gpu_transform(
         fn_constructor_kwargs={"build_state": build_state, "apply_fn": apply_fn},
         batch_format="pyarrow",
         zero_copy_batch=True,
-        num_gpus=1,
+        num_gpus=env_gpu_fraction(),
         batch_size=bs,
         concurrency=conc,
     )
@@ -486,7 +507,7 @@ def gpu_unique_values(
             per_block,
             batch_format="pyarrow",
             zero_copy_batch=True,
-            num_gpus=1,
+            num_gpus=env_gpu_fraction(),
             batch_size=bs,
             concurrency=conc,
         )
@@ -545,7 +566,7 @@ def gpu_sum_count(
         per_block,
         batch_format="pyarrow",
         zero_copy_batch=True,
-        num_gpus=1,
+        num_gpus=env_gpu_fraction(),
         batch_size=bs,
         concurrency=conc,
     )
@@ -625,7 +646,7 @@ def gpu_mean_std(
         per_block,
         batch_format="pyarrow",
         zero_copy_batch=True,
-        num_gpus=1,
+        num_gpus=env_gpu_fraction(),
         batch_size=bs,
         concurrency=conc,
     )
@@ -719,7 +740,7 @@ def gpu_value_counts(
             per_block,
             batch_format="pyarrow",
             zero_copy_batch=True,
-            num_gpus=1,
+            num_gpus=env_gpu_fraction(),
             batch_size=bs,
             concurrency=conc,
         )
@@ -1051,7 +1072,7 @@ def gpu_fused_reductions(
         per_block,
         batch_format="pyarrow",
         zero_copy_batch=True,
-        num_gpus=1,
+        num_gpus=env_gpu_fraction(),
         batch_size=bs,
         concurrency=conc,
     )
