@@ -1,0 +1,1267 @@
+{
+  "days": [
+    1,
+    2,
+    3
+  ],
+  "rows_cap": 0,
+  "feature_set": "lean",
+  "n_scaled": 44,
+  "scaled_columns": [
+    "features_kv_bits_constrained_0",
+    "features_kv_bits_constrained_2",
+    "features_kv_bits_constrained_4",
+    "features_kv_bits_constrained_6",
+    "features_kv_bits_constrained_7",
+    "features_kv_bits_constrained_8",
+    "features_kv_bits_constrained_9",
+    "features_kv_bits_constrained_10",
+    "features_kv_bits_constrained_11",
+    "features_kv_bits_constrained_12",
+    "features_kv_bits_constrained_13",
+    "features_kv_bits_constrained_14",
+    "features_kv_bits_constrained_15",
+    "features_kv_bits_constrained_16",
+    "features_kv_bits_constrained_17",
+    "features_kv_bits_constrained_18",
+    "features_kv_bits_constrained_19",
+    "features_kv_bits_constrained_20",
+    "features_kv_bits_constrained_21",
+    "features_kv_bits_constrained_22",
+    "features_kv_bits_constrained_23",
+    "features_kv_bits_constrained_24",
+    "features_kv_bits_constrained_25",
+    "features_kv_bits_constrained_27",
+    "features_kv_bits_constrained_28",
+    "features_kv_bits_constrained_29",
+    "features_kv_bits_constrained_30",
+    "features_kv_not_constrained_4",
+    "features_kv_not_constrained_5",
+    "features_kv_not_constrained_6",
+    "features_kv_not_constrained_7",
+    "features_browser_bits_constrained_0",
+    "features_browser_bits_constrained_1",
+    "features_browser_bits_constrained_2",
+    "features_browser_bits_constrained_3",
+    "features_browser_bits_constrained_4",
+    "features_browser_bits_constrained_5",
+    "features_browser_bits_constrained_6",
+    "features_browser_bits_constrained_7",
+    "features_browser_bits_constrained_8",
+    "features_browser_bits_constrained_9",
+    "features_browser_bits_constrained_10",
+    "features_ctx_not_constrained_3",
+    "features_ctx_not_constrained_2_len"
+  ],
+  "gpus": 4,
+  "cpus": 64,
+  "input": {
+    "rows": 14727673,
+    "cols": 65,
+    "gib": 7.05,
+    "bytes_per_row": 514.0,
+    "blocks": 392,
+    "build_s": 25.4,
+    "n_scaled": 44
+  },
+  "cpu": {
+    "kind": "cpu",
+    "total_s": 10.232,
+    "total_s_all": [
+      10.232
+    ],
+    "rows": 14727673,
+    "mrows_per_s": 1.44,
+    "fitted_sample": {
+      "features_kv_bits_constrained_0": [
+        0.0459890723176557,
+        0.25017565368435596
+      ],
+      "features_kv_bits_constrained_2": [
+        6.717678569743637,
+        0.03829617506665734
+      ],
+      "features_kv_bits_constrained_4": [
+        8.803393237702295,
+        0.00030814196176862893
+      ],
+      "features_kv_bits_constrained_6": [
+        71.03620069961504,
+        16.91635932681507
+      ],
+      "features_kv_bits_constrained_7": [
+        2.3374991563387013,
+        0.19185858208215367
+      ]
+    }
+  },
+  "gpu": [
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 4,
+      "actors_per_gpu": 1.0,
+      "batch_rows": 3276800,
+      "fit_s": 6.86,
+      "transform_s": 8.104,
+      "total_s": 15.03,
+      "total_s_all": [
+        15.495,
+        14.203,
+        15.03
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.98,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.25017565368435607
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.00030814196176862644
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961497,
+          16.91635932681507
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 4,
+      "actors_per_gpu": 1.0,
+      "batch_rows": 1000000,
+      "fit_s": 13.304,
+      "transform_s": 6.803,
+      "total_s": 20.112,
+      "total_s_all": [
+        19.599,
+        20.233,
+        20.112
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.73,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 4,
+      "actors_per_gpu": 1.0,
+      "batch_rows": 2000000,
+      "fit_s": 8.36,
+      "transform_s": 6.525,
+      "total_s": 14.957,
+      "total_s_all": [
+        14.776,
+        14.957,
+        14.98
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.98,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 4,
+      "actors_per_gpu": 1.0,
+      "batch_rows": 4000000,
+      "fit_s": 5.579,
+      "transform_s": 8.298,
+      "total_s": 13.877,
+      "total_s_all": [
+        13.877,
+        14.778,
+        11.937
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.06,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 8,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 8,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 8,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 8,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 16,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 16>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 16,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 16>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 16,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 16>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 1.0,
+      "actors": 16,
+      "actors_per_gpu": 1.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 16>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 4,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 3276800,
+      "fit_s": 6.801,
+      "transform_s": 7.61,
+      "total_s": 14.411,
+      "total_s_all": [
+        15.556,
+        14.247,
+        14.411
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.02,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.25017565368435607
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.00030814196176862644
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961497,
+          16.91635932681507
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 4,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 1000000,
+      "fit_s": 13.142,
+      "transform_s": 7.22,
+      "total_s": 20.425,
+      "total_s_all": [
+        20.625,
+        20.257,
+        20.425
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.72,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 4,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 2000000,
+      "fit_s": 8.355,
+      "transform_s": 6.649,
+      "total_s": 14.992,
+      "total_s_all": [
+        14.989,
+        15.177,
+        14.992
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.98,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 4,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 4000000,
+      "fit_s": 5.874,
+      "transform_s": 9.592,
+      "total_s": 15.401,
+      "total_s_all": [
+        15.401,
+        15.551,
+        14.268
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.96,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 8,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 1835008,
+      "fit_s": 6.539,
+      "transform_s": 6.929,
+      "total_s": 13.52,
+      "total_s_all": [
+        12.35,
+        13.52,
+        13.618
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.09,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.00030814196176863056
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215364
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 8,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 1000000,
+      "fit_s": 10.198,
+      "transform_s": 6.171,
+      "total_s": 16.369,
+      "total_s_all": [
+        16.369,
+        16.778,
+        16.302
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.9,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 8,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 2000000,
+      "fit_s": 6.652,
+      "transform_s": 6.544,
+      "total_s": 13.237,
+      "total_s_all": [
+        12.606,
+        13.237,
+        13.468
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.11,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 8,
+      "actors_per_gpu": 2.0,
+      "batch_rows": 4000000,
+      "fit_s": 5.849,
+      "transform_s": 8.772,
+      "total_s": 14.635,
+      "total_s_all": [
+        14.331,
+        14.635,
+        15.378
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.01,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 16,
+      "actors_per_gpu": 2.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 16,
+      "actors_per_gpu": 2.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 16,
+      "actors_per_gpu": 2.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.5,
+      "actors": 16,
+      "actors_per_gpu": 2.0,
+      "batch_rows": -1,
+      "total_s": null,
+      "skipped": "needs 8>4 gpus"
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 4,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 3276800,
+      "fit_s": 6.918,
+      "transform_s": 8.745,
+      "total_s": 15.711,
+      "total_s_all": [
+        15.711,
+        15.734,
+        14.719
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.94,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.25017565368435607
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.00030814196176862644
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961497,
+          16.91635932681507
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 4,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 1000000,
+      "fit_s": 14.523,
+      "transform_s": 7.508,
+      "total_s": 21.96,
+      "total_s_all": [
+        21.166,
+        22.034,
+        21.96
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.67,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 4,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 2000000,
+      "fit_s": 8.811,
+      "transform_s": 7.037,
+      "total_s": 15.793,
+      "total_s_all": [
+        15.734,
+        15.793,
+        16.318
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.93,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 4,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 4000000,
+      "fit_s": 6.225,
+      "transform_s": 9.564,
+      "total_s": 15.789,
+      "total_s_all": [
+        15.952,
+        15.789,
+        13.271
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.93,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 8,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 1835008,
+      "fit_s": 6.713,
+      "transform_s": 7.203,
+      "total_s": 13.876,
+      "total_s_all": [
+        13.876,
+        14.1,
+        13.254
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.06,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.00030814196176863056
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215364
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 8,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 1000000,
+      "fit_s": 10.185,
+      "transform_s": 6.433,
+      "total_s": 16.618,
+      "total_s_all": [
+        16.562,
+        16.653,
+        16.618
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.89,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 8,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 2000000,
+      "fit_s": 6.715,
+      "transform_s": 6.191,
+      "total_s": 12.976,
+      "total_s_all": [
+        12.976,
+        12.834,
+        14.253
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.13,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 8,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 4000000,
+      "fit_s": 6.159,
+      "transform_s": 6.712,
+      "total_s": 12.828,
+      "total_s_all": [
+        13.034,
+        12.828,
+        12.678
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.15,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 16,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 917504,
+      "fit_s": 8.814,
+      "transform_s": 7.114,
+      "total_s": 15.928,
+      "total_s_all": [
+        15.928,
+        16.128,
+        15.6
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.92,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.25017565368435607
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.00030814196176863305
+        ],
+        "features_kv_bits_constrained_6": [
+          71.036200699615,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215364
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 16,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 1000000,
+      "fit_s": 9.007,
+      "transform_s": 6.872,
+      "total_s": 15.893,
+      "total_s_all": [
+        15.928,
+        15.733,
+        15.893
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.93,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765576,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665731
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702293,
+          0.000308141961768625
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 16,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 2000000,
+      "fit_s": 6.813,
+      "transform_s": 7.241,
+      "total_s": 14.06,
+      "total_s_all": [
+        14.069,
+        14.06,
+        13.591
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 1.05,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.04598907231765574,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743638,
+          0.038296175066657306
+        ],
+        "features_kv_bits_constrained_4": [
+          8.80339323770229,
+          0.0003081419617686318
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.3374991563387004,
+          0.19185858208215362
+        ]
+      }
+    },
+    {
+      "kind": "gpu",
+      "fraction": 0.25,
+      "actors": 16,
+      "actors_per_gpu": 4.0,
+      "batch_rows": 4000000,
+      "fit_s": 6.193,
+      "transform_s": 8.782,
+      "total_s": 14.975,
+      "total_s_all": [
+        14.975,
+        15.147,
+        12.688
+      ],
+      "rows": 14727673,
+      "mrows_per_s": 0.98,
+      "fitted_sample": {
+        "features_kv_bits_constrained_0": [
+          0.045989072317655734,
+          0.250175653684356
+        ],
+        "features_kv_bits_constrained_2": [
+          6.717678569743637,
+          0.03829617506665733
+        ],
+        "features_kv_bits_constrained_4": [
+          8.803393237702291,
+          0.00030814196176863067
+        ],
+        "features_kv_bits_constrained_6": [
+          71.03620069961498,
+          16.916359326815066
+        ],
+        "features_kv_bits_constrained_7": [
+          2.337499156338701,
+          0.19185858208215362
+        ]
+      }
+    }
+  ],
+  "parity": [
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=1.0  actors=4   (1/gpu) batch=3.28M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=1.0  actors=4   (1/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=1.0  actors=4   (1/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=1.0  actors=4   (1/gpu) batch=4.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=4   (2/gpu) batch=3.28M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=4   (2/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=4   (2/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=4   (2/gpu) batch=4.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=8   (2/gpu) batch=1.84M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=8   (2/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=8   (2/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.5  actors=8   (2/gpu) batch=4.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=4   (4/gpu) batch=3.28M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=4   (4/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=4   (4/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=4   (4/gpu) batch=4.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=8   (4/gpu) batch=1.84M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=8   (4/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=8   (4/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=8   (4/gpu) batch=4.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=16  (4/gpu) batch=0.92M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=16  (4/gpu) batch=1.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=16  (4/gpu) batch=2.00M"
+    },
+    {
+      "ok": true,
+      "detail": "ok",
+      "variant": "frac=0.25 actors=16  (4/gpu) batch=4.00M"
+    }
+  ],
+  "object_store_gib": 642.0
+}

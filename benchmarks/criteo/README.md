@@ -363,7 +363,8 @@ every scale (best tuned GPU ~0.6x at 100M rows). Large batches are the dominant
 GPU lever and fractional packing (~2-4 actors/GPU) helps the transfer-bound
 transform, but the op is too bandwidth-bound for 4 GPUs to beat 64 CPU cores --
 the GPU win in this repo comes from the fused stage (section 4), not scaling
-alone. Full writeup + numbers: [`bench_scaler_local.md`](bench_scaler_local.md).
+alone. Full writeup + numbers: [`writeups/bench_scaler_local.md`](writeups/bench_scaler_local.md);
+committed result JSON + console logs in [`results/`](results).
 
 ---
 

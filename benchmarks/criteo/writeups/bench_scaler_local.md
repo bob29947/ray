@@ -1,6 +1,7 @@
 # Standalone StandardScaler benchmark (GPU vs CPU)
 
-Driver: [`bench_scaler_local.py`](bench_scaler_local.py).
+Driver: [`bench_scaler_local.py`](../bench_scaler_local.py). Committed result
+files: [`../results/`](../results).
 
 This isolates **just the scaler** from the CriteoPrivateAd pipeline: it
 materializes `read -> prep` into RAM once (untimed), then times **only**
@@ -58,7 +59,7 @@ the PCIe round trip; see README section 4), not from scaling alone.
 The documented `RAY_DATA_GPU_PREPROC_GPU_FRACTION` was previously not
 implemented (every GPU `map_batches` hardcoded `num_gpus=1`). It is now real:
 `env_gpu_fraction()` in
-[`python/ray/data/preprocessors/_gpu.py`](../../python/ray/data/preprocessors/_gpu.py)
+[`python/ray/data/preprocessors/_gpu.py`](../../../python/ray/data/preprocessors/_gpu.py)
 sets the `num_gpus` each actor requests, wired into all 6 GPU `map_batches`
 calls (fit reductions + transform). Default `1.0` is byte-for-byte the old
 `num_gpus=1` behavior. A fraction `< 1` packs multiple actors per GPU, so
@@ -129,7 +130,7 @@ GPU runs need a real CUDA device, so run OUTSIDE any sandbox.
 # full dataset, focused large-batch sweep (what produced the 100M table above)
 .venv/bin/python benchmarks/criteo/bench_scaler_local.py \
   --days all --gpu-batch-sizes 2000000,4000000 --repeats 2 \
-  --out benchmarks/criteo/data/bench_scaler_all30.json
+  --out benchmarks/criteo/results/bench_scaler_all30.json
 
 # default multi-day sweep (fractions x actors x batch incl. auto/1M)
 .venv/bin/python benchmarks/criteo/bench_scaler_local.py --days 1-3
@@ -138,4 +139,14 @@ GPU runs need a real CUDA device, so run OUTSIDE any sandbox.
 Key flags: `--cpus 64 --gpus 4` (resource pin), `--gpu-fractions`,
 `--gpu-actors`, `--gpu-batch-sizes` (`auto` = VRAM-aware sizer), `--feature-set
 lean|wide`, `--warmup` (default 0 keeps cold-start overhead in the number).
-Results JSON is written under `benchmarks/criteo/data/` (git-ignored).
+
+The committed results behind the tables above live in
+[`../results/`](../results):
+
+- `bench_scaler_all30.json` -- the 103.86M-row (all 30 days) run.
+- `bench_scaler_days1_3.json` -- the 14.7M-row (days 1-3) full sweep.
+- `bench_scaler_smoke_days1_2M.json` -- the 2M-row smoke.
+- `bench_scaler_all30.log`, `bench_scaler_days1_3.log` -- full console output.
+
+Ad-hoc runs default `--out` to `benchmarks/criteo/data/` (git-ignored); pass an
+explicit `--out benchmarks/criteo/results/...` to commit a curated run.

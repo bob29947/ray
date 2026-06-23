@@ -1,0 +1,93 @@
+Usage stats collection is enabled by default for nightly wheels. To disable this, run the following command: `ray disable-usage-stats` before starting Ray. See https://docs.ray.io/en/master/cluster/usage-stats.html for more details.
+====================================================================================================
+building cached read -> prep -> materialize input (once, untimed) ...
+  days=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]  rows_cap=full  feature_set=lean  GPUs=4  CPUs=64
+[dataset]: Run `pip install tqdm` to enable progress reporting.
+  done: 103,862,032 rows, 65 cols, 49.91 GiB, 533 blocks in 28.9s
+  scaling 44 columns (roles.numeric_features): ['features_kv_bits_constrained_0', 'features_kv_bits_constrained_2', 'features_kv_bits_constrained_4', 'features_kv_bits_constrained_6', 'features_kv_bits_constrained_7', 'features_kv_bits_constrained_8', 'features_kv_bits_constrained_9', 'features_kv_bits_constrained_10', 'features_kv_bits_constrained_11', 'features_kv_bits_constrained_12', 'features_kv_bits_constrained_13', 'features_kv_bits_constrained_14', 'features_kv_bits_constrained_15', 'features_kv_bits_constrained_16', 'features_kv_bits_constrained_17', 'features_kv_bits_constrained_18', 'features_kv_bits_constrained_19', 'features_kv_bits_constrained_20', 'features_kv_bits_constrained_21', 'features_kv_bits_constrained_22', 'features_kv_bits_constrained_23', 'features_kv_bits_constrained_24', 'features_kv_bits_constrained_25', 'features_kv_bits_constrained_27', 'features_kv_bits_constrained_28', 'features_kv_bits_constrained_29', 'features_kv_bits_constrained_30', 'features_kv_not_constrained_4', 'features_kv_not_constrained_5', 'features_kv_not_constrained_6', 'features_kv_not_constrained_7', 'features_browser_bits_constrained_0', 'features_browser_bits_constrained_1', 'features_browser_bits_constrained_2', 'features_browser_bits_constrained_3', 'features_browser_bits_constrained_4', 'features_browser_bits_constrained_5', 'features_browser_bits_constrained_6', 'features_browser_bits_constrained_7', 'features_browser_bits_constrained_8', 'features_browser_bits_constrained_9', 'features_browser_bits_constrained_10', 'features_ctx_not_constrained_3', 'features_ctx_not_constrained_2_len']
+
+running CPU StandardScaler baseline (default settings) ...
+  CPU baseline median: 25.39s (4.09 Mrows/s)
+
+sweeping GPU variants (fraction x actors x batch), capacity guard actors*fraction <= 4 GPUs ...
+  -> frac=1.0 actors=4 batch=2,000,000 ...
+[2026-06-23 18:59:23,878 E 2000431 2000431] core_worker.cc:2150: Actor with class name: 'MapWorker(MapBatches(_GpuBatchActor))' and ID: '130a5a5f3bc1b2cfa610babc01000000' has constructor arguments in the object store and max_restarts > 0. If the arguments in the object store go out of scope or are lost, the actor restart will fail. See https://github.com/ray-project/ray/issues/53727 for more details.
+     fit=48.24s transform=27.27s total=75.52s (1.38 Mrows/s)  (0.34x vs CPU)
+  -> frac=1.0 actors=4 batch=4,000,000 ...
+     fit=30.38s transform=25.98s total=56.36s (1.84 Mrows/s)  (0.45x vs CPU)
+  -> SKIP frac=1.0 actors=8 (needs 8 > 4 GPUs)
+  -> SKIP frac=1.0 actors=8 (needs 8 > 4 GPUs)
+  -> SKIP frac=1.0 actors=16 (needs 16 > 4 GPUs)
+  -> SKIP frac=1.0 actors=16 (needs 16 > 4 GPUs)
+  -> frac=0.5 actors=4 batch=2,000,000 ...
+     fit=48.09s transform=27.38s total=75.47s (1.38 Mrows/s)  (0.34x vs CPU)
+  -> frac=0.5 actors=4 batch=4,000,000 ...
+     fit=30.80s transform=27.68s total=58.47s (1.78 Mrows/s)  (0.43x vs CPU)
+  -> frac=0.5 actors=8 batch=2,000,000 ...
+     fit=33.59s transform=18.81s total=52.40s (1.98 Mrows/s)  (0.48x vs CPU)
+  -> frac=0.5 actors=8 batch=4,000,000 ...
+     fit=22.21s transform=18.52s total=40.72s (2.55 Mrows/s)  (0.62x vs CPU)
+  -> SKIP frac=0.5 actors=16 (needs 8 > 4 GPUs)
+  -> SKIP frac=0.5 actors=16 (needs 8 > 4 GPUs)
+  -> frac=0.25 actors=4 batch=2,000,000 ...
+     fit=50.70s transform=27.55s total=78.24s (1.33 Mrows/s)  (0.32x vs CPU)
+  -> frac=0.25 actors=4 batch=4,000,000 ...
+     fit=31.61s transform=27.89s total=59.50s (1.75 Mrows/s)  (0.43x vs CPU)
+  -> frac=0.25 actors=8 batch=2,000,000 ...
+     fit=34.72s transform=19.24s total=53.96s (1.92 Mrows/s)  (0.47x vs CPU)
+  -> frac=0.25 actors=8 batch=4,000,000 ...
+     fit=22.77s transform=18.89s total=41.67s (2.49 Mrows/s)  (0.61x vs CPU)
+  -> frac=0.25 actors=16 batch=2,000,000 ...
+     fit=32.60s transform=18.45s total=51.05s (2.03 Mrows/s)  (0.50x vs CPU)
+  -> frac=0.25 actors=16 batch=4,000,000 ...
+     fit=21.04s transform=18.75s total=39.80s (2.61 Mrows/s)  (0.64x vs CPU)
+
+====================================================================================================
+STANDALONE StandardScaler BENCHMARK -- GPU sweep vs CPU baseline
+====================================================================================================
+cached input   : 103,862,032 rows x 65 cols  49.91 GiB  (516.0 B/row, 533 blocks, built in 28.9s)
+scaling        : 44 columns (roles.numeric_features, lean recipe)
+resources      : 4 GPU(s) + 64 CPU(s)   days=all   repeats=2 (warmup=0)
+
+CPU baseline   : 25.39s  (4.09 Mrows/s)  (runs=[25.385])
+
+----------------------------------------------------------------------------------------------------
+variant                                      fit_s  xform_s  total_s   Mrows/s   vs CPU
+----------------------------------------------------------------------------------------------------
+frac=1.0  actors=4   (1/gpu) batch=2.00M     48.24    27.27    75.52      1.38    0.34x
+frac=1.0  actors=4   (1/gpu) batch=4.00M     30.38    25.98    56.36      1.84    0.45x
+frac=1.0  actors=8   (1/gpu) batch=-0.00M       --       --       --        --       --  needs 8>4 gpus
+frac=1.0  actors=8   (1/gpu) batch=-0.00M       --       --       --        --       --  needs 8>4 gpus
+frac=1.0  actors=16  (1/gpu) batch=-0.00M       --       --       --        --       --  needs 16>4 gpus
+frac=1.0  actors=16  (1/gpu) batch=-0.00M       --       --       --        --       --  needs 16>4 gpus
+frac=0.5  actors=4   (2/gpu) batch=2.00M     48.09    27.38    75.47      1.38    0.34x
+frac=0.5  actors=4   (2/gpu) batch=4.00M     30.80    27.68    58.47      1.78    0.43x
+frac=0.5  actors=8   (2/gpu) batch=2.00M     33.59    18.81    52.40      1.98    0.48x
+frac=0.5  actors=8   (2/gpu) batch=4.00M     22.21    18.52    40.72      2.55    0.62x
+frac=0.5  actors=16  (2/gpu) batch=-0.00M       --       --       --        --       --  needs 8>4 gpus
+frac=0.5  actors=16  (2/gpu) batch=-0.00M       --       --       --        --       --  needs 8>4 gpus
+frac=0.25 actors=4   (4/gpu) batch=2.00M     50.70    27.55    78.24      1.33    0.32x
+frac=0.25 actors=4   (4/gpu) batch=4.00M     31.61    27.89    59.50      1.75    0.43x
+frac=0.25 actors=8   (4/gpu) batch=2.00M     34.72    19.24    53.96      1.92    0.47x
+frac=0.25 actors=8   (4/gpu) batch=4.00M     22.77    18.89    41.67      2.49    0.61x
+frac=0.25 actors=16  (4/gpu) batch=2.00M     32.60    18.45    51.05      2.03    0.50x
+frac=0.25 actors=16  (4/gpu) batch=4.00M     21.04    18.75    39.80      2.61    0.64x
+----------------------------------------------------------------------------------------------------
+FASTEST GPU    : frac=0.25 actors=16  (4/gpu) batch=4.00M -> 39.80s (2.61 Mrows/s)  (0.64x vs CPU)
+====================================================================================================
+
+parity (sampled fitted mean/std, each GPU variant vs CPU):
+  MATCH     frac=1.0  actors=4   (1/gpu) batch=2.00M
+  MATCH     frac=1.0  actors=4   (1/gpu) batch=4.00M
+  MATCH     frac=0.5  actors=4   (2/gpu) batch=2.00M
+  MATCH     frac=0.5  actors=4   (2/gpu) batch=4.00M
+  MATCH     frac=0.5  actors=8   (2/gpu) batch=2.00M
+  MATCH     frac=0.5  actors=8   (2/gpu) batch=4.00M
+  MATCH     frac=0.25 actors=4   (4/gpu) batch=2.00M
+  MATCH     frac=0.25 actors=4   (4/gpu) batch=4.00M
+  MATCH     frac=0.25 actors=8   (4/gpu) batch=2.00M
+  MATCH     frac=0.25 actors=8   (4/gpu) batch=4.00M
+  MATCH     frac=0.25 actors=16  (4/gpu) batch=2.00M
+  MATCH     frac=0.25 actors=16  (4/gpu) batch=4.00M
+
+wrote results -> benchmarks/criteo/data/bench_scaler_all30.json
