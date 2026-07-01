@@ -27,6 +27,7 @@ from ray.data._internal.datasource.parquet_range_v1 import (
 from ray.data._internal.execution.interfaces import (
     BlockEntry,
     ExecutionOptions,
+    PhysicalOperator,
     RefBundle,
 )
 from ray.data._internal.execution.interfaces.task_context import TaskContext
@@ -38,6 +39,9 @@ from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
     CustomOpStatsReportFn,
     MapTransformer,
+)
+from ray.data._internal.execution.operators.task_pool_map_operator import (
+    TaskPoolMapOperator,
 )
 from ray.data._internal.logical.operators import MapBatches, MapGroups
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
@@ -669,27 +673,17 @@ def _execute_range(
     return stats
 
 
-class ParquetRangeMapGroupsActorPoolMapOperator(ActorPoolMapOperator):
-    """Fixed actor pool that exposes planner and worker metrics in stats output."""
+class _ParquetRangeMapGroupsMetricsMixin:
+    """Expose range-plan and worker metrics for either execution backend."""
 
     def __init__(
         self,
         *args: Any,
         plan_metrics: Dict[str, Any],
-        actor_start_timeout_s: float,
         **kwargs: Any,
     ) -> None:
         self._parquet_range_plan_metrics = plan_metrics
-        self._actor_start_timeout_s = actor_start_timeout_s
         super().__init__(*args, **kwargs)
-
-    def start(self, options: ExecutionOptions) -> None:
-        super().start(options)
-        # All actors must be live before the first range is dispatched. With one
-        # in-flight task per actor, this guarantees a distinct actor/GPU per range.
-        pending = self._actor_pool.get_pending_actor_refs()
-        if pending:
-            ray.get(pending, timeout=self._actor_start_timeout_s)
 
     def _worker_stats(self) -> List[Dict[str, Any]]:
         by_partition: Dict[int, ParquetRangeMapGroupsStats] = {}
@@ -711,6 +705,35 @@ class ParquetRangeMapGroupsActorPoolMapOperator(ActorPoolMapOperator):
         if worker_stats:
             metrics["parquet_range_map_groups_workers"] = worker_stats
         return metrics
+
+
+class ParquetRangeMapGroupsActorPoolMapOperator(
+    _ParquetRangeMapGroupsMetricsMixin, ActorPoolMapOperator
+):
+    """Fixed actor pool used for the ordinary per-group compatibility path."""
+
+    def __init__(
+        self,
+        *args: Any,
+        actor_start_timeout_s: float,
+        **kwargs: Any,
+    ) -> None:
+        self._actor_start_timeout_s = actor_start_timeout_s
+        super().__init__(*args, **kwargs)
+
+    def start(self, options: ExecutionOptions) -> None:
+        super().start(options)
+        # All actors must be live before the first range is dispatched. With one
+        # in-flight task per actor, this guarantees a distinct actor/GPU per range.
+        pending = self._actor_pool.get_pending_actor_refs()
+        if pending:
+            ray.get(pending, timeout=self._actor_start_timeout_s)
+
+
+class ParquetRangeMapGroupsTaskPoolMapOperator(
+    _ParquetRangeMapGroupsMetricsMixin, TaskPoolMapOperator
+):
+    """Task-backed execution for an explicitly side-effect-free partition UDF."""
 
 
 def _make_work(
@@ -755,7 +778,7 @@ def build_parquet_range_map_groups_operator(
     ray_remote_args: Dict[str, Any],
     estimated_peak_gpu_memory_bytes: int = 0,
     gpu_memory_budget_bytes: int = 0,
-) -> ParquetRangeMapGroupsActorPoolMapOperator:
+) -> PhysicalOperator:
     """Build the shuffle-free fixed-GPU physical operator for a validated plan."""
 
     works = _make_work(
@@ -879,9 +902,11 @@ def build_parquet_range_map_groups_operator(
     ) -> Iterator[Block]:
         rmm_pool_state = allocator_state.get("rmm")
         if rmm_pool_state is None:
-            raise RuntimeError(
-                "ParquetRangeMapGroups actor executed before RMM initialization."
-            )
+            # Actor workers call this hook in their constructor. Task workers
+            # initialize lazily once per range so they can use Ray's prestarted
+            # worker pool without changing callable lifecycle or retry semantics.
+            init_fn()
+            rmm_pool_state = allocator_state["rmm"]
         for work in blocks:
             range_outputs = _execute_range(
                 work,
@@ -921,15 +946,7 @@ def build_parquet_range_map_groups_operator(
         ],
         init_fn=init_fn,
     )
-    compute = ActorPoolStrategy(
-        size=len(works),
-        max_tasks_in_flight_per_actor=1,
-        enable_true_multi_threading=False,
-    )
     actor_args = dict(ray_remote_args)
-    # Never replay a tokenizer or group UDF after it may have produced effects.
-    actor_args["max_restarts"] = 0
-    actor_args["max_task_retries"] = 0
     actor_start_timeout_s = data_context.get_config(
         "parquet_range_map_groups_actor_start_timeout_s", 300.0
     )
@@ -962,6 +979,9 @@ def build_parquet_range_map_groups_operator(
             "partition_v1" if partition_contract is not None else "per_group"
         ),
         "group_partition_fallback_reason": partition_contract_fallback_reason,
+        "execution_backend": (
+            "task_pool" if partition_contract is not None else "actor_pool"
+        ),
         "ranges": tuple(
             {
                 "partition_id": work.partition_id,
@@ -979,6 +999,28 @@ def build_parquet_range_map_groups_operator(
         f"amplification={metrics.scan_amplification:.3f}, "
         f"skew={metrics.load_skew:.3f})"
     )
+    if partition_contract is not None:
+        task_args = dict(ray_remote_args)
+        task_args["max_retries"] = 0
+        return ParquetRangeMapGroupsTaskPoolMapOperator(
+            map_transformer,
+            input_op,
+            data_context,
+            name=name,
+            max_concurrency=len(works),
+            supports_fusion=False,
+            ray_remote_args=task_args,
+            plan_metrics=plan_metrics,
+        )
+
+    compute = ActorPoolStrategy(
+        size=len(works),
+        max_tasks_in_flight_per_actor=1,
+        enable_true_multi_threading=False,
+    )
+    # Never replay a tokenizer or group UDF after it may have produced effects.
+    actor_args["max_restarts"] = 0
+    actor_args["max_task_retries"] = 0
     return ParquetRangeMapGroupsActorPoolMapOperator(
         map_transformer,
         input_op,

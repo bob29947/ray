@@ -365,6 +365,7 @@ def test_natural_api_uses_partition_equivalent_group_udf_once_per_range(
     assert plan_metrics["group_execution_mode"] == "partition_v1", plan_metrics[
         "group_partition_fallback_reason"
     ]
+    assert plan_metrics["execution_backend"] == "task_pool"
     workers = metrics["parquet_range_map_groups_workers"]
     assert sum(worker["groups_invoked"] for worker in workers) == 4
     assert sum(worker["group_udf_invocations"] for worker in workers) == 0
