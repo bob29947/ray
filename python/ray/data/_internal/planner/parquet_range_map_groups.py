@@ -125,14 +125,6 @@ class _RmmPoolState:
         )
 
 
-@dataclass(frozen=True)
-class _DeferredPartitionValidation:
-    """Device-resident tokenizer contract predicates for one exact batch."""
-
-    preserved: Any
-    contains_missing: Any
-
-
 def _resolve_rmm_pool_config(
     *,
     free_bytes: int,
@@ -334,8 +326,12 @@ def _invoke_row_preserving_tokenizer(
     partition_key: str,
     zero_copy_batch: bool,
     cudf: Any,
-    deferred_validations: Optional[List[_DeferredPartitionValidation]] = None,
 ) -> Any:
+    # Snapshot the contract column before invoking a zero-copy UDF. Otherwise,
+    # an in-place mutation could change both ``batch`` and the returned frame
+    # and incorrectly pass the elementwise-preservation check below.
+    input_key = batch[partition_key].reset_index(drop=True).copy(deep=True)
+    input_missing = input_key.isnull()
     udf_batch = batch if zero_copy_batch else batch.copy(deep=True)
     outputs = list(_TransformingBatchIterator((udf_batch,), tokenizer_fn))
     if not outputs:
@@ -358,24 +354,9 @@ def _invoke_row_preserving_tokenizer(
         raise ValueError(
             f"The tokenizer removed preserved partition column {partition_key!r}."
         )
-    input_key = batch[partition_key].reset_index(drop=True)
     output_key = output[partition_key].reset_index(drop=True)
-    input_missing = input_key.isnull()
     output_missing = output_key.isnull()
     values_equal = (input_key == output_key).fillna(False)
-    if deferred_validations is not None:
-        import cupy
-
-        missing = input_missing | output_missing
-        missing_values = missing.to_cupy()
-        deferred_validations.append(
-            _DeferredPartitionValidation(
-                preserved=cupy.all(~missing_values & values_equal.to_cupy()),
-                contains_missing=cupy.any(missing_values),
-            )
-        )
-        return output
-
     # Keep the success path to one device synchronization per tokenizer batch.
     # Detailed diagnostics may synchronize again only after the contract fails.
     preserved = (~input_missing & ~output_missing & values_equal).all()
@@ -388,33 +369,6 @@ def _invoke_row_preserving_tokenizer(
             f"The tokenizer changed preserved partition column {partition_key!r}."
         )
     return output
-
-
-def _finish_partition_validation(
-    validations: List[_DeferredPartitionValidation],
-    *,
-    partition_key: str,
-    array_module: Any,
-) -> None:
-    """Synchronize tokenizer preservation predicates once for the full range."""
-
-    if not validations:
-        return
-    preserved = array_module.all(
-        array_module.stack([validation.preserved for validation in validations])
-    )
-    if bool(preserved):
-        return
-    contains_missing = array_module.any(
-        array_module.stack([validation.contains_missing for validation in validations])
-    )
-    if bool(contains_missing):
-        raise ValueError(
-            f"Preserved partition column {partition_key!r} contains nulls."
-        )
-    raise ValueError(
-        f"The tokenizer changed preserved partition column {partition_key!r}."
-    )
 
 
 def _group_boundaries(frame: Any, group_keys: Tuple[str, ...], cupy: Any) -> List[int]:
@@ -558,7 +512,6 @@ def _execute_range(
             verify_posix_source_identity(fragment.path, fragment.source_identity)
 
     tokenized_batches: List[Any] = []
-    deferred_validations: List[_DeferredPartitionValidation] = []
     for raw_batch in _iter_exact_cudf_batches(raw_frames(), tokenizer_batch_size, cudf):
         started = time.perf_counter()
         tokenized = _invoke_row_preserving_tokenizer(
@@ -567,19 +520,10 @@ def _execute_range(
             partition_key=work.partition_key,
             zero_copy_batch=tokenizer_zero_copy_batch,
             cudf=cudf,
-            deferred_validations=deferred_validations,
         )
         map_time_s += time.perf_counter() - started
         tokenized_rows += len(tokenized)
         tokenized_batches.append(tokenized)
-
-    started = time.perf_counter()
-    _finish_partition_validation(
-        deferred_validations,
-        partition_key=work.partition_key,
-        array_module=cupy,
-    )
-    map_time_s += time.perf_counter() - started
 
     output_blocks = 0
     output_buffer = BlockOutputBuffer(
