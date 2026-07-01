@@ -17,6 +17,7 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _iter_exact_cudf_batches,
     _iter_group_outputs,
     _invoke_row_preserving_tokenizer,
+    _iter_group_views,
     _is_sorted_by_group_keys,
     _make_work,
     _resolve_rmm_pool_config,
@@ -398,6 +399,45 @@ def test_group_key_order_detection_sorts_when_compiled_check_is_unavailable():
     assert not _is_sorted_by_group_keys(
         pd.DataFrame({"User": [1, 1], "Card": [1, 2]}), ("User", "Card")
     )
+
+
+def test_group_views_use_one_segmented_split_when_available():
+    class Frame:
+        def __init__(self):
+            self.calls = []
+
+        def _split(self, boundaries, *, keep_index):
+            self.calls.append((boundaries, keep_index))
+            return ["first", "second", "third"]
+
+    frame = Frame()
+    assert list(_iter_group_views(frame, [0, 2, 5, 9])) == [
+        "first",
+        "second",
+        "third",
+    ]
+    assert frame.calls == [([2, 5], True)]
+
+
+def test_group_views_fall_back_to_exact_slices():
+    frame = pd.DataFrame({"value": list(range(6))})
+
+    groups = list(_iter_group_views(frame, [0, 2, 5, 6]))
+
+    assert [group["value"].tolist() for group in groups] == [
+        [0, 1],
+        [2, 3, 4],
+        [5],
+    ]
+
+
+def test_group_views_reject_unexpected_segment_count():
+    class Frame:
+        def _split(self, boundaries, *, keep_index):
+            return ["only-one"]
+
+    with pytest.raises(RuntimeError, match="unexpected number"):
+        list(_iter_group_views(Frame(), [0, 2, 5]))
 
 
 def test_group_output_generator_and_empty_generator_semantics():

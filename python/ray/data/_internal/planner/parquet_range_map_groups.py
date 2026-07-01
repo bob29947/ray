@@ -397,6 +397,28 @@ def _is_sorted_by_group_keys(frame: Any, group_keys: Tuple[str, ...]) -> bool:
         return False
 
 
+def _iter_group_views(frame: Any, boundaries: List[int]) -> Iterator[Any]:
+    """Split all cuDF groups in one compiled call when the runtime supports it."""
+
+    split = getattr(frame, "_split", None)
+    if split is not None:
+        try:
+            groups = split(boundaries[1:-1], keep_index=True)
+        except (AttributeError, NotImplementedError, TypeError):
+            pass
+        else:
+            if len(groups) != len(boundaries) - 1:
+                raise RuntimeError(
+                    "cuDF returned an unexpected number of segmented group views: "
+                    f"expected={len(boundaries) - 1}, actual={len(groups)}"
+                )
+            yield from groups
+            return
+
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        yield frame.iloc[start:end]
+
+
 def _iter_group_outputs(group_fn: Any, group: Any) -> Iterator[Any]:
     """Mirror ``_apply_udf_to_groups`` iterator semantics and validation."""
 
@@ -516,9 +538,8 @@ def _execute_range(
         sort_time_s += time.perf_counter() - started
         gpu_peak_memory_bytes = max(gpu_peak_memory_bytes, _sample_gpu_memory(cupy))
 
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
+        for group in _iter_group_views(tokenized_partition, boundaries):
             group_count += 1
-            group = tokenized_partition.iloc[start:end]
             if not group_zero_copy_batch:
                 group = group.copy(deep=True)
             started = time.perf_counter()
