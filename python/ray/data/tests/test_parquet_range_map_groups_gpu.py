@@ -330,6 +330,20 @@ def test_group_boundaries_keep_float_nan_keys_together(ray_with_two_gpus, tmp_pa
     assert _group_boundaries(frame, ("User", "Card"), cupy) == [0, 1, 3]
 
 
+def test_compiled_group_key_order_check(ray_with_two_gpus):
+    import cudf
+
+    from ray.data._internal.planner.parquet_range_map_groups import (
+        _is_sorted_by_group_keys,
+    )
+
+    sorted_frame = cudf.DataFrame({"User": [1, 1, 1, 2], "Card": [1.0, 2.0, None, 0.0]})
+    unsorted_frame = cudf.DataFrame({"User": [1, 2, 1], "Card": [1, 0, 2]})
+
+    assert _is_sorted_by_group_keys(sorted_frame, ("User", "Card"))
+    assert not _is_sorted_by_group_keys(unsorted_frame, ("User", "Card"))
+
+
 def test_natural_api_gpu_shuffle_matches_selected_range_backend_when_available(
     ray_with_two_gpus,
     restore_data_context,

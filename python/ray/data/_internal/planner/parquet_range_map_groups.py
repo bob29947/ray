@@ -375,40 +375,26 @@ def _group_boundaries(frame: Any, group_keys: Tuple[str, ...], cupy: Any) -> Lis
     return [int(value) for value in starts] + [row_count]
 
 
-def _is_sorted_by_group_keys(
-    frame: Any, group_keys: Tuple[str, ...], array_module: Any
-) -> bool:
-    """Return whether adjacent rows are lexicographically group-key ordered."""
+def _is_sorted_by_group_keys(frame: Any, group_keys: Tuple[str, ...]) -> bool:
+    """Use libcudf's compiled lexicographic check when the runtime exposes it."""
 
-    row_count = len(frame)
-    if row_count < 2:
+    if len(frame) < 2:
         return True
+    try:
+        import pylibcudf as plc
 
-    def as_array(series: Any) -> Any:
-        if hasattr(series, "to_cupy"):
-            return series.to_cupy()
-        return array_module.asarray(series.to_numpy())
-
-    equal_prefix = array_module.ones(row_count - 1, dtype=array_module.bool_)
-    out_of_order = array_module.zeros(row_count - 1, dtype=array_module.bool_)
-    for column in group_keys:
-        values = frame[column]
-        previous = values.iloc[:-1].reset_index(drop=True)
-        current = values.iloc[1:].reset_index(drop=True)
-        previous_missing = previous.isnull()
-        current_missing = current.isnull()
-        both_present = ~previous_missing & ~current_missing
-        less = ((current < previous) & both_present).fillna(False)
-        # ``sort_values`` puts null/NaN keys last. A present value following a
-        # missing value is therefore descending at the first differing key.
-        missing_descends = previous_missing & ~current_missing
-        out_of_order |= equal_prefix & as_array(less | missing_descends)
-
-        both_missing = previous_missing & current_missing
-        equal = both_missing | ((current == previous) & both_present).fillna(False)
-        equal_prefix &= as_array(equal)
-
-    return not bool(array_module.any(out_of_order))
+        table, _ = frame.loc[:, list(group_keys)].to_pylibcudf(copy=False)
+        return bool(
+            plc.sorting.is_sorted(
+                table,
+                [plc.types.Order.ASCENDING] * len(group_keys),
+                [plc.types.NullOrder.AFTER] * len(group_keys),
+            )
+        )
+    except (AttributeError, ImportError, TypeError):
+        # Compatibility path for older cuDF/pylibcudf versions. Sorting is
+        # always correct; only the redundant-sort elision is unavailable.
+        return False
 
 
 def _iter_group_outputs(group_fn: Any, group: Any) -> Iterator[Any]:
@@ -521,7 +507,7 @@ def _execute_range(
         )
         tokenized_batches.clear()
         _validate_group_keys(tokenized_partition, work.group_keys)
-        if not _is_sorted_by_group_keys(tokenized_partition, work.group_keys, cupy):
+        if not _is_sorted_by_group_keys(tokenized_partition, work.group_keys):
             tokenized_partition = tokenized_partition.sort_values(
                 list(work.group_keys), ignore_index=True, na_position="last"
             )

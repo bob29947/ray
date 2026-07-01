@@ -386,24 +386,18 @@ def test_group_output_single_result_and_empty_dataframe_are_single_batches():
     assert outputs[0] is empty
 
 
-@pytest.mark.parametrize(
-    ("frame", "expected"),
-    [
-        (pd.DataFrame({"User": [], "Card": []}), True),
-        (pd.DataFrame({"User": [1], "Card": [2]}), True),
-        (pd.DataFrame({"User": [1, 1, 2], "Card": [1, 2, 0]}), True),
-        (pd.DataFrame({"User": [1, 2, 1], "Card": [1, 0, 2]}), False),
-        (pd.DataFrame({"User": [1, 1], "Card": [2, 1]}), False),
-        (pd.DataFrame({"User": [1, 1], "Card": [1.0, float("nan")]}), True),
-        (pd.DataFrame({"User": [1, 1], "Card": [float("nan"), 1.0]}), False),
-        (pd.DataFrame({"User": [1, 1], "Card": [None, None]}), True),
-        (pd.DataFrame({"User": [1, 1], "Card": ["a", "b"]}), True),
-    ],
-)
-def test_group_key_order_detection_matches_ascending_nulls_last(frame, expected):
-    import numpy as np
+def test_group_key_order_detection_accepts_trivial_frames():
+    assert _is_sorted_by_group_keys(
+        pd.DataFrame({"User": [1], "Card": [2]}), ("User", "Card")
+    )
 
-    assert _is_sorted_by_group_keys(frame, ("User", "Card"), np) is expected
+
+def test_group_key_order_detection_sorts_when_compiled_check_is_unavailable():
+    # Pandas has no ``to_pylibcudf`` bridge and exercises the compatibility
+    # path. A False result conservatively requests the ordinary sort.
+    assert not _is_sorted_by_group_keys(
+        pd.DataFrame({"User": [1, 1], "Card": [1, 2]}), ("User", "Card")
+    )
 
 
 def test_group_output_generator_and_empty_generator_semantics():
