@@ -81,6 +81,7 @@ def _stats(partition_id=0):
         host_transfer_bytes=256,
         rmm_pool_initial_bytes=8 * 1024**3,
         rmm_pool_maximum_bytes=24 * 1024**3,
+        rmm_pool_reserved_peak_bytes=16 * 1024**3,
     )
 
 

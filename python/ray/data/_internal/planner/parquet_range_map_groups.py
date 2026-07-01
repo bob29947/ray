@@ -96,6 +96,7 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     host_transfer_bytes: int
     rmm_pool_initial_bytes: int
     rmm_pool_maximum_bytes: int
+    rmm_pool_reserved_peak_bytes: int
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,16 @@ class _RmmPoolState:
 
     config: _RmmPoolConfig
     upstream: Any
+    statistics: Any
     pool: Any
+    external_used_bytes: int
+
+    def peak_memory_bytes(self) -> int:
+        """Return non-pool residency plus peak bytes reserved by the RMM pool."""
+
+        return self.external_used_bytes + int(
+            self.statistics.allocation_counts.peak_bytes
+        )
 
 
 def _resolve_rmm_pool_config(
@@ -168,7 +178,7 @@ def _configure_rmm_pool(
 
     import rmm
 
-    free_bytes, _ = rmm.mr.available_device_memory()
+    free_bytes, total_bytes = rmm.mr.available_device_memory()
     config = _resolve_rmm_pool_config(
         free_bytes=int(free_bytes),
         gpu_memory_budget_bytes=gpu_memory_budget_bytes,
@@ -180,8 +190,9 @@ def _configure_rmm_pool(
     # resource preserves any such live allocations; ``rmm.reinitialize``
     # would invalidate them.
     upstream = rmm.mr.get_current_device_resource()
+    statistics = rmm.mr.StatisticsResourceAdaptor(upstream)
     pool = rmm.mr.PoolMemoryResource(
-        upstream,
+        statistics,
         initial_pool_size=config.initial_bytes,
         maximum_pool_size=config.maximum_bytes,
     )
@@ -193,7 +204,13 @@ def _configure_rmm_pool(
     from rmm.allocators.cupy import rmm_cupy_allocator
 
     cupy.cuda.set_allocator(rmm_cupy_allocator)
-    return _RmmPoolState(config=config, upstream=upstream, pool=pool)
+    return _RmmPoolState(
+        config=config,
+        upstream=upstream,
+        statistics=statistics,
+        pool=pool,
+        external_used_bytes=max(0, int(total_bytes) - int(free_bytes)),
+    )
 
 
 def validate_cudf_projection_schema(
@@ -440,14 +457,6 @@ def _validate_group_keys(frame: Any, group_keys: Tuple[str, ...]) -> None:
         )
 
 
-def _sample_gpu_memory(cupy: Any) -> int:
-    try:
-        free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
-        return int(total_bytes - free_bytes)
-    except Exception:
-        return 0
-
-
 def _execute_range(
     work: ParquetRangeMapGroupsWork,
     *,
@@ -457,7 +466,7 @@ def _execute_range(
     tokenizer_zero_copy_batch: bool,
     group_zero_copy_batch: bool,
     target_max_block_size: int,
-    rmm_pool_config: _RmmPoolConfig,
+    rmm_pool_state: _RmmPoolState,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
     """Read, tokenize, sort, and invoke every group exactly once on one GPU."""
 
@@ -474,10 +483,9 @@ def _execute_range(
     group_count = 0
     output_rows = 0
     host_transfer_bytes = 0
-    gpu_peak_memory_bytes = _sample_gpu_memory(cupy)
 
     def raw_frames() -> Iterator[Any]:
-        nonlocal read_time_s, input_rows, gpu_peak_memory_bytes
+        nonlocal read_time_s, input_rows
         for fragment in work.fragments:
             verify_posix_source_identity(fragment.path, fragment.source_identity)
             started = time.perf_counter()
@@ -496,7 +504,6 @@ def _execute_range(
             ].reset_index(drop=True)
             read_time_s += time.perf_counter() - started
             input_rows += len(frame)
-            gpu_peak_memory_bytes = max(gpu_peak_memory_bytes, _sample_gpu_memory(cupy))
             if len(frame):
                 yield frame
             verify_posix_source_identity(fragment.path, fragment.source_identity)
@@ -514,7 +521,6 @@ def _execute_range(
         map_time_s += time.perf_counter() - started
         tokenized_rows += len(tokenized)
         tokenized_batches.append(tokenized)
-        gpu_peak_memory_bytes = max(gpu_peak_memory_bytes, _sample_gpu_memory(cupy))
 
     output_blocks = 0
     output_buffer = BlockOutputBuffer(
@@ -536,7 +542,6 @@ def _execute_range(
         boundaries = _group_boundaries(tokenized_partition, work.group_keys, cupy)
         host_transfer_bytes += max(0, len(boundaries) - 1) * 8
         sort_time_s += time.perf_counter() - started
-        gpu_peak_memory_bytes = max(gpu_peak_memory_bytes, _sample_gpu_memory(cupy))
 
         for group in _iter_group_views(tokenized_partition, boundaries):
             group_count += 1
@@ -559,10 +564,6 @@ def _execute_range(
                 output_time_s += time.perf_counter() - started
                 started = time.perf_counter()
             group_time_s += time.perf_counter() - started
-            if group_count % 128 == 0:
-                gpu_peak_memory_bytes = max(
-                    gpu_peak_memory_bytes, _sample_gpu_memory(cupy)
-                )
 
     started = time.perf_counter()
     output_buffer.finalize()
@@ -575,6 +576,9 @@ def _execute_range(
         yield output_block
         started = time.perf_counter()
     output_time_s += time.perf_counter() - started
+    rmm_pool_reserved_peak_bytes = int(
+        rmm_pool_state.statistics.allocation_counts.peak_bytes
+    )
 
     stats = ParquetRangeMapGroupsStats(
         partition_id=work.partition_id,
@@ -594,10 +598,11 @@ def _execute_range(
         sort_time_s=sort_time_s,
         group_time_s=group_time_s,
         output_time_s=output_time_s,
-        gpu_peak_memory_bytes=gpu_peak_memory_bytes,
+        gpu_peak_memory_bytes=rmm_pool_state.peak_memory_bytes(),
         host_transfer_bytes=host_transfer_bytes,
-        rmm_pool_initial_bytes=rmm_pool_config.initial_bytes,
-        rmm_pool_maximum_bytes=rmm_pool_config.maximum_bytes,
+        rmm_pool_initial_bytes=rmm_pool_state.config.initial_bytes,
+        rmm_pool_maximum_bytes=rmm_pool_state.config.maximum_bytes,
+        rmm_pool_reserved_peak_bytes=rmm_pool_reserved_peak_bytes,
     )
     return stats
 
@@ -808,7 +813,7 @@ def build_parquet_range_map_groups_operator(
                 tokenizer_zero_copy_batch=tokenizer_zero_copy_batch,
                 group_zero_copy_batch=group_zero_copy_batch,
                 target_max_block_size=target_max_block_size,
-                rmm_pool_config=rmm_pool_state.config,
+                rmm_pool_state=rmm_pool_state,
             )
             # Keep one block behind so completed worker metrics are attached to
             # its metadata. Earlier bounded blocks can flow to the writer while
