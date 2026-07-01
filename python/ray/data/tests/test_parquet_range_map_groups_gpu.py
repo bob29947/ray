@@ -299,6 +299,11 @@ def test_natural_api_hash_shuffle_matches_selected_range_backend(
     assert sum(item["groups_invoked"] for item in worker_metrics) == 4
     assert all(item["gpu_peak_memory_bytes"] > 0 for item in worker_metrics)
     assert all(item["host_transfer_bytes"] > 0 for item in worker_metrics)
+    assert all(item["rmm_pool_initial_bytes"] > 0 for item in worker_metrics)
+    assert all(
+        item["rmm_pool_maximum_bytes"] >= item["rmm_pool_initial_bytes"]
+        for item in worker_metrics
+    )
 
     records = ray.get(gpu_assignment_collector.records.remote("hash-fast"))
     _assert_fast_range_gpu_assignments(records)

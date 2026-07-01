@@ -11,6 +11,7 @@ from __future__ import annotations
 import collections.abc
 import math
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple
 
@@ -93,6 +94,106 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     output_time_s: float
     gpu_peak_memory_bytes: int
     host_transfer_bytes: int
+    rmm_pool_initial_bytes: int
+    rmm_pool_maximum_bytes: int
+
+
+@dataclass(frozen=True)
+class _RmmPoolConfig:
+    """Realized bounds for the dedicated actor's device-memory pool."""
+
+    initial_bytes: int
+    maximum_bytes: int
+
+
+@dataclass
+class _RmmPoolState:
+    """Keep the installed pool and its upstream resource alive in the actor."""
+
+    config: _RmmPoolConfig
+    upstream: Any
+    pool: Any
+
+
+def _resolve_rmm_pool_config(
+    *,
+    free_bytes: int,
+    gpu_memory_budget_bytes: int,
+    initial_bytes: int,
+    reserve_bytes: int,
+) -> _RmmPoolConfig:
+    """Clamp configured RMM bounds to the planner budget and live free memory."""
+
+    alignment = 256
+
+    def align_down(value: int) -> int:
+        return int(value) // alignment * alignment
+
+    if free_bytes <= 0:
+        raise RuntimeError("RMM reported no free GPU memory for the fused actor.")
+    if gpu_memory_budget_bytes <= 0:
+        raise ValueError("gpu_memory_budget_bytes must be positive")
+    if initial_bytes <= 0:
+        raise ValueError("RMM initial pool size must be positive")
+    if reserve_bytes < 0:
+        raise ValueError("RMM reserved GPU memory must be nonnegative")
+
+    live_limit = align_down(max(0, free_bytes - reserve_bytes))
+    maximum = min(align_down(gpu_memory_budget_bytes), live_limit)
+    if maximum < alignment:
+        raise RuntimeError(
+            "Insufficient free GPU memory for the fused actor's RMM pool: "
+            f"free_bytes={free_bytes}, reserve_bytes={reserve_bytes}, "
+            f"gpu_memory_budget_bytes={gpu_memory_budget_bytes}"
+        )
+    return _RmmPoolConfig(
+        initial_bytes=min(align_down(initial_bytes), maximum),
+        maximum_bytes=maximum,
+    )
+
+
+def _configure_rmm_pool(
+    *,
+    gpu_memory_budget_bytes: int,
+    initial_bytes: int,
+    reserve_bytes: int,
+) -> _RmmPoolState:
+    """Install an actor-local RMM pool before constructing either GPU UDF.
+
+    A selected range actor is a dedicated one-GPU process, so changing its
+    process-global allocator cannot affect unrelated Ray tasks.  Initializing
+    here avoids serialized cudaMalloc/cudaFree calls across the tokenizer and
+    thousands of synchronous ``map_groups`` invocations.
+    """
+
+    import rmm
+
+    free_bytes, _ = rmm.mr.available_device_memory()
+    config = _resolve_rmm_pool_config(
+        free_bytes=int(free_bytes),
+        gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+        initial_bytes=initial_bytes,
+        reserve_bytes=reserve_bytes,
+    )
+    # Cloudpickle may import a callable's module while constructing this map
+    # worker, before the transformer's init hook runs. Wrapping the current
+    # resource preserves any such live allocations; ``rmm.reinitialize``
+    # would invalidate them.
+    upstream = rmm.mr.get_current_device_resource()
+    pool = rmm.mr.PoolMemoryResource(
+        upstream,
+        initial_pool_size=config.initial_bytes,
+        maximum_pool_size=config.maximum_bytes,
+    )
+    rmm.mr.set_current_device_resource(pool)
+
+    # Import CuPy only after RMM owns the device resource.  The tokenizer and
+    # map_groups callable then share the same bounded allocator as cuDF.
+    import cupy
+    from rmm.allocators.cupy import rmm_cupy_allocator
+
+    cupy.cuda.set_allocator(rmm_cupy_allocator)
+    return _RmmPoolState(config=config, upstream=upstream, pool=pool)
 
 
 def validate_cudf_projection_schema(
@@ -160,31 +261,45 @@ def _normalize_cudf_frame(frame: Any, work: ParquetRangeMapGroupsWork) -> Any:
 def _iter_exact_cudf_batches(
     frames: Iterable[Any], batch_size: int, cudf: Any
 ) -> Iterator[Any]:
-    """Rebatch a row-group stream exactly like a fixed-size ``map_batches``."""
+    """Rebatch a row-group stream without repeatedly copying its remainder."""
 
-    pending: List[Any] = []
+    # Each entry holds a frame and the first unconsumed row.  In particular,
+    # do not materialize ``combined.iloc[batch_size:]`` after every batch: one
+    # large Parquet read would otherwise copy progressively smaller tails and
+    # turn exact batching into quadratic device-memory traffic.
+    pending = deque()
     pending_rows = 0
+
+    def take(rows: int) -> Any:
+        nonlocal pending_rows
+        pieces = []
+        remaining = rows
+        while remaining:
+            frame, offset = pending[0]
+            available = len(frame) - offset
+            consumed = min(available, remaining)
+            pieces.append(frame.iloc[offset : offset + consumed])
+            if consumed == available:
+                pending.popleft()
+            else:
+                pending[0] = (frame, offset + consumed)
+            pending_rows -= consumed
+            remaining -= consumed
+        combined = (
+            pieces[0] if len(pieces) == 1 else cudf.concat(pieces, ignore_index=True)
+        )
+        return combined.reset_index(drop=True)
+
     for frame in frames:
         frame_rows = len(frame)
         if frame_rows == 0:
             continue
-        pending.append(frame)
+        pending.append((frame, 0))
         pending_rows += frame_rows
         while pending_rows >= batch_size:
-            combined = (
-                pending[0]
-                if len(pending) == 1
-                else cudf.concat(pending, ignore_index=True)
-            )
-            yield combined.iloc[:batch_size].reset_index(drop=True)
-            remainder = combined.iloc[batch_size:].reset_index(drop=True)
-            pending = [remainder] if len(remainder) else []
-            pending_rows = len(remainder)
+            yield take(batch_size)
     if pending_rows:
-        combined = (
-            pending[0] if len(pending) == 1 else cudf.concat(pending, ignore_index=True)
-        )
-        yield combined.reset_index(drop=True)
+        yield take(pending_rows)
 
 
 def _invoke_row_preserving_tokenizer(
@@ -219,11 +334,17 @@ def _invoke_row_preserving_tokenizer(
         )
     input_key = batch[partition_key].reset_index(drop=True)
     output_key = output[partition_key].reset_index(drop=True)
-    if bool(input_key.isnull().any()) or bool(output_key.isnull().any()):
-        raise ValueError(
-            f"Preserved partition column {partition_key!r} contains nulls."
-        )
-    if not bool((input_key == output_key).all()):
+    input_missing = input_key.isnull()
+    output_missing = output_key.isnull()
+    values_equal = (input_key == output_key).fillna(False)
+    # Keep the success path to one device synchronization per tokenizer batch.
+    # Detailed diagnostics may synchronize again only after the contract fails.
+    preserved = (~input_missing & ~output_missing & values_equal).all()
+    if not bool(preserved):
+        if bool((input_missing | output_missing).any()):
+            raise ValueError(
+                f"Preserved partition column {partition_key!r} contains nulls."
+            )
         raise ValueError(
             f"The tokenizer changed preserved partition column {partition_key!r}."
         )
@@ -252,6 +373,42 @@ def _group_boundaries(frame: Any, group_keys: Tuple[str, ...], cupy: Any) -> Lis
         changed |= value_changed | missing_changed
     starts = cupy.flatnonzero(changed).get().tolist()
     return [int(value) for value in starts] + [row_count]
+
+
+def _is_sorted_by_group_keys(
+    frame: Any, group_keys: Tuple[str, ...], array_module: Any
+) -> bool:
+    """Return whether adjacent rows are lexicographically group-key ordered."""
+
+    row_count = len(frame)
+    if row_count < 2:
+        return True
+
+    def as_array(series: Any) -> Any:
+        if hasattr(series, "to_cupy"):
+            return series.to_cupy()
+        return array_module.asarray(series.to_numpy())
+
+    equal_prefix = array_module.ones(row_count - 1, dtype=array_module.bool_)
+    out_of_order = array_module.zeros(row_count - 1, dtype=array_module.bool_)
+    for column in group_keys:
+        values = frame[column]
+        previous = values.iloc[:-1].reset_index(drop=True)
+        current = values.iloc[1:].reset_index(drop=True)
+        previous_missing = previous.isnull()
+        current_missing = current.isnull()
+        both_present = ~previous_missing & ~current_missing
+        less = ((current < previous) & both_present).fillna(False)
+        # ``sort_values`` puts null/NaN keys last. A present value following a
+        # missing value is therefore descending at the first differing key.
+        missing_descends = previous_missing & ~current_missing
+        out_of_order |= equal_prefix & as_array(less | missing_descends)
+
+        both_missing = previous_missing & current_missing
+        equal = both_missing | ((current == previous) & both_present).fillna(False)
+        equal_prefix &= as_array(equal)
+
+    return not bool(array_module.any(out_of_order))
 
 
 def _iter_group_outputs(group_fn: Any, group: Any) -> Iterator[Any]:
@@ -292,6 +449,7 @@ def _execute_range(
     tokenizer_zero_copy_batch: bool,
     group_zero_copy_batch: bool,
     target_max_block_size: int,
+    rmm_pool_config: _RmmPoolConfig,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
     """Read, tokenize, sort, and invoke every group exactly once on one GPU."""
 
@@ -363,9 +521,10 @@ def _execute_range(
         )
         tokenized_batches.clear()
         _validate_group_keys(tokenized_partition, work.group_keys)
-        tokenized_partition = tokenized_partition.sort_values(
-            list(work.group_keys), ignore_index=True
-        )
+        if not _is_sorted_by_group_keys(tokenized_partition, work.group_keys, cupy):
+            tokenized_partition = tokenized_partition.sort_values(
+                list(work.group_keys), ignore_index=True, na_position="last"
+            )
         boundaries = _group_boundaries(tokenized_partition, work.group_keys, cupy)
         host_transfer_bytes += max(0, len(boundaries) - 1) * 8
         sort_time_s += time.perf_counter() - started
@@ -430,6 +589,8 @@ def _execute_range(
         output_time_s=output_time_s,
         gpu_peak_memory_bytes=gpu_peak_memory_bytes,
         host_transfer_bytes=host_transfer_bytes,
+        rmm_pool_initial_bytes=rmm_pool_config.initial_bytes,
+        rmm_pool_maximum_bytes=rmm_pool_config.maximum_bytes,
     )
     return stats
 
@@ -576,7 +737,43 @@ def build_parquet_range_map_groups_operator(
         compute=map_groups_op.compute,
     )
 
+    rmm_pool_initial_bytes = data_context.get_config(
+        "parquet_range_map_groups_rmm_pool_initial_bytes", 8 * 1024**3
+    )
+    rmm_pool_reserve_bytes = data_context.get_config(
+        "parquet_range_map_groups_rmm_pool_reserve_bytes", 2 * 1024**3
+    )
+    if (
+        isinstance(rmm_pool_initial_bytes, bool)
+        or not isinstance(rmm_pool_initial_bytes, int)
+        or rmm_pool_initial_bytes <= 0
+    ):
+        raise ValueError(
+            "parquet_range_map_groups_rmm_pool_initial_bytes must be a positive "
+            "integer"
+        )
+    if (
+        isinstance(rmm_pool_reserve_bytes, bool)
+        or not isinstance(rmm_pool_reserve_bytes, int)
+        or rmm_pool_reserve_bytes < 0
+    ):
+        raise ValueError(
+            "parquet_range_map_groups_rmm_pool_reserve_bytes must be a nonnegative "
+            "integer"
+        )
+    if gpu_memory_budget_bytes <= 0:
+        raise ValueError("The fused GPU actor requires a positive memory budget.")
+
+    # This dictionary is process-local after Ray deserializes the actor's map
+    # transformer. The init hook populates it before execute can run.
+    allocator_state: Dict[str, _RmmPoolState] = {}
+
     def init_fn() -> None:
+        allocator_state["rmm"] = _configure_rmm_pool(
+            gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+            initial_bytes=rmm_pool_initial_bytes,
+            reserve_bytes=rmm_pool_reserve_bytes,
+        )
         tokenizer_init_fn()
         group_init_fn()
 
@@ -590,6 +787,11 @@ def build_parquet_range_map_groups_operator(
         _: TaskContext,
         report_custom_op_stats: CustomOpStatsReportFn,
     ) -> Iterator[Block]:
+        rmm_pool_state = allocator_state.get("rmm")
+        if rmm_pool_state is None:
+            raise RuntimeError(
+                "ParquetRangeMapGroups actor executed before RMM initialization."
+            )
         for work in blocks:
             range_outputs = _execute_range(
                 work,
@@ -599,6 +801,7 @@ def build_parquet_range_map_groups_operator(
                 tokenizer_zero_copy_batch=tokenizer_zero_copy_batch,
                 group_zero_copy_batch=group_zero_copy_batch,
                 target_max_block_size=target_max_block_size,
+                rmm_pool_config=rmm_pool_state.config,
             )
             # Keep one block behind so completed worker metrics are attached to
             # its metadata. Earlier bounded blocks can flow to the writer while
@@ -662,6 +865,8 @@ def build_parquet_range_map_groups_operator(
         "load_skew": metrics.load_skew,
         "estimated_peak_gpu_memory_bytes": estimated_peak_gpu_memory_bytes,
         "gpu_memory_budget_bytes": gpu_memory_budget_bytes,
+        "rmm_pool_initial_bytes": rmm_pool_initial_bytes,
+        "rmm_pool_reserve_bytes": rmm_pool_reserve_bytes,
         "ranges": tuple(
             {
                 "partition_id": work.partition_id,

@@ -17,7 +17,9 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _iter_exact_cudf_batches,
     _iter_group_outputs,
     _invoke_row_preserving_tokenizer,
+    _is_sorted_by_group_keys,
     _make_work,
+    _resolve_rmm_pool_config,
     _validate_group_keys,
     build_parquet_range_map_groups_operator,
     validate_cudf_projection_schema,
@@ -76,7 +78,99 @@ def _stats(partition_id=0):
         output_time_s=5.0,
         gpu_peak_memory_bytes=1024,
         host_transfer_bytes=256,
+        rmm_pool_initial_bytes=8 * 1024**3,
+        rmm_pool_maximum_bytes=24 * 1024**3,
     )
+
+
+def test_rmm_pool_config_respects_budget_reserve_and_alignment():
+    gib = 1024**3
+
+    config = _resolve_rmm_pool_config(
+        free_bytes=30 * gib + 127,
+        gpu_memory_budget_bytes=24 * gib + 127,
+        initial_bytes=8 * gib + 127,
+        reserve_bytes=2 * gib,
+    )
+
+    assert config.initial_bytes == 8 * gib
+    assert config.maximum_bytes == 24 * gib
+    assert config.initial_bytes % 256 == 0
+    assert config.maximum_bytes % 256 == 0
+
+
+def test_rmm_pool_config_clamps_initial_size_to_live_limit():
+    gib = 1024**3
+
+    config = _resolve_rmm_pool_config(
+        free_bytes=7 * gib,
+        gpu_memory_budget_bytes=12 * gib,
+        initial_bytes=8 * gib,
+        reserve_bytes=2 * gib,
+    )
+
+    assert config.initial_bytes == 5 * gib
+    assert config.maximum_bytes == 5 * gib
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        (
+            {
+                "free_bytes": 0,
+                "gpu_memory_budget_bytes": 1,
+                "initial_bytes": 1,
+                "reserve_bytes": 0,
+            },
+            RuntimeError,
+            "no free GPU memory",
+        ),
+        (
+            {
+                "free_bytes": 1,
+                "gpu_memory_budget_bytes": 0,
+                "initial_bytes": 1,
+                "reserve_bytes": 0,
+            },
+            ValueError,
+            "gpu_memory_budget_bytes",
+        ),
+        (
+            {
+                "free_bytes": 1,
+                "gpu_memory_budget_bytes": 1,
+                "initial_bytes": 0,
+                "reserve_bytes": 0,
+            },
+            ValueError,
+            "initial pool size",
+        ),
+        (
+            {
+                "free_bytes": 1,
+                "gpu_memory_budget_bytes": 1,
+                "initial_bytes": 1,
+                "reserve_bytes": -1,
+            },
+            ValueError,
+            "reserved GPU memory",
+        ),
+        (
+            {
+                "free_bytes": 1024,
+                "gpu_memory_budget_bytes": 1024,
+                "initial_bytes": 1024,
+                "reserve_bytes": 1024,
+            },
+            RuntimeError,
+            "Insufficient free GPU memory",
+        ),
+    ],
+)
+def test_rmm_pool_config_rejects_invalid_or_exhausted_bounds(kwargs, error, match):
+    with pytest.raises(error, match=match):
+        _resolve_rmm_pool_config(**kwargs)
 
 
 def test_schema_preflight_accepts_supported_primitive_projection():
@@ -255,7 +349,9 @@ def test_exact_batching_combines_splits_and_flushes_pandas_frames():
         [6, 7],
     ]
     assert all(batch.index.tolist() == list(range(len(batch))) for batch in batches)
-    assert _FakeCudf.concat_calls == [(2, 5), (1, 1)]
+    # Only the rows needed to finish a batch are concatenated; the four-row
+    # source remainder is retained by cursor rather than recopied.
+    assert _FakeCudf.concat_calls == [(2, 1), (1, 1)]
 
 
 def test_exact_batching_avoids_concat_for_one_frame_and_skips_empty_input():
@@ -288,6 +384,26 @@ def test_group_output_single_result_and_empty_dataframe_are_single_batches():
     outputs = list(_iter_group_outputs(lambda _: empty, group))
     assert len(outputs) == 1
     assert outputs[0] is empty
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        (pd.DataFrame({"User": [], "Card": []}), True),
+        (pd.DataFrame({"User": [1], "Card": [2]}), True),
+        (pd.DataFrame({"User": [1, 1, 2], "Card": [1, 2, 0]}), True),
+        (pd.DataFrame({"User": [1, 2, 1], "Card": [1, 0, 2]}), False),
+        (pd.DataFrame({"User": [1, 1], "Card": [2, 1]}), False),
+        (pd.DataFrame({"User": [1, 1], "Card": [1.0, float("nan")]}), True),
+        (pd.DataFrame({"User": [1, 1], "Card": [float("nan"), 1.0]}), False),
+        (pd.DataFrame({"User": [1, 1], "Card": [None, None]}), True),
+        (pd.DataFrame({"User": [1, 1], "Card": ["a", "b"]}), True),
+    ],
+)
+def test_group_key_order_detection_matches_ascending_nulls_last(frame, expected):
+    import numpy as np
+
+    assert _is_sorted_by_group_keys(frame, ("User", "Card"), np) is expected
 
 
 def test_group_output_generator_and_empty_generator_semantics():
