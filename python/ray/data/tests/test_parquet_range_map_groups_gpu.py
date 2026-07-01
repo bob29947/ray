@@ -102,9 +102,7 @@ def _summarize_partition(partition, groups, *, summary_offset):
 
     return cudf.concat(
         [
-            _summarize_group(
-                partition.iloc[start:end], summary_offset=summary_offset
-            )
+            _summarize_group(partition.iloc[start:end], summary_offset=summary_offset)
             for start, end in zip(
                 groups.input_group_boundaries[:-1],
                 groups.input_group_boundaries[1:],
@@ -195,6 +193,7 @@ def _run_natural_pipeline(
     shuffle_strategy,
     range_backend_enabled,
     partition_execution_enabled=False,
+    group_zero_copy_batch=False,
 ):
     context = DataContext.get_current()
     context.use_datasource_v2 = False
@@ -228,7 +227,7 @@ def _run_natural_pipeline(
         .map_groups(
             _summarize_group,
             batch_format="cudf",
-            zero_copy_batch=False,
+            zero_copy_batch=group_zero_copy_batch,
             fn_kwargs={"summary_offset": 11},
             compute=TaskPoolStrategy(size=2),
             num_gpus=1,
@@ -356,14 +355,16 @@ def test_natural_api_uses_partition_equivalent_group_udf_once_per_range(
         shuffle_strategy=ShuffleStrategy.HASH_SHUFFLE,
         range_backend_enabled=True,
         partition_execution_enabled=True,
+        group_zero_copy_batch=True,
     )
 
     frame = _logical_output(output)
     _assert_expected_groups(frame)
     metrics = output.get_stats_summary().extra_metrics
-    assert metrics["parquet_range_map_groups_plan"]["group_execution_mode"] == (
-        "partition_v1"
-    )
+    plan_metrics = metrics["parquet_range_map_groups_plan"]
+    assert plan_metrics["group_execution_mode"] == "partition_v1", plan_metrics[
+        "group_partition_fallback_reason"
+    ]
     workers = metrics["parquet_range_map_groups_workers"]
     assert sum(worker["groups_invoked"] for worker in workers) == 4
     assert sum(worker["group_udf_invocations"] for worker in workers) == 0

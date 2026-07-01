@@ -21,12 +21,8 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Tuple
 from ray.data.context import DataContext
 
 
-MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG = (
-    "map_groups_partition_execution_enabled"
-)
-MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE = (
-    "__ray_data_map_groups_partition_protocol__"
-)
+MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG = "map_groups_partition_execution_enabled"
+MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE = "__ray_data_map_groups_partition_protocol__"
 MAP_GROUPS_PARTITION_UDF_ATTRIBUTE = "__ray_data_map_groups_partition__"
 MAP_GROUPS_PARTITION_PROTOCOL_VERSION = 1
 
@@ -63,9 +59,7 @@ def resolve_map_groups_partition_contract(
     """Resolve a strict v1 contract without invoking application code."""
 
     if (
-        data_context.get_config(
-            MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG, False
-        )
+        data_context.get_config(MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG, False)
         is not True
     ):
         return None, None

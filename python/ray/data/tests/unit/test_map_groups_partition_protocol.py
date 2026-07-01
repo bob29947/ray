@@ -115,7 +115,10 @@ def test_partition_protocol_rejects_malformed_descriptors():
         ),
     ]
     for descriptor, expected_reason in cases:
-        fn = lambda batch: batch
+
+        def fn(batch):
+            return batch
+
         setattr(fn, MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE, descriptor)
         setattr(fn, MAP_GROUPS_PARTITION_UDF_ATTRIBUTE, _partition)
         contract, reason = resolve_map_groups_partition_contract(
