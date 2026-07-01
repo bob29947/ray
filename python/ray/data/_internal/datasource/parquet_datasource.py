@@ -596,30 +596,44 @@ class ParquetDatasource(Datasource):
         _validate_shuffle_arg(shuffle)
         self._shuffle = shuffle
 
-        # Sample small number of parquet files to estimate
-        #   - Encoding ratio: ratio of file size on disk to approximate expected
-        #     size of the corresponding block in memory
-        #   - Default batch-size: number of rows to be read from a file at a time,
-        #     used to limit amount of memory pressure
-        sampled_fragments = _sample_fragments(
-            self._pq_fragments,
-        )
+        data_context = DataContext.get_current()
+        if data_context.get_config("parquet_range_map_groups_enabled", False) is True:
+            # The range backend reads projected row groups directly and obtains
+            # encoded and uncompressed sizes from their footers. Sampling rows
+            # here would perform redundant distributed I/O before the logical
+            # pattern can be selected. Safe defaults retain ordinary-reader
+            # behavior if the later optimizer decides to fall back.
+            self._encoding_ratio = PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+            estimated_batch_size = (
+                DEFAULT_PARQUET_READER_ROW_BATCH_SIZE
+                if data_context.target_max_block_size is not None
+                else None
+            )
+        else:
+            # Sample small number of parquet files to estimate
+            #   - Encoding ratio: ratio of file size on disk to approximate expected
+            #     size of the corresponding block in memory
+            #   - Default batch-size: number of rows to be read from a file at a time,
+            #     used to limit amount of memory pressure
+            sampled_fragments = _sample_fragments(
+                self._pq_fragments,
+            )
 
-        sampled_file_infos = _fetch_file_infos(
-            sampled_fragments,
-            columns=self._get_data_columns(),
-            schema=read_schema,
-            local_scheduling=self._local_scheduling,
-        )
+            sampled_file_infos = _fetch_file_infos(
+                sampled_fragments,
+                columns=self._get_data_columns(),
+                schema=read_schema,
+                local_scheduling=self._local_scheduling,
+            )
 
-        self._encoding_ratio = _estimate_files_encoding_ratio(
-            sampled_fragments,
-            sampled_file_infos,
-        )
+            self._encoding_ratio = _estimate_files_encoding_ratio(
+                sampled_fragments,
+                sampled_file_infos,
+            )
 
-        estimated_batch_size = _estimate_reader_batch_size(
-            sampled_file_infos, DataContext.get_current().target_max_block_size
-        )
+            estimated_batch_size = _estimate_reader_batch_size(
+                sampled_file_infos, data_context.target_max_block_size
+            )
 
         self._scanner_kwargs = self._get_scanner_kwargs(
             to_batch_kwargs, estimated_batch_size

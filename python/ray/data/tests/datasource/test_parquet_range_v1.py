@@ -26,6 +26,8 @@ from ray.data._internal.datasource.parquet_range_v1 import (
     try_extract_v1_parquet_row_group_metadata,
     verify_posix_source_identity,
 )
+from ray.data.context import DataContext
+from ray.data.datasource.datasource import Datasource
 
 
 def _write_parquet(
@@ -75,6 +77,53 @@ def _datasource_state(
         _partition_columns=list(partition_columns),
         _include_paths=include_paths,
         _include_row_hash=False,
+    )
+
+
+def test_range_backend_skips_redundant_parquet_row_sampling(
+    tmp_path, monkeypatch, restore_data_context
+):
+    path = tmp_path / "data.parquet"
+    _write_parquet(path, [0, 1, 2, 3])
+    fragment = next(pds.dataset(str(path), format="parquet").get_fragments())
+    context = DataContext.get_current()
+    context.set_config("parquet_range_map_groups_enabled", True)
+
+    def unexpected_sampling(*args, **kwargs):
+        raise AssertionError("range-planned parquet read sampled data rows")
+
+    monkeypatch.setattr(
+        parquet_datasource_module, "_fetch_file_infos", unexpected_sampling
+    )
+    datasource = ParquetDatasource.__new__(ParquetDatasource)
+    Datasource.__init__(datasource)
+    datasource._init_state(
+        supports_distributed_reads=False,
+        local_scheduling=None,
+        source_paths_ref=None,
+        filesystem=pa_fs.LocalFileSystem(),
+        fragments=[fragment],
+        file_sizes=[path.stat().st_size],
+        file_schema=fragment.physical_schema,
+        read_schema=None,
+        partition_columns=[],
+        partition_columns_selected=False,
+        partition_schema=pa.schema([]),
+        partitioning=None,
+        projection_map={"User": "User", "Card": "Card"},
+        to_batch_kwargs=None,
+        _block_udf=None,
+        shuffle=None,
+        include_paths=False,
+    )
+
+    assert (
+        datasource._encoding_ratio
+        == parquet_datasource_module.PARQUET_ENCODING_RATIO_ESTIMATE_DEFAULT
+    )
+    assert (
+        datasource._scanner_kwargs["batch_size"]
+        == parquet_datasource_module.DEFAULT_PARQUET_READER_ROW_BATCH_SIZE
     )
 
 
