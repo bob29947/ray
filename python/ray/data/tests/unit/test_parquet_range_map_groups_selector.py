@@ -145,6 +145,29 @@ def test_selection_rejects_checkpointing():
 
 
 @pytest.mark.parametrize(
+    ("attribute", "value", "reason"),
+    [
+        ("retried_map_errors", True, "map_error_retries_unsupported"),
+        (
+            "actor_task_retry_on_errors",
+            [ValueError],
+            "actor_task_retries_unsupported",
+        ),
+        ("actor_init_retry_on_errors", True, "actor_init_retries_unsupported"),
+        ("max_errored_blocks", 1, "errored_blocks_unsupported"),
+        ("max_errored_blocks", -1, "errored_blocks_unsupported"),
+    ],
+)
+def test_selection_rejects_context_level_replay_and_error_suppression(
+    attribute, value, reason
+):
+    op, context = _candidate_plan()
+    setattr(context, attribute, value)
+
+    assert _select(op, context).fallback_reason == reason
+
+
+@pytest.mark.parametrize(
     ("value", "reason"),
     [
         (None, "missing_partitioning_contract"),
@@ -153,6 +176,7 @@ def test_selection_rejects_checkpointing():
         (("User", "User"), "invalid_partitioning_contract"),
         (("User", 1), "invalid_partitioning_contract"),
         (("",), "invalid_partitioning_contract"),
+        (("User", "Card"), "partitioning_contract_not_single_column"),
     ],
 )
 def test_partition_preservation_protocol_is_strict(value, reason):
@@ -361,7 +385,7 @@ def test_projection_must_contain_partition_and_all_group_keys():
 
 def test_partition_key_must_be_the_leading_group_key():
     class Tokenizer:
-        __ray_data_preserves_partitioning__ = ("Card", "User")
+        __ray_data_preserves_partitioning__ = ("Card",)
 
         def __call__(self, batch):
             return batch

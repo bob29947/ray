@@ -242,6 +242,14 @@ def select_parquet_range_map_groups_candidate(
         return _fallback("parquet_range_map_groups_disabled")
     if data_context.checkpoint_config is not None:
         return _fallback("checkpointing_unsupported")
+    if data_context.retried_map_errors:
+        return _fallback("map_error_retries_unsupported")
+    if data_context.actor_task_retry_on_errors:
+        return _fallback("actor_task_retries_unsupported")
+    if data_context.actor_init_retry_on_errors:
+        return _fallback("actor_init_retries_unsupported")
+    if data_context.max_errored_blocks != 0:
+        return _fallback("errored_blocks_unsupported")
     if type(op) is not MapGroups:
         return _fallback("root_not_map_groups")
     map_groups_op = op
@@ -300,6 +308,8 @@ def select_parquet_range_map_groups_candidate(
     if reason is not None:
         return _fallback(reason)
     assert contract is not None
+    if len(contract) != 1:
+        return _fallback("partitioning_contract_not_single_column")
     partition_key = contract[0]
     if partition_key != group_keys[0]:
         return _fallback("partition_key_not_leading_group_key")

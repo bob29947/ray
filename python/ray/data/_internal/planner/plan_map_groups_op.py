@@ -1,13 +1,25 @@
+import logging
 from functools import partial
 from typing import List
 
 from ray.data._internal.execution.interfaces import PhysicalOperator
-from ray.data._internal.logical.operators import MapBatches, MapGroups, Repartition, Sort
+from ray.data._internal.logical.operators import (
+    MapBatches,
+    MapGroups,
+    Repartition,
+    Sort,
+)
 from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
+from ray.data._internal.planner.plan_parquet_range_map_groups import (
+    try_plan_parquet_range_map_groups,
+)
 from ray.data._internal.planner.plan_udf_map_op import plan_udf_map_op
 from ray.data.block import CallableClass
 from ray.data.context import DataContext, ShuffleStrategy
+
+
+logger = logging.getLogger(__name__)
 
 
 def _build_map_groups_udf(op: MapGroups):
@@ -63,6 +75,16 @@ def plan_map_groups_op(
     assert len(physical_children) == 1
     input_physical_dag = physical_children[0]
 
+    range_result = try_plan_parquet_range_map_groups(op, data_context)
+    if range_result.selected:
+        logger.info(
+            "Selected ParquetRangeMapGroups for %s after %.6fs of metadata planning",
+            op.name,
+            range_result.footer_planning_time_s,
+        )
+        assert range_result.physical_operator is not None
+        return range_result.physical_operator
+
     if op.key is None:
         exchange_op = Repartition(
             num_outputs=1,
@@ -106,6 +128,15 @@ def plan_map_groups_op(
         ray_remote_args_fn=op.ray_remote_args_fn,
         ray_remote_args=op.ray_remote_args,
     )
-    return plan_udf_map_op(
-        map_batches_op, [exchange_physical_dag], data_context
-    )
+    physical_op = plan_udf_map_op(map_batches_op, [exchange_physical_dag], data_context)
+    if range_result.fallback_reason != "parquet_range_map_groups_disabled":
+        logger.info(
+            "ParquetRangeMapGroups retained ordinary execution for %s: %s",
+            op.name,
+            range_result.fallback_reason,
+        )
+        physical_op._name = (
+            f"{physical_op.name} "
+            f"[ParquetRangeMapGroupsFallback={range_result.fallback_reason}]"
+        )
+    return physical_op
