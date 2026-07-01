@@ -1,5 +1,7 @@
 from ray.data._internal.tensor_extensions.arrow import (  # noqa: F401
     ArrowConversionError,
+    ArrowPackedTensorArray,
+    ArrowPackedTensorType,
     ArrowTensorArray,
     ArrowTensorType,
     ArrowTensorTypeV2,

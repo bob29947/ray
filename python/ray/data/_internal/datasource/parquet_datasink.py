@@ -30,7 +30,74 @@ ARROW_DEFAULT_MAX_ROWS_PER_GROUP = 1024 * 1024
 
 DEFAULT_PARTITIONING_FLAVOR = "hive"
 
+# Experimental, source-neutral Parquet encoding for dense fixed-shape tensor
+# columns.  This remains opt-in while the packed on-disk representation gains
+# broader compatibility coverage.
+PARQUET_WRITE_PACKED_TENSORS_CONFIG = "parquet_write_packed_tensors"
+
 logger = logging.getLogger(__name__)
+
+
+def _pack_fixed_shape_tensor_columns(
+    tables: List["pyarrow.Table"],
+) -> tuple[List["pyarrow.Table"], "pyarrow.Schema"]:
+    """Pack compatible tensor columns consistently across all input tables.
+
+    A column is converted only if every chunk in every table is compatible.
+    This keeps schema selection fail-closed for null, variable-shape, empty-
+    dimension, oversized, or unsupported tensors.
+    """
+
+    import pyarrow as pa
+
+    from ray.data._internal.tensor_extensions.arrow import (
+        pack_arrow_fixed_shape_tensor_array,
+    )
+
+    if not tables:
+        raise ValueError("At least one table is required for Parquet output.")
+
+    output_tables = list(tables)
+    output_fields = list(tables[0].schema)
+    for column_index, field in enumerate(output_fields):
+        packed_columns = []
+        packed_type = None
+        compatible = True
+        for table in output_tables:
+            packed_chunks = []
+            for chunk in table.column(column_index).chunks:
+                packed = pack_arrow_fixed_shape_tensor_array(chunk)
+                if packed is None:
+                    compatible = False
+                    break
+                if packed_type is None:
+                    packed_type = packed.type
+                elif packed.type != packed_type:
+                    compatible = False
+                    break
+                packed_chunks.append(packed)
+            if not compatible or not packed_chunks:
+                compatible = False
+                break
+            packed_columns.append(pa.chunked_array(packed_chunks, type=packed_type))
+
+        if not compatible:
+            continue
+
+        packed_field = pa.field(
+            field.name,
+            packed_type,
+            nullable=field.nullable,
+            metadata=field.metadata,
+        )
+        output_fields[column_index] = packed_field
+        output_tables = [
+            table.set_column(column_index, packed_field, packed_column)
+            for table, packed_column in zip(output_tables, packed_columns)
+        ]
+
+    output_schema = pa.schema(output_fields, metadata=tables[0].schema.metadata)
+    return output_tables, output_schema
 
 
 def choose_row_group_limits(
@@ -275,6 +342,12 @@ class ParquetDatasink(_FileDatasink):
                 table = reorder_columns_by_schema(table, output_schema)
                 table = table.cast(output_schema)
             tables[idx] = table
+
+        if (
+            self._data_context.get_config(PARQUET_WRITE_PACKED_TENSORS_CONFIG, False)
+            is True
+        ):
+            tables, output_schema = _pack_fixed_shape_tensor_columns(tables)
 
         row_group_size = write_kwargs.pop("row_group_size", None)
 

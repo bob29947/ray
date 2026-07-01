@@ -563,7 +563,7 @@ def get_arrow_extension_fixed_shape_tensor_types():
     """Returns list of Arrow extension types holding multidimensional
     tensors of *fixed* shape
     """
-    types = (ArrowTensorType, ArrowTensorTypeV2)
+    types = (ArrowTensorType, ArrowTensorTypeV2, ArrowPackedTensorType)
     if FixedShapeTensorType is not None:
         types = types + (FixedShapeTensorType,)
     return types
@@ -753,6 +753,221 @@ class ArrowTensorTypeV2(_BaseFixedShapeArrowTensorType):
     def _arrow_ext_deserialize_compute(cls, serialized, value_type):
         shape = tuple(_deserialize_with_fallback(serialized, "shape"))
         return cls(shape, value_type)
+
+
+@PublicAPI(stability="alpha")
+class ArrowPackedTensorType(ArrowExtensionSerializeDeserializeCache, pa.ExtensionType):
+    """Fixed-shape tensor type with packed fixed-size-binary storage.
+
+    Unlike :class:`ArrowTensorTypeV2`, this type stores each tensor row as one
+    fixed-size binary value.  This representation is intended for Parquet I/O:
+    it maps to Parquet's ``FIXED_LEN_BYTE_ARRAY`` rather than a repeated LIST
+    column, avoiding per-element definition levels for large dense tensors.
+
+    The type is registered process-wide, so PyArrow restores the tensor shape
+    and scalar dtype automatically when reading Parquet files written by Ray.
+    Ray's ordinary in-memory tensor representation remains unchanged unless a
+    caller explicitly opts into packed Parquet output.
+    """
+
+    _EXTENSION_NAME = "ray.data.arrow_packed_tensor"
+
+    def __init__(self, shape: Tuple[int, ...], dtype: pa.DataType):
+        shape = tuple(int(dim) for dim in shape)
+        if not shape or any(dim <= 0 for dim in shape):
+            raise ValueError(
+                "Packed tensor dimensions must all be positive, "
+                f"but received shape={shape!r}."
+            )
+        if not (
+            pa.types.is_integer(dtype)
+            or pa.types.is_floating(dtype)
+            or pa.types.is_boolean(dtype)
+        ):
+            raise TypeError(
+                "Packed tensors only support numeric and boolean scalar types, "
+                f"but received {dtype}."
+            )
+
+        numpy_dtype = np.dtype(dtype.to_pandas_dtype())
+        byte_width = int(np.prod(shape)) * numpy_dtype.itemsize
+        if byte_width <= 0 or byte_width > INT32_MAX:
+            raise ValueError(
+                "A packed tensor row must occupy between 1 and INT32_MAX bytes, "
+                f"but shape={shape!r}, dtype={dtype} occupies {byte_width} bytes."
+            )
+
+        self._shape = shape
+        self._value_type = dtype
+        self._numpy_dtype = numpy_dtype
+        super().__init__(pa.binary(byte_width), self._EXTENSION_NAME)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self._shape
+
+    @property
+    def value_type(self) -> pa.DataType:
+        return self._value_type
+
+    @property
+    def numpy_dtype(self) -> np.dtype:
+        return self._numpy_dtype
+
+    def to_pandas_dtype(self):
+        from ray.data._internal.tensor_extensions.pandas import TensorDtype
+
+        return TensorDtype(self._shape, self._numpy_dtype)
+
+    def __arrow_ext_class__(self):
+        return ArrowPackedTensorArray
+
+    def __arrow_ext_scalar_class__(self):
+        return ArrowPackedTensorScalar
+
+    def _arrow_ext_serialize_compute(self) -> bytes:
+        return json.dumps(
+            {"shape": self._shape, "dtype": self._numpy_dtype.str},
+            separators=(",", ":"),
+        ).encode()
+
+    @classmethod
+    def _get_deserialize_parameter(cls, storage_type, serialized):
+        return (serialized, storage_type.byte_width)
+
+    @classmethod
+    def _arrow_ext_deserialize_compute(cls, serialized, byte_width):
+        metadata = json.loads(serialized)
+        packed_type = cls(
+            tuple(metadata["shape"]),
+            pa.from_numpy_dtype(np.dtype(metadata["dtype"])),
+        )
+        if packed_type.storage_type.byte_width != byte_width:
+            raise ValueError(
+                "Packed tensor metadata does not match its physical byte width: "
+                f"metadata={packed_type.storage_type.byte_width}, storage={byte_width}."
+            )
+        return packed_type
+
+    def __reduce__(self):
+        return self.__arrow_ext_deserialize__, (
+            self.storage_type,
+            self.__arrow_ext_serialize__(),
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(shape={self.shape}, "
+            f"dtype={self.value_type})"
+        )
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, ArrowPackedTensorType)
+            and other.shape == self.shape
+            and other.value_type == self.value_type
+        )
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash((self.extension_name, self.value_type, self.shape))
+
+
+@PublicAPI(stability="alpha")
+class ArrowPackedTensorScalar(pa.ExtensionScalar):
+    """Scalar view of one packed fixed-shape tensor."""
+
+    def as_py(self, **kwargs) -> Optional[np.ndarray]:
+        if self.value is None:
+            return None
+        return np.ndarray(
+            self.type.shape,
+            dtype=self.type.numpy_dtype,
+            buffer=self.value.as_buffer(),
+        )
+
+    def __array__(self) -> Optional[np.ndarray]:
+        return self.as_py()
+
+    def to_numpy(self) -> Optional[np.ndarray]:
+        return self.as_py()
+
+
+@PublicAPI(stability="alpha")
+class ArrowPackedTensorArray(pa.ExtensionArray):
+    """Array of packed fixed-shape tensors."""
+
+    def to_numpy(self, zero_copy_only: bool = True) -> np.ndarray:
+        if self.null_count:
+            raise pa.ArrowInvalid(
+                "Packed tensor arrays containing null rows cannot be converted "
+                "to one dense NumPy ndarray."
+            )
+        shape = (len(self),) + self.type.shape
+        if not len(self):
+            return np.empty(shape, dtype=self.type.numpy_dtype)
+        data_buffer = self.storage.buffers()[1]
+        return np.ndarray(
+            shape,
+            dtype=self.type.numpy_dtype,
+            buffer=data_buffer,
+            offset=self.offset * self.type.storage_type.byte_width,
+        )
+
+    def to_numpy_ndarray(self, zero_copy_only: bool = True) -> np.ndarray:
+        return self.to_numpy(zero_copy_only=zero_copy_only)
+
+    def to_var_shaped_tensor_array(self, ndim: int) -> "ArrowVariableShapedTensorArray":
+        return ArrowVariableShapedTensorArray.from_numpy(self.to_numpy())
+
+
+@DeveloperAPI(stability="alpha")
+def pack_arrow_fixed_shape_tensor_array(
+    array: Union[pa.Array, "FixedShapeTensorArray"],
+) -> Optional[ArrowPackedTensorArray]:
+    """Return a packed view of a compatible tensor array, or ``None``.
+
+    Packing is fail-closed: variable-shaped tensors, null rows, zero-sized
+    dimensions, unsupported scalar types, and rows wider than Arrow's
+    fixed-size-binary limit retain their ordinary representation.
+    """
+
+    if not isinstance(array.type, get_arrow_extension_fixed_shape_tensor_types()):
+        return None
+    if isinstance(array.type, ArrowPackedTensorType):
+        return array
+    if array.null_count:
+        return None
+
+    shape = tuple(array.type.shape)
+    value_type = array.type.value_type
+    if not shape or any(dim <= 0 for dim in shape):
+        return None
+    if not (
+        pa.types.is_integer(value_type)
+        or pa.types.is_floating(value_type)
+        or pa.types.is_boolean(value_type)
+    ):
+        return None
+
+    try:
+        packed_type = ArrowPackedTensorType(shape, value_type)
+        values = array.to_numpy_ndarray()
+        if not values.flags.c_contiguous:
+            values = np.ascontiguousarray(values)
+        storage = pa.Array.from_buffers(
+            packed_type.storage_type,
+            len(values),
+            [None, pa.py_buffer(values)],
+        )
+        return packed_type.wrap_array(storage)
+    except (pa.ArrowException, TypeError, ValueError):
+        return None
 
 
 @DeveloperAPI(stability="alpha")
@@ -1747,6 +1962,7 @@ try:
     # the same subclass regardless of parametrization of the type.
     pa.register_extension_type(ArrowTensorType((0,), pa.int64()))
     pa.register_extension_type(ArrowTensorTypeV2((0,), pa.int64()))
+    pa.register_extension_type(ArrowPackedTensorType((1,), pa.int64()))
     pa.register_extension_type(ArrowVariableShapedTensorType(pa.int64(), 0))
 except pa.ArrowKeyError:
     # Extension types are already registered.

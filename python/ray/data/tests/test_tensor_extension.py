@@ -11,6 +11,8 @@ from packaging.version import parse as parse_version
 from ray.data._internal.arrow_ops.transform_pyarrow import combine_chunked_array
 from ray.data._internal.tensor_extensions.arrow import (
     ArrowConversionError,
+    ArrowPackedTensorArray,
+    ArrowPackedTensorType,
     ArrowTensorArray,
     ArrowTensorType,
     ArrowTensorTypeV2,
@@ -24,6 +26,7 @@ from ray.data._internal.tensor_extensions.arrow import (
     concat_tensor_arrays,
     create_arrow_fixed_shape_tensor_type,
     fixed_shape_extension_scalar_to_ndarray,
+    pack_arrow_fixed_shape_tensor_array,
     unify_tensor_arrays,
 )
 from ray.data._internal.tensor_extensions.pandas import TensorArray, TensorDtype
@@ -124,6 +127,41 @@ def test_arrow_scalar_tensor_array_roundtrip_boolean(tensor_format_context):
     # not.
     out = ata.to_numpy(zero_copy_only=False)
     np.testing.assert_array_equal(out, arr)
+
+
+@pytest.mark.parametrize("dtype", [np.uint16, np.int64, np.float32, np.bool_])
+def test_pack_arrow_fixed_shape_tensor_array(dtype, tensor_format_context):
+    values = np.arange(48).reshape(8, 2, 3).astype(dtype)
+    tensor = ArrowTensorArray.from_numpy(values)
+
+    packed = pack_arrow_fixed_shape_tensor_array(tensor)
+
+    assert isinstance(packed, ArrowPackedTensorArray)
+    assert isinstance(packed.type, ArrowPackedTensorType)
+    assert packed.storage.type == pa.binary(6 * np.dtype(dtype).itemsize)
+    assert packed.type.shape == (2, 3)
+    assert packed.type.value_type == pa.from_numpy_dtype(dtype)
+    np.testing.assert_array_equal(packed.to_numpy_ndarray(), values)
+    np.testing.assert_array_equal(packed.slice(2, 3).to_numpy(), values[2:5])
+    np.testing.assert_array_equal(np.asarray(packed[4]), values[4])
+
+    table = pa.table({"tensor": packed})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    restored = pa.ipc.open_stream(sink.getvalue()).read_all().column(0).chunk(0)
+    assert isinstance(restored, ArrowPackedTensorArray)
+    np.testing.assert_array_equal(restored.to_numpy_ndarray(), values)
+
+
+def test_pack_arrow_fixed_shape_tensor_array_fails_closed(tensor_format_context):
+    zero_dimension = ArrowTensorArray.from_numpy(np.empty((2, 0, 3), np.uint16))
+    variable_shape = ArrowVariableShapedTensorArray.from_numpy(
+        [np.ones((2,), np.uint16), np.ones((3,), np.uint16)]
+    )
+
+    assert pack_arrow_fixed_shape_tensor_array(zero_dimension) is None
+    assert pack_arrow_fixed_shape_tensor_array(variable_shape) is None
 
 
 def test_scalar_tensor_array_roundtrip(tensor_format_context):

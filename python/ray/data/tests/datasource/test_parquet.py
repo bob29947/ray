@@ -27,11 +27,15 @@ from ray.data._internal.datasource.parquet_datasource import (
     _coerce_pyarrow_fragment_batch_size,
     _read_batches_from,
 )
+from ray.data._internal.datasource.parquet_datasink import (
+    PARQUET_WRITE_PACKED_TENSORS_CONFIG,
+)
 from ray.data._internal.execution.interfaces.ref_bundle import (
     _ref_bundles_iterator_to_block_refs_list,
 )
 from ray.data._internal.object_extensions.arrow import ArrowPythonObjectType
 from ray.data._internal.tensor_extensions.arrow import (
+    ArrowPackedTensorType,
     get_arrow_extension_fixed_shape_tensor_types,
 )
 from ray.data._internal.util import explain_plan, rows_same
@@ -931,6 +935,45 @@ def test_parquet_read_with_udf(
 
     ones, twos = zip(*[[s["one"], s["two"]] for s in ds.take()])
     np.testing.assert_array_equal(sorted(ones), np.array(one_data[:2]) + 1)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["ordinary", "packed"])
+def test_write_parquet_packed_fixed_shape_tensors(
+    ray_start_regular_shared,
+    tmp_path,
+    restore_data_context,
+    use_datasource_v2,
+    packed,
+):
+    context = DataContext.get_current()
+    if packed:
+        context.set_config(PARQUET_WRITE_PACKED_TENSORS_CONFIG, True)
+
+    path = tmp_path / ("packed" if packed else "ordinary")
+    expected = np.arange(96, dtype=np.uint16).reshape(12, 8)
+    ray.data.from_numpy([expected]).write_parquet(str(path))
+
+    files = list(path.glob("*.parquet"))
+    assert files
+    physical_types = {
+        pq.ParquetFile(file).schema.column(0).physical_type for file in files
+    }
+    output_type = pq.ParquetFile(files[0]).schema_arrow.field("data").type
+    if packed:
+        assert physical_types == {"FIXED_LEN_BYTE_ARRAY"}
+        assert isinstance(output_type, ArrowPackedTensorType)
+        assert output_type.shape == (8,)
+        assert output_type.value_type == pa.uint16()
+    else:
+        assert physical_types != {"FIXED_LEN_BYTE_ARRAY"}
+        assert not isinstance(output_type, ArrowPackedTensorType)
+
+    restored = ray.data.read_parquet(str(path))
+    restored_type = restored.schema().base_schema.field("data").type
+    assert isinstance(restored_type, get_arrow_extension_fixed_shape_tensor_types())
+    assert isinstance(restored_type, ArrowPackedTensorType) is packed
+    actual = restored.take_batch(batch_size=len(expected), batch_format="numpy")["data"]
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_parquet_reader_estimate_data_size(shutdown_only, tmp_path):

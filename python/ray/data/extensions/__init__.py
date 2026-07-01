@@ -1,4 +1,6 @@
 from ray.data._internal.tensor_extensions.arrow import (
+    ArrowPackedTensorArray,
+    ArrowPackedTensorType,
     ArrowTensorTypeV2,
     FixedShapeTensorFormat,
     FixedShapeTensorType,
@@ -31,7 +33,9 @@ __all__ = [
     "TensorArrayElement",
     "ArrowTensorType",
     "ArrowTensorTypeV2",
+    "ArrowPackedTensorType",
     "ArrowTensorArray",
+    "ArrowPackedTensorArray",
     "ArrowVariableShapedTensorType",
     "ArrowVariableShapedTensorArray",
     "column_needs_tensor_extension",
