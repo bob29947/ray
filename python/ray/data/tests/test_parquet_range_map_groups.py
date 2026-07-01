@@ -17,6 +17,7 @@ from ray.data._internal.planner.map_groups_partition_protocol import (
 from ray.data._internal.planner.parquet_range_map_groups import (
     ParquetRangeMapGroupsStats,
     ParquetRangeMapGroupsWork,
+    _default_rmm_pool_initial_bytes,
     _iter_exact_cudf_batches,
     _iter_group_outputs,
     _iter_partition_outputs,
@@ -87,6 +88,11 @@ def _stats(partition_id=0):
         rmm_pool_maximum_bytes=24 * 1024**3,
         rmm_pool_reserved_peak_bytes=16 * 1024**3,
     )
+
+
+def test_partition_execution_uses_a_smaller_startup_pool_by_default():
+    assert _default_rmm_pool_initial_bytes(None) == 8 * 1024**3
+    assert _default_rmm_pool_initial_bytes(object()) == 1 * 1024**3
 
 
 def test_rmm_pool_config_respects_budget_reserve_and_alignment():

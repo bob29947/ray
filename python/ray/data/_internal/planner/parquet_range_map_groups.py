@@ -135,6 +135,15 @@ class _RmmPoolState:
         )
 
 
+def _default_rmm_pool_initial_bytes(
+    partition_contract: Optional[MapGroupsPartitionContract],
+) -> int:
+    # Partition-vectorized execution performs one bounded allocation phase and
+    # benefits from cheap task startup. The compatibility path makes thousands
+    # of independent UDF calls and retains the larger amortizing pool.
+    return 1 * 1024**3 if partition_contract is not None else 8 * 1024**3
+
+
 def _resolve_rmm_pool_config(
     *,
     free_bytes: int,
@@ -850,8 +859,10 @@ def build_parquet_range_map_groups_operator(
     else:
         partition_fn = None
 
+    default_rmm_pool_initial_bytes = _default_rmm_pool_initial_bytes(partition_contract)
     rmm_pool_initial_bytes = data_context.get_config(
-        "parquet_range_map_groups_rmm_pool_initial_bytes", 8 * 1024**3
+        "parquet_range_map_groups_rmm_pool_initial_bytes",
+        default_rmm_pool_initial_bytes,
     )
     rmm_pool_reserve_bytes = data_context.get_config(
         "parquet_range_map_groups_rmm_pool_reserve_bytes", 2 * 1024**3
