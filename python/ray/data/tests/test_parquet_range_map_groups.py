@@ -14,6 +14,8 @@ from ray.data._internal.datasource.parquet_range import (
 from ray.data._internal.planner.parquet_range_map_groups import (
     ParquetRangeMapGroupsStats,
     ParquetRangeMapGroupsWork,
+    _DeferredPartitionValidation,
+    _finish_partition_validation,
     _iter_exact_cudf_batches,
     _iter_group_outputs,
     _invoke_row_preserving_tokenizer,
@@ -330,6 +332,36 @@ def test_tokenizer_runtime_contract_rejects_empty_generator_and_host_output(
             partition_key="User",
             zero_copy_batch=True,
             cudf=_FakeCudf,
+        )
+
+
+def test_deferred_partition_validation_accepts_all_batches():
+    import numpy as np
+
+    _finish_partition_validation(
+        [
+            _DeferredPartitionValidation(np.array(True), np.array(False)),
+            _DeferredPartitionValidation(np.array(True), np.array(False)),
+        ],
+        partition_key="User",
+        array_module=np,
+    )
+
+
+def test_deferred_partition_validation_preserves_failure_diagnostics():
+    import numpy as np
+
+    with pytest.raises(ValueError, match="contains nulls"):
+        _finish_partition_validation(
+            [_DeferredPartitionValidation(np.array(False), np.array(True))],
+            partition_key="User",
+            array_module=np,
+        )
+    with pytest.raises(ValueError, match="changed preserved partition"):
+        _finish_partition_validation(
+            [_DeferredPartitionValidation(np.array(False), np.array(False))],
+            partition_key="User",
+            array_module=np,
         )
 
 
