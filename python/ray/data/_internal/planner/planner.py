@@ -35,6 +35,7 @@ from ray.data._internal.logical.operators import (
     Join,
     Limit,
     ListFiles,
+    MapGroups,
     Mix,
     Project,
     Read,
@@ -53,6 +54,7 @@ from ray.data._internal.planner.checkpoint import (
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
 from ray.data._internal.planner.plan_download_op import plan_download_op
 from ray.data._internal.planner.plan_list_files_op import plan_list_files_op
+from ray.data._internal.planner.plan_map_groups_op import plan_map_groups_op
 from ray.data._internal.planner.plan_read_files_op import plan_read_files_op
 from ray.data._internal.planner.plan_read_op import plan_read_op
 from ray.data._internal.planner.plan_udf_map_op import (
@@ -185,6 +187,7 @@ class Planner:
         Union: plan_union_op,
         Zip: plan_zip_op,
         Limit: plan_limit_op,
+        MapGroups: plan_map_groups_op,
         Count: plan_count_op,
         Project: plan_project_op,
         StreamingRepartition: plan_streaming_repartition_op,

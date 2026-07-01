@@ -1,15 +1,14 @@
 from collections.abc import Iterator as IteratorABC
-from functools import partial
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from ray.data._internal.compute import ComputeStrategy
 from ray.data._internal.logical.interfaces import LogicalPlan
-from ray.data._internal.logical.operators import Aggregate
+from ray.data._internal.logical.operators import Aggregate, MapGroups
+from ray.data._internal.util import get_compute_strategy
 from ray.data.aggregate import AggregateFn, Count, Max, Mean, Min, Std, Sum
 from ray.data.block import (
     Block,
     BlockAccessor,
-    CallableClass,
     DataBatch,
     UserDefinedFunction,
 )
@@ -213,100 +212,54 @@ class GroupedData:
                 Use this method for common aggregation use cases.
         """
 
-        # Prior to applying map operation we have to shuffle the data based on provided
-        # key and (optionally) number of partitions
-        #
-        #   - In case key is none, we repartition into a single block
-        #   - In case when hash-shuffle strategy is employed -- perform `repartition_and_sort`
-        #   - Otherwise we perform "global" sort of the dataset (to co-locate rows with the
-        #     same key values)
+        shuffle_strategy = self._dataset.context.shuffle_strategy
+        num_partitions = self._num_partitions
         if self._key is None:
-            shuffled_ds = self._dataset.repartition(1)
-        elif self._dataset.context.shuffle_strategy in (
+            num_partitions = 1
+        elif shuffle_strategy in (
             ShuffleStrategy.HASH_SHUFFLE,
             ShuffleStrategy.GPU_SHUFFLE,
         ):
             num_partitions = (
-                self._num_partitions
+                num_partitions
                 or self._dataset.context.default_hash_shuffle_parallelism
             )
-            shuffled_ds = self._dataset.repartition(
-                num_partitions,
-                keys=self._key,
-                # Blocks must be sorted after repartitioning, such that group
-                # of rows sharing the same key values are co-located
-                sort=True,
-            )
         else:
-            shuffled_ds = self._dataset.sort(self._key)
+            # Sort shuffle chooses its output parallelism at execution time and
+            # historically ignores GroupedData's num_partitions argument.
+            num_partitions = None
 
-        # The batch is the entire block, because we have batch_size=None for
-        # map_batches() below.
-
-        if self._key is None:
-            keys = []
-        elif isinstance(self._key, str):
-            keys = [self._key]
-        elif isinstance(self._key, List):
-            keys = self._key
-        else:
-            raise ValueError(
-                f"Group-by keys are expected to either be a single column (str) "
-                f"or a list of columns (got '{self._key}')"
-            )
-
-        # NOTE: It's crucial to make sure that UDF isn't capturing `GroupedData`
-        #       object in its closure to ensure its serializability
-        #
-        # See https://github.com/ray-project/ray/issues/54280 for more details
-        if isinstance(fn, CallableClass):
-
-            class wrapped_fn:
-                def __init__(self, *args, **kwargs):
-                    self.fn = fn(*args, **kwargs)
-
-                def __call__(self, batch, *args, **kwargs):
-                    yield from _apply_udf_to_groups(
-                        self.fn, batch, keys, batch_format, *args, **kwargs
-                    )
-
-        else:
-
-            def wrapped_fn(batch, *args, **kwargs):
-                yield from _apply_udf_to_groups(
-                    fn, batch, keys, batch_format, *args, **kwargs
-                )
-
-        # Change the name of the wrapped function so that users see the name of their
-        # function rather than `wrapped_fn` in the progress bar.
-        if isinstance(fn, partial):
-            wrapped_fn.__name__ = fn.func.__name__
-        else:
-            wrapped_fn.__name__ = fn.__name__
-
-        # NOTE: We set batch_size=None here, so that every batch contains the entire block,
-        #       guaranteeing that groups are contained in full (ie not being split)
-        return shuffled_ds._map_batches_without_batch_size_validation(
-            wrapped_fn,
-            batch_size=None,
+        compute = get_compute_strategy(
+            fn,
+            fn_constructor_args=fn_constructor_args,
             compute=compute,
-            # NOTE: We specify `batch_format` as none to avoid converting
-            #       back-n-forth between batch and block formats (instead we convert
-            #       once per group inside the method applying the UDF itself)
-            batch_format=None,
+            concurrency=concurrency,
+        )
+        if num_cpus is not None:
+            ray_remote_args["num_cpus"] = num_cpus
+        if num_gpus is not None:
+            ray_remote_args["num_gpus"] = num_gpus
+        if memory is not None:
+            ray_remote_args["memory"] = memory
+
+        op = MapGroups(
+            key=self._key,
+            fn=fn,
+            num_partitions=num_partitions,
+            shuffle_strategy=shuffle_strategy,
+            input_dependencies=[self._dataset._logical_plan.dag],
+            batch_format=batch_format,
             zero_copy_batch=zero_copy_batch,
             fn_args=fn_args,
             fn_kwargs=fn_kwargs,
             fn_constructor_args=fn_constructor_args,
             fn_constructor_kwargs=fn_constructor_kwargs,
-            num_cpus=num_cpus,
-            num_gpus=num_gpus,
-            memory=memory,
-            concurrency=concurrency,
-            udf_modifying_row_count=True,
+            compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
-            **ray_remote_args,
+            ray_remote_args=ray_remote_args,
         )
+        logical_plan = LogicalPlan(op, self._dataset.context)
+        return Dataset._from_parent(self._dataset, logical_plan)
 
     @PublicAPI(api_group=EXPRESSION_API_GROUP, stability="alpha")
     def with_column(

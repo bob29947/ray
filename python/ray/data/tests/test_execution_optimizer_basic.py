@@ -22,14 +22,16 @@ from ray.data._internal.logical.operators import (
     FromItems,
     FromNumpy,
     FromPandas,
+    InputData,
     MapBatches,
+    MapGroups,
     MapRows,
     Project,
 )
 from ray.data._internal.logical.optimizers import PhysicalOptimizer
 from ray.data._internal.planner import create_planner
 from ray.data.block import BlockMetadata
-from ray.data.context import DataContext
+from ray.data.context import DataContext, ShuffleStrategy
 from ray.data.datasource import Datasource
 from ray.data.datasource.datasource import ReadTask
 from ray.data.expressions import col
@@ -139,6 +141,61 @@ def test_from_operators(ray_start_regular_shared_2_cpus):
 
         # Check that the linked logical operator is the same the input op.
         assert physical_op._logical_operators == [op]
+
+
+@pytest.mark.parametrize(
+    "shuffle_strategy, expected_exchange_types, expected_exchange_name",
+    [
+        (
+            ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+            ["AllToAllOperator"],
+            "Sort",
+        ),
+        (
+            ShuffleStrategy.HASH_SHUFFLE,
+            ["ShuffleReduceOp", "ShuffleMapOp"],
+            "HashShuffleReduce",
+        ),
+        (
+            ShuffleStrategy.GPU_SHUFFLE,
+            ["GPUShuffleOperator"],
+            "GPUShuffle",
+        ),
+    ],
+)
+def test_map_groups_logical_operator_lowering(
+    shuffle_strategy, expected_exchange_types, expected_exchange_name
+):
+    def group_fn(batch):
+        return batch
+
+    ctx = DataContext()
+    ctx._shuffle_strategy = shuffle_strategy
+    ctx.gpu_shuffle_num_actors = 1
+    source = InputData([])
+    op = MapGroups(
+        key=["key", "subkey"],
+        fn=group_fn,
+        num_partitions=(
+            None
+            if shuffle_strategy == ShuffleStrategy.SORT_SHUFFLE_PULL_BASED
+            else 3
+        ),
+        shuffle_strategy=shuffle_strategy,
+        input_dependencies=[source],
+    )
+
+    assert op.name == "MapGroups(group_fn)"
+    assert op.input_dependencies == [source]
+
+    physical_plan, _ = create_planner().plan(LogicalPlan(op, ctx))
+    physical_op = physical_plan.dag
+    assert physical_op.name == "MapBatches(group_fn)"
+
+    for expected_type in expected_exchange_types:
+        physical_op = physical_op.input_dependencies[0]
+        assert type(physical_op).__name__ == expected_type
+    assert expected_exchange_name in physical_plan.dag.input_dependencies[0].name
 
 
 def test_from_items_e2e(ray_start_regular_shared_2_cpus):

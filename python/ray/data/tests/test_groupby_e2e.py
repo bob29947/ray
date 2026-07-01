@@ -113,6 +113,41 @@ def test_map_groups_with_gpus(
     assert rows == [{"id": 0}]
 
 
+def test_map_groups_builds_first_class_logical_operator(
+    ray_start_regular_shared_2_cpus,
+    configure_shuffle_method,
+):
+    from ray.data._internal.logical.operators import MapGroups
+
+    def group_fn(batch, increment):
+        return batch
+
+    source = ray.data.range(4, override_num_blocks=2)
+    result = source.groupby(["id"], num_partitions=3).map_groups(
+        group_fn,
+        batch_format="pandas",
+        fn_args=(1,),
+        num_cpus=0.5,
+    )
+
+    op = result._logical_plan.dag
+    assert isinstance(op, MapGroups)
+    assert op.input_dependencies == [source._logical_plan.dag]
+    assert op.key == ["id"]
+    assert op.fn is group_fn
+    assert op.fn_args == (1,)
+    assert op.batch_format == "pandas"
+    assert op.ray_remote_args == {"num_cpus": 0.5}
+    assert op.name == "MapGroups(group_fn)"
+    if configure_shuffle_method in (
+        ShuffleStrategy.HASH_SHUFFLE,
+        ShuffleStrategy.GPU_SHUFFLE,
+    ):
+        assert op.num_partitions == 3
+    else:
+        assert op.num_partitions is None
+
+
 def test_groupby_with_column_expression_udf(
     ray_start_regular_shared_2_cpus,
     configure_shuffle_method,
