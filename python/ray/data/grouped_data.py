@@ -247,6 +247,7 @@ class GroupedData:
             fn=fn,
             num_partitions=num_partitions,
             shuffle_strategy=shuffle_strategy,
+            num_partitions_explicit=self._num_partitions is not None,
             input_dependencies=[self._dataset._logical_plan.dag],
             batch_format=batch_format,
             zero_copy_batch=zero_copy_batch,

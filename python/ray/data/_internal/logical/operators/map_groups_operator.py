@@ -24,6 +24,7 @@ class MapGroups(LogicalOperator):
     fn: UserDefinedFunction
     num_partitions: Optional[int]
     shuffle_strategy: ShuffleStrategy
+    num_partitions_explicit: bool = True
     input_dependencies: List[LogicalOperator] = field(repr=False, kw_only=True)
     batch_format: Optional[str] = "default"
     zero_copy_batch: bool = True
