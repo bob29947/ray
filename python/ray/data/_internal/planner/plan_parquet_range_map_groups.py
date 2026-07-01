@@ -346,6 +346,10 @@ def try_plan_parquet_range_map_groups(
             source_schema=candidate.datasource._file_schema,
             tokenizer_op=candidate.tokenizer_op,
             map_groups_op=candidate.map_groups_op,
+            partition_contract=candidate.partition_contract,
+            partition_contract_fallback_reason=(
+                candidate.partition_contract_fallback_reason
+            ),
             data_context=data_context,
             ray_remote_args=actor_args,
             estimated_peak_gpu_memory_bytes=estimated_peak_gpu_memory,

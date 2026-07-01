@@ -18,6 +18,9 @@ from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.logical.operators import MapBatches, MapGroups, Read
+from ray.data._internal.planner.map_groups_partition_protocol import (
+    resolve_map_groups_partition_contract,
+)
 from ray.data.block import CallableClass
 from ray.data.context import DataContext, ShuffleStrategy
 
@@ -45,6 +48,8 @@ class ParquetRangeMapGroupsCandidate:
     projection: Tuple[str, ...]
     compute: ActorPoolStrategy
     ray_remote_args: Dict[str, Any]
+    partition_contract: Optional[Any] = None
+    partition_contract_fallback_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +357,14 @@ def select_parquet_range_map_groups_candidate(
         return _fallback("group_udf_not_plain_function")
     if not _is_sync_plain_function(map_groups_op.fn):
         return _fallback("group_udf_async_unsupported")
+    partition_contract, reason = resolve_map_groups_partition_contract(
+        map_groups_op.fn,
+        data_context,
+        batch_format=map_groups_op.batch_format,
+        zero_copy_batch=map_groups_op.zero_copy_batch,
+        fn_args=map_groups_op.fn_args,
+        fn_kwargs=map_groups_op.fn_kwargs,
+    )
     if map_groups_op.batch_format != "cudf":
         return _fallback("group_batch_format_not_cudf")
     if map_groups_op.ray_remote_args_fn is not None:
@@ -408,6 +421,8 @@ def select_parquet_range_map_groups_candidate(
         projection=projection,
         compute=tokenizer_op.compute,
         ray_remote_args=actor_args,
+        partition_contract=partition_contract,
+        partition_contract_fallback_reason=reason,
     )
     return ParquetRangeMapGroupsSelectionResult(
         candidate=candidate,

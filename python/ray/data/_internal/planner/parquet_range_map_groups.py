@@ -41,6 +41,10 @@ from ray.data._internal.execution.operators.map_transformer import (
 )
 from ray.data._internal.logical.operators import MapBatches, MapGroups
 from ray.data._internal.output_buffer import BlockOutputBuffer, OutputBlockSizeOption
+from ray.data._internal.planner.map_groups_partition_protocol import (
+    MapGroupsPartitionContract,
+    MapGroupsPartitionContext,
+)
 from ray.data._internal.planner.plan_udf_map_op import (
     _TransformingBatchIterator,
     _get_udf,
@@ -97,6 +101,8 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     rmm_pool_initial_bytes: int
     rmm_pool_maximum_bytes: int
     rmm_pool_reserved_peak_bytes: int
+    group_udf_invocations: int = 0
+    partition_udf_invocations: int = 0
 
 
 @dataclass(frozen=True)
@@ -452,6 +458,23 @@ def _iter_group_outputs(group_fn: Any, group: Any) -> Iterator[Any]:
         yield output
 
 
+def _iter_partition_outputs(
+    partition_fn: Any,
+    partition: Any,
+    context: MapGroupsPartitionContext,
+) -> Iterator[Any]:
+    """Validate the partition protocol's ordinary batch-or-iterator output."""
+
+    result = partition_fn(partition, context)
+    if isinstance(result, collections.abc.Iterator):
+        outputs = result
+    else:
+        outputs = iter((result,))
+    for output in outputs:
+        _validate_batch_output(output)
+        yield output
+
+
 def _validate_group_keys(frame: Any, group_keys: Tuple[str, ...]) -> None:
     missing_group_keys = tuple(key for key in group_keys if key not in frame.columns)
     if missing_group_keys:
@@ -465,13 +488,14 @@ def _execute_range(
     *,
     tokenizer_fn: Any,
     group_fn: Any,
+    partition_fn: Optional[Any],
     tokenizer_batch_size: int,
     tokenizer_zero_copy_batch: bool,
     group_zero_copy_batch: bool,
     target_max_block_size: int,
     rmm_pool_state: _RmmPoolState,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
-    """Read, tokenize, sort, and invoke every group exactly once on one GPU."""
+    """Execute one range with per-group or explicitly equivalent partition code."""
 
     import cudf
     import cupy
@@ -484,6 +508,8 @@ def _execute_range(
     input_rows = 0
     tokenized_rows = 0
     group_count = 0
+    group_udf_invocations = 0
+    partition_udf_invocations = 0
     output_rows = 0
     host_transfer_bytes = 0
 
@@ -546,12 +572,20 @@ def _execute_range(
         host_transfer_bytes += max(0, len(boundaries) - 1) * 8
         sort_time_s += time.perf_counter() - started
 
-        for group in _iter_group_views(tokenized_partition, boundaries):
-            group_count += 1
+        if partition_fn is not None:
+            group_count = max(0, len(boundaries) - 1)
+            partition = tokenized_partition
             if not group_zero_copy_batch:
-                group = group.copy(deep=True)
+                partition = partition.copy(deep=True)
+            partition_context = MapGroupsPartitionContext(
+                group_keys=work.group_keys,
+                input_group_boundaries=tuple(boundaries),
+            )
             started = time.perf_counter()
-            outputs = _iter_group_outputs(group_fn, group)
+            outputs = _iter_partition_outputs(
+                partition_fn, partition, partition_context
+            )
+            partition_udf_invocations = 1
             for output in outputs:
                 group_time_s += time.perf_counter() - started
                 started = time.perf_counter()
@@ -567,6 +601,29 @@ def _execute_range(
                 output_time_s += time.perf_counter() - started
                 started = time.perf_counter()
             group_time_s += time.perf_counter() - started
+        else:
+            for group in _iter_group_views(tokenized_partition, boundaries):
+                group_count += 1
+                group_udf_invocations += 1
+                if not group_zero_copy_batch:
+                    group = group.copy(deep=True)
+                started = time.perf_counter()
+                outputs = _iter_group_outputs(group_fn, group)
+                for output in outputs:
+                    group_time_s += time.perf_counter() - started
+                    started = time.perf_counter()
+                    output_buffer.add_batch(output)
+                    for output_block in output_buffer.iter_ready_blocks():
+                        accessor = BlockAccessor.for_block(output_block)
+                        output_rows += accessor.num_rows()
+                        output_blocks += 1
+                        host_transfer_bytes += accessor.size_bytes()
+                        output_time_s += time.perf_counter() - started
+                        yield output_block
+                        started = time.perf_counter()
+                    output_time_s += time.perf_counter() - started
+                    started = time.perf_counter()
+                group_time_s += time.perf_counter() - started
 
     started = time.perf_counter()
     output_buffer.finalize()
@@ -606,6 +663,8 @@ def _execute_range(
         rmm_pool_initial_bytes=rmm_pool_state.config.initial_bytes,
         rmm_pool_maximum_bytes=rmm_pool_state.config.maximum_bytes,
         rmm_pool_reserved_peak_bytes=rmm_pool_reserved_peak_bytes,
+        group_udf_invocations=group_udf_invocations,
+        partition_udf_invocations=partition_udf_invocations,
     )
     return stats
 
@@ -690,6 +749,8 @@ def build_parquet_range_map_groups_operator(
     source_schema: Any,
     tokenizer_op: MapBatches,
     map_groups_op: MapGroups,
+    partition_contract: Optional[MapGroupsPartitionContract] = None,
+    partition_contract_fallback_reason: Optional[str] = None,
     data_context: DataContext,
     ray_remote_args: Dict[str, Any],
     estimated_peak_gpu_memory_bytes: int = 0,
@@ -751,6 +812,20 @@ def build_parquet_range_map_groups_operator(
         map_groups_op.fn_constructor_kwargs,
         compute=map_groups_op.compute,
     )
+    if partition_contract is not None:
+        partition_args = tuple(map_groups_op.fn_args or ())
+        partition_kwargs = dict(map_groups_op.fn_kwargs or {})
+
+        def partition_fn(batch: Any, context: MapGroupsPartitionContext) -> Any:
+            return partition_contract.udf(
+                batch,
+                context,
+                *partition_args,
+                **partition_kwargs,
+            )
+
+    else:
+        partition_fn = None
 
     rmm_pool_initial_bytes = data_context.get_config(
         "parquet_range_map_groups_rmm_pool_initial_bytes", 8 * 1024**3
@@ -812,6 +887,7 @@ def build_parquet_range_map_groups_operator(
                 work,
                 tokenizer_fn=tokenizer_fn,
                 group_fn=group_fn,
+                partition_fn=partition_fn,
                 tokenizer_batch_size=tokenizer_batch_size,
                 tokenizer_zero_copy_batch=tokenizer_zero_copy_batch,
                 group_zero_copy_batch=group_zero_copy_batch,
@@ -882,6 +958,10 @@ def build_parquet_range_map_groups_operator(
         "gpu_memory_budget_bytes": gpu_memory_budget_bytes,
         "rmm_pool_initial_bytes": rmm_pool_initial_bytes,
         "rmm_pool_reserve_bytes": rmm_pool_reserve_bytes,
+        "group_execution_mode": (
+            "partition_v1" if partition_contract is not None else "per_group"
+        ),
+        "group_partition_fallback_reason": partition_contract_fallback_reason,
         "ranges": tuple(
             {
                 "partition_id": work.partition_id,

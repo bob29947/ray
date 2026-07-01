@@ -148,6 +148,76 @@ def test_map_groups_builds_first_class_logical_operator(
         assert op.num_partitions is None
 
 
+def test_map_groups_partition_protocol_after_ordinary_shuffle(
+    ray_start_regular_shared_2_cpus,
+    restore_data_context,
+    disable_fallback_to_object_extension,
+):
+    from ray.data._internal.planner.map_groups_partition_protocol import (
+        MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG,
+        MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+        MAP_GROUPS_PARTITION_UDF_ATTRIBUTE,
+    )
+    from ray.data.context import DataContext
+
+    def group_fn(group, multiplier, *, offset):
+        return pd.DataFrame(
+            {
+                "group": [group["group"].iloc[0]],
+                "total": [group["value"].sum() * multiplier + offset],
+            }
+        )
+
+    def partition_fn(partition, groups, multiplier, *, offset):
+        assert groups.group_keys == ("group",)
+        result = (
+            partition.groupby("group", sort=False, as_index=False)["value"]
+            .sum()
+            .rename(columns={"value": "total"})
+        )
+        result["total"] = result["total"] * multiplier + offset
+        return result
+
+    setattr(
+        group_fn,
+        MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+        {
+            "version": 1,
+            "batch_format": "pandas",
+            "side_effect_free": True,
+            "equivalent_to_per_group": True,
+        },
+    )
+    setattr(group_fn, MAP_GROUPS_PARTITION_UDF_ATTRIBUTE, partition_fn)
+    context = DataContext.get_current()
+    context.set_config(MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG, True)
+
+    result = (
+        ray.data.from_items(
+            [
+                {"group": 1, "value": 2},
+                {"group": 2, "value": 3},
+                {"group": 1, "value": 5},
+            ],
+            override_num_blocks=2,
+        )
+        .groupby("group", num_partitions=2)
+        .map_groups(
+            group_fn,
+            batch_format="pandas",
+            fn_args=(2,),
+            fn_kwargs={"offset": 1},
+        )
+        .materialize()
+    )
+
+    assert sorted(result.take_all(), key=lambda row: row["group"]) == [
+        {"group": 1, "total": 15},
+        {"group": 2, "total": 7},
+    ]
+    assert "partition-v1" in result.stats()
+
+
 def test_groupby_with_column_expression_udf(
     ray_start_regular_shared_2_cpus,
     configure_shuffle_method,

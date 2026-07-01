@@ -97,6 +97,32 @@ def _summarize_group(group, *, summary_offset):
     return output
 
 
+def _summarize_partition(partition, groups, *, summary_offset):
+    import cudf
+
+    return cudf.concat(
+        [
+            _summarize_group(
+                partition.iloc[start:end], summary_offset=summary_offset
+            )
+            for start, end in zip(
+                groups.input_group_boundaries[:-1],
+                groups.input_group_boundaries[1:],
+            )
+        ],
+        ignore_index=True,
+    )
+
+
+_summarize_group.__ray_data_map_groups_partition_protocol__ = {
+    "version": 1,
+    "batch_format": "cudf",
+    "side_effect_free": True,
+    "equivalent_to_per_group": True,
+}
+_summarize_group.__ray_data_map_groups_partition__ = _summarize_partition
+
+
 @pytest.fixture(scope="module")
 def ray_with_two_gpus():
     pytest.importorskip("cudf", reason="cudf (GPU DataFrame library) is not installed")
@@ -168,12 +194,16 @@ def _run_natural_pipeline(
     run_label,
     shuffle_strategy,
     range_backend_enabled,
+    partition_execution_enabled=False,
 ):
     context = DataContext.get_current()
     context.use_datasource_v2 = False
     context.shuffle_strategy = shuffle_strategy
     context.gpu_shuffle_num_actors = 2
     context.set_config(_RANGE_BACKEND_CONFIG, range_backend_enabled)
+    context.set_config(
+        "map_groups_partition_execution_enabled", partition_execution_enabled
+    )
     context.set_config("parquet_range_map_groups_gpu_memory_bytes", 8 * 1024**3)
 
     return (
@@ -311,6 +341,33 @@ def test_natural_api_hash_shuffle_matches_selected_range_backend(
 
     records = ray.get(gpu_assignment_collector.records.remote("hash-fast"))
     _assert_fast_range_gpu_assignments(records)
+
+
+def test_natural_api_uses_partition_equivalent_group_udf_once_per_range(
+    ray_with_two_gpus,
+    restore_data_context,
+    sorted_parquet_path,
+    gpu_assignment_collector,
+):
+    output = _run_natural_pipeline(
+        sorted_parquet_path,
+        gpu_assignment_collector,
+        run_label="hash-partition-udf",
+        shuffle_strategy=ShuffleStrategy.HASH_SHUFFLE,
+        range_backend_enabled=True,
+        partition_execution_enabled=True,
+    )
+
+    frame = _logical_output(output)
+    _assert_expected_groups(frame)
+    metrics = output.get_stats_summary().extra_metrics
+    assert metrics["parquet_range_map_groups_plan"]["group_execution_mode"] == (
+        "partition_v1"
+    )
+    workers = metrics["parquet_range_map_groups_workers"]
+    assert sum(worker["groups_invoked"] for worker in workers) == 4
+    assert sum(worker["group_udf_invocations"] for worker in workers) == 0
+    assert sum(worker["partition_udf_invocations"] for worker in workers) == 2
 
 
 def test_group_boundaries_keep_float_nan_keys_together(ray_with_two_gpus, tmp_path):

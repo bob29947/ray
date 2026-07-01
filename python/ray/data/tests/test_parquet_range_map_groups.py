@@ -11,11 +11,15 @@ from ray.data._internal.datasource.parquet_range import (
     ParquetRowGroupMetadata,
     plan_parquet_row_groups,
 )
+from ray.data._internal.planner.map_groups_partition_protocol import (
+    MapGroupsPartitionContext,
+)
 from ray.data._internal.planner.parquet_range_map_groups import (
     ParquetRangeMapGroupsStats,
     ParquetRangeMapGroupsWork,
     _iter_exact_cudf_batches,
     _iter_group_outputs,
+    _iter_partition_outputs,
     _invoke_row_preserving_tokenizer,
     _iter_group_views,
     _is_sorted_by_group_keys,
@@ -323,6 +327,50 @@ def test_tokenizer_runtime_contract_rejects_in_place_partition_mutation(monkeypa
             zero_copy_batch=True,
             cudf=_FakeCudf,
         )
+
+
+def test_partition_udf_receives_immutable_group_layout_and_generator_outputs():
+    context = MapGroupsPartitionContext(
+        group_keys=("User", "Card"),
+        input_group_boundaries=(0, 2, 5),
+    )
+    seen = []
+
+    def partition_fn(partition, groups):
+        seen.append((partition, groups))
+        yield {"value": [1]}
+        yield {"value": [2]}
+
+    assert list(_iter_partition_outputs(partition_fn, "partition", context)) == [
+        {"value": [1]},
+        {"value": [2]},
+    ]
+    assert seen == [("partition", context)]
+    assert context.num_groups == 2
+
+
+def test_partition_udf_empty_output_and_exceptions_are_not_replayed():
+    context = MapGroupsPartitionContext(
+        group_keys=("User",),
+        input_group_boundaries=(0, 1),
+    )
+    calls = []
+
+    def empty(partition, groups):
+        calls.append((partition, groups))
+        if False:
+            yield partition
+
+    assert list(_iter_partition_outputs(empty, "partition", context)) == []
+    assert calls == [("partition", context)]
+
+    def fails(partition, groups):
+        calls.append((partition, groups))
+        raise RuntimeError("partition failure")
+
+    with pytest.raises(RuntimeError, match="partition failure"):
+        list(_iter_partition_outputs(fails, "partition", context))
+    assert calls == [("partition", context), ("partition", context)]
 
 
 def test_tokenizer_runtime_contract_rejects_empty_generator_and_host_output(

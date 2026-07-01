@@ -7,6 +7,11 @@ import pytest
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
 from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
 from ray.data._internal.logical.operators import InputData, MapBatches, MapGroups, Read
+from ray.data._internal.planner.map_groups_partition_protocol import (
+    MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG,
+    MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+    MAP_GROUPS_PARTITION_UDF_ATTRIBUTE,
+)
 from ray.data._internal.planner.parquet_range_map_groups_selector import (
     PARQUET_RANGE_MAP_GROUPS_ENABLED_CONFIG,
     select_parquet_range_map_groups_candidate,
@@ -124,6 +129,57 @@ def test_selects_exact_natural_gpu_pipeline_without_io():
     assert candidate.projection == ("User", "Card", "payload")
     assert candidate.compute is candidate.tokenizer_op.compute
     assert candidate.ray_remote_args == {"num_cpus": 1, "num_gpus": 1}
+    assert candidate.partition_contract is None
+
+
+def test_selects_explicit_partition_equivalent_group_udf():
+    def partition_group(batch, context):
+        return batch
+
+    def group(batch):
+        return batch
+
+    setattr(
+        group,
+        MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+        {
+            "version": 1,
+            "batch_format": "cudf",
+            "side_effect_free": True,
+            "equivalent_to_per_group": True,
+        },
+    )
+    setattr(group, MAP_GROUPS_PARTITION_UDF_ATTRIBUTE, partition_group)
+    op, context = _candidate_plan(group_fn=group)
+    context.set_config(MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG, True)
+
+    result = _select(op, context)
+
+    assert result.selected
+    assert result.candidate.partition_contract.udf is partition_group
+
+
+def test_invalid_optional_partition_protocol_keeps_per_group_range_backend():
+    def group(batch):
+        return batch
+
+    setattr(
+        group,
+        MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+        {"version": 99, "batch_format": "cudf", "side_effect_free": True},
+    )
+    setattr(group, MAP_GROUPS_PARTITION_UDF_ATTRIBUTE, lambda batch: batch)
+    op, context = _candidate_plan(group_fn=group)
+    context.set_config(MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG, True)
+
+    result = _select(op, context)
+
+    assert result.selected
+    assert result.candidate.partition_contract is None
+    assert (
+        result.candidate.partition_contract_fallback_reason
+        == "group_partition_protocol_invalid"
+    )
 
 
 def test_selection_requires_explicit_opt_in():

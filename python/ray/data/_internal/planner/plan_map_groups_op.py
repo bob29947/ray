@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterator
 from functools import partial
 from typing import List
 
@@ -10,19 +11,23 @@ from ray.data._internal.logical.operators import (
     Sort,
 )
 from ray.data._internal.planner.exchange.sort_task_spec import SortKey
+from ray.data._internal.planner.map_groups_partition_protocol import (
+    MapGroupsPartitionContext,
+    resolve_map_groups_partition_contract,
+)
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
 from ray.data._internal.planner.plan_parquet_range_map_groups import (
     try_plan_parquet_range_map_groups,
 )
 from ray.data._internal.planner.plan_udf_map_op import plan_udf_map_op
-from ray.data.block import CallableClass
+from ray.data.block import BlockAccessor, CallableClass
 from ray.data.context import DataContext, ShuffleStrategy
 
 
 logger = logging.getLogger(__name__)
 
 
-def _build_map_groups_udf(op: MapGroups):
+def _build_map_groups_udf(op: MapGroups, data_context: DataContext):
     """Wrap the group UDF with the existing per-block group iteration behavior."""
     # Extract standalone values so the worker closure doesn't capture the logical op
     # (or, transitively, its entire input plan).
@@ -34,6 +39,20 @@ def _build_map_groups_udf(op: MapGroups):
     else:
         keys = op.key
     batch_format = op.batch_format
+    partition_contract, partition_reason = resolve_map_groups_partition_contract(
+        fn,
+        data_context,
+        batch_format=batch_format,
+        zero_copy_batch=op.zero_copy_batch,
+        fn_args=op.fn_args,
+        fn_kwargs=op.fn_kwargs,
+    )
+    if partition_reason is not None:
+        logger.info(
+            "MapGroups retained per-group execution for %s: %s",
+            op.name,
+            partition_reason,
+        )
 
     # Keep this import lazy to avoid a module cycle through Dataset/GroupedData.
     from ray.data.grouped_data import _apply_udf_to_groups
@@ -49,6 +68,31 @@ def _build_map_groups_udf(op: MapGroups):
                     self.fn, batch, keys, batch_format, *args, **kwargs
                 )
 
+    elif partition_contract is not None:
+
+        def wrapped_fn(batch, *args, **kwargs):
+            accessor = BlockAccessor.for_block(batch)
+            boundaries = tuple(
+                int(value) for value in accessor._get_group_boundaries_sorted(keys)
+            )
+            context = MapGroupsPartitionContext(
+                group_keys=tuple(keys),
+                input_group_boundaries=boundaries,
+            )
+            if context.num_groups == 0:
+                return
+            partition = accessor.to_batch_format(partition_contract.batch_format)
+            result = partition_contract.udf(
+                partition,
+                context,
+                *args,
+                **kwargs,
+            )
+            if isinstance(result, Iterator):
+                yield from result
+            else:
+                yield result
+
     else:
 
         def wrapped_fn(batch, *args, **kwargs):
@@ -59,9 +103,12 @@ def _build_map_groups_udf(op: MapGroups):
     # Match the historical wrapped MapBatches name shown in progress and explain
     # output, including functools.partial handling.
     if isinstance(fn, partial):
-        wrapped_fn.__name__ = fn.func.__name__
+        name = fn.func.__name__
     else:
-        wrapped_fn.__name__ = fn.__name__
+        name = fn.__name__
+    wrapped_fn.__name__ = (
+        f"{name}[partition-v1]" if partition_contract is not None else name
+    )
 
     return wrapped_fn
 
@@ -111,7 +158,7 @@ def plan_map_groups_op(
     )
 
     map_batches_op = MapBatches(
-        _build_map_groups_udf(op),
+        _build_map_groups_udf(op, data_context),
         input_dependencies=[exchange_op],
         batch_size=None,
         can_modify_num_rows=True,
