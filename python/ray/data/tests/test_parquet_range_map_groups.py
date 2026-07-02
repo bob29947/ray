@@ -27,6 +27,7 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _make_work,
     _resolve_rmm_pool_config,
     _validate_group_keys,
+    _work_descriptor_metadata,
     build_parquet_range_map_groups_operator,
     validate_cudf_projection_schema,
 )
@@ -624,6 +625,11 @@ def test_work_and_stats_are_ray_serializable():
     assert isinstance(restored_stats, ParquetRangeMapGroupsStats)
     assert restored_stats == stats
     assert json.loads(json.dumps(asdict(stats)))["groups_invoked"] == 4
+
+    descriptor_metadata = _work_descriptor_metadata(work)
+    assert descriptor_metadata.num_rows == 1
+    assert descriptor_metadata.size_bytes == len(ray_pickle.dumps(work))
+    assert descriptor_metadata.input_files == ("data.parquet",)
 
 
 def test_make_work_preserves_range_and_fragment_shape_including_empty_ranges():

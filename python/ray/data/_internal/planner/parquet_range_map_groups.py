@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple
 
 import ray
+import ray.cloudpickle as ray_pickle
 from ray.data._internal.compute import ActorPoolStrategy
 from ray.data._internal.datasource.parquet_range import (
     ParquetRangeLayout,
@@ -107,6 +108,13 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     rmm_pool_reserved_peak_bytes: int
     group_udf_invocations: int = 0
     partition_udf_invocations: int = 0
+    worker_init_time_s: float = 0.0
+    rmm_init_time_s: float = 0.0
+    tokenizer_init_time_s: float = 0.0
+    group_init_time_s: float = 0.0
+    execution_setup_time_s: float = 0.0
+    range_elapsed_time_s: float = 0.0
+    range_unaccounted_time_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -507,11 +515,16 @@ def _execute_range(
     group_zero_copy_batch: bool,
     target_max_block_size: int,
     rmm_pool_state: _RmmPoolState,
+    initialization_timings: Optional[Dict[str, float]] = None,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
     """Execute one range with per-group or explicitly equivalent partition code."""
 
+    range_started = time.perf_counter()
+    setup_started = time.perf_counter()
     import cudf
     import cupy
+
+    execution_setup_time_s = time.perf_counter() - setup_started
 
     read_time_s = 0.0
     map_time_s = 0.0
@@ -653,6 +666,16 @@ def _execute_range(
         rmm_pool_state.statistics.allocation_counts.peak_bytes
     )
 
+    range_elapsed_time_s = time.perf_counter() - range_started
+    accounted_time_s = (
+        execution_setup_time_s
+        + read_time_s
+        + map_time_s
+        + sort_time_s
+        + group_time_s
+        + output_time_s
+    )
+    initialization_timings = initialization_timings or {}
     stats = ParquetRangeMapGroupsStats(
         partition_id=work.partition_id,
         lower_bound=work.lower_bound,
@@ -678,6 +701,13 @@ def _execute_range(
         rmm_pool_reserved_peak_bytes=rmm_pool_reserved_peak_bytes,
         group_udf_invocations=group_udf_invocations,
         partition_udf_invocations=partition_udf_invocations,
+        worker_init_time_s=initialization_timings.get("total", 0.0),
+        rmm_init_time_s=initialization_timings.get("rmm", 0.0),
+        tokenizer_init_time_s=initialization_timings.get("tokenizer", 0.0),
+        group_init_time_s=initialization_timings.get("group", 0.0),
+        execution_setup_time_s=execution_setup_time_s,
+        range_elapsed_time_s=range_elapsed_time_s,
+        range_unaccounted_time_s=max(0.0, range_elapsed_time_s - accounted_time_s),
     )
     return stats
 
@@ -771,6 +801,23 @@ def _make_work(
     )
 
 
+def _work_descriptor_metadata(work: ParquetRangeMapGroupsWork) -> BlockMetadata:
+    """Return metadata for the in-memory descriptor passed to one range task.
+
+    The task input is a small descriptor, not the Parquet bytes it references.
+    Reporting the encoded scan size here incorrectly charges that external data
+    to Ray's object-store and large-argument scheduling budgets. Scan estimates
+    remain available in the range plan and worker statistics.
+    """
+
+    return BlockMetadata(
+        num_rows=1,
+        size_bytes=max(1, len(ray_pickle.dumps(work))),
+        input_files=tuple(fragment.path for fragment in work.fragments),
+        exec_stats=None,
+    )
+
+
 def build_parquet_range_map_groups_operator(
     *,
     layout: ParquetRangeLayout,
@@ -811,14 +858,7 @@ def build_parquet_range_map_groups_operator(
                     blocks=(
                         BlockEntry(
                             ref=work_ref,
-                            metadata=BlockMetadata(
-                                num_rows=work.estimated_scanned_rows,
-                                size_bytes=max(1, work.estimated_encoded_bytes),
-                                input_files=tuple(
-                                    fragment.path for fragment in work.fragments
-                                ),
-                                exec_stats=None,
-                            ),
+                            metadata=_work_descriptor_metadata(work),
                         ),
                     ),
                     owns_blocks=False,
@@ -891,15 +931,24 @@ def build_parquet_range_map_groups_operator(
     # This dictionary is process-local after Ray deserializes the actor's map
     # transformer. The init hook populates it before execute can run.
     allocator_state: Dict[str, _RmmPoolState] = {}
+    initialization_timings: Dict[str, float] = {}
 
     def init_fn() -> None:
+        total_started = time.perf_counter()
+        started = time.perf_counter()
         allocator_state["rmm"] = _configure_rmm_pool(
             gpu_memory_budget_bytes=gpu_memory_budget_bytes,
             initial_bytes=rmm_pool_initial_bytes,
             reserve_bytes=rmm_pool_reserve_bytes,
         )
+        initialization_timings["rmm"] = time.perf_counter() - started
+        started = time.perf_counter()
         tokenizer_init_fn()
+        initialization_timings["tokenizer"] = time.perf_counter() - started
+        started = time.perf_counter()
         group_init_fn()
+        initialization_timings["group"] = time.perf_counter() - started
+        initialization_timings["total"] = time.perf_counter() - total_started
 
     tokenizer_batch_size = tokenizer_op.batch_size
     tokenizer_zero_copy_batch = tokenizer_op.zero_copy_batch
@@ -929,6 +978,7 @@ def build_parquet_range_map_groups_operator(
                 group_zero_copy_batch=group_zero_copy_batch,
                 target_max_block_size=target_max_block_size,
                 rmm_pool_state=rmm_pool_state,
+                initialization_timings=initialization_timings,
             )
             # Keep one block behind so completed worker metrics are attached to
             # its metadata. Earlier bounded blocks can flow to the writer while
