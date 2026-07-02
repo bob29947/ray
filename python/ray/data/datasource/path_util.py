@@ -417,23 +417,28 @@ def _split_uri(uri: str):
 
 def _is_http_filesystem(fs: "pyarrow.fs.FileSystem") -> bool:
     """Return whether ``fs`` is a PyFileSystem handled by a fsspec HTTPFileSystem."""
-    from pyarrow.fs import FSSpecHandler, PyFileSystem
+    from pyarrow.fs import PyFileSystem
 
-    # Try to import HTTPFileSystem
+    if isinstance(fs, RetryingPyFileSystem):
+        fs = fs.unwrap()
+
+    # Most reads use a native PyArrow filesystem. Check that inexpensive case
+    # before importing fsspec's HTTP implementation, which also imports its
+    # asynchronous HTTP dependency stack.
+    if not isinstance(fs, PyFileSystem):
+        return False
+
+    from pyarrow.fs import FSSpecHandler
+
+    if not isinstance(fs.handler, FSSpecHandler):
+        return False
+
     try:
         from fsspec.implementations.http import HTTPFileSystem
     except ModuleNotFoundError:
         return False
 
-    if isinstance(fs, RetryingPyFileSystem):
-        fs = fs.unwrap()
-
-    if not isinstance(fs, PyFileSystem):
-        return False
-
-    return isinstance(fs.handler, FSSpecHandler) and isinstance(
-        fs.handler.fs, HTTPFileSystem
-    )
+    return isinstance(fs.handler.fs, HTTPFileSystem)
 
 
 def _unwrap_protocol(path):

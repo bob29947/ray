@@ -2085,6 +2085,34 @@ def test_dataset_name_and_id():
     assert "very_loooooooong_name" in repr(ds)
 
 
+def test_dataset_id_generation_is_local_and_stats_registration_is_lazy(
+    ray_start_regular_shared,
+):
+    mock_actor = MagicMock()
+
+    with patch(
+        "ray.data._internal.stats.get_or_create_stats_actor",
+        return_value=mock_actor,
+    ) as get_stats_actor:
+        source = ray.data.range(1, override_num_blocks=1)
+        transformed = source.map_batches(lambda batch: batch)
+
+        # Building and transforming a lazy Dataset must not create the stats actor
+        # or wait for a remote ID-allocation call.
+        get_stats_actor.assert_not_called()
+
+        assert source._uuid != transformed._uuid
+        for dataset_uuid in (source._uuid, transformed._uuid):
+            assert len(dataset_uuid) == 32
+            int(dataset_uuid, 16)
+
+        transformed.materialize()
+
+    # Registration remains deferred until execution and is submitted
+    # asynchronously through the existing StatsManager path.
+    assert mock_actor.register_dataset.remote.call_count == 1
+
+
 def test_dataset_id_train_ingest():
     """Test that the dataset ID is properly set for training ingestion jobs."""
     num_epochs = 3

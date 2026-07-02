@@ -20,7 +20,6 @@ from typing import (
 
 if TYPE_CHECKING:
     from ray.data._internal.scheduling_overhead import BucketedSchedulingOverhead
-from uuid import uuid4
 
 import ray
 from ray.actor import ActorHandle
@@ -335,8 +334,6 @@ class _StatsActor:
         self.start_time = {}
         self.max_stats = max_stats
 
-        # Assign dataset uuids with a global counter.
-        self.next_dataset_id = 0
         # Dataset metadata to be queried directly by DashboardHead api.
         self.datasets: Dict[str, Any] = {}
 
@@ -631,12 +628,6 @@ class _StatsActor:
                 tag_keys=("dataset", "node_ip"),
             )
         return metrics
-
-    def gen_dataset_id(self) -> str:
-        """Generate a unique dataset_id for tracking datasets."""
-        dataset_id = str(self.next_dataset_id)
-        self.next_dataset_id += 1
-        return dataset_id
 
     def update_execution_metrics(
         self,
@@ -1070,21 +1061,6 @@ class _StatsManager:
             topology,
             data_context,
         )
-
-    @staticmethod
-    def gen_dataset_id_from_stats_actor() -> str:
-        try:
-            stats_actor = get_or_create_stats_actor()
-
-            return ray.get(stats_actor.gen_dataset_id.remote())
-        except Exception as e:
-            logger.warning(
-                f"Failed to generate dataset_id, falling back to random uuid_v4: {e}"
-            )
-            # Getting dataset id from _StatsActor may fail, in this case
-            # fall back to uuid4
-            return uuid4().hex
-
 
 class DatasetStats:
     """Holds the execution times for a given Dataset.

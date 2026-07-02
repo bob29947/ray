@@ -1,3 +1,4 @@
+import builtins
 from unittest import mock
 
 import pyarrow
@@ -10,6 +11,7 @@ from ray.data._internal.util import RetryingPyFileSystem
 from ray.data.datasource.path_util import (
     _has_file_extension,
     _is_filesystem_compatible_with_scheme,
+    _is_http_filesystem,
     _is_local_windows_path,
     _resolve_paths_and_filesystem,
 )
@@ -50,6 +52,34 @@ def test_resolve_http_paths(filesystem):
     assert isinstance(resolve_filesystem, pyarrow.fs.PyFileSystem)
     assert isinstance(resolve_filesystem.handler, pyarrow.fs.FSSpecHandler)
     assert isinstance(resolve_filesystem.handler.fs, HTTPFileSystem)
+
+
+@pytest.mark.parametrize("retrying", [False, True])
+def test_is_http_filesystem_does_not_import_fsspec_for_native_filesystem(
+    monkeypatch, retrying
+):
+    filesystem = pyarrow.fs.LocalFileSystem()
+    if retrying:
+        filesystem = RetryingPyFileSystem.wrap(filesystem, retryable_errors=[])
+
+    original_import = builtins.__import__
+
+    def fail_on_fsspec_http_import(name, *args, **kwargs):
+        if name == "fsspec.implementations.http":
+            raise AssertionError(
+                "native PyArrow filesystems should not import fsspec HTTP support"
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_on_fsspec_http_import)
+
+    assert _is_http_filesystem(filesystem) is False
+
+
+def test_is_http_filesystem_with_fsspec_http_filesystem():
+    filesystem = PyFileSystem(FSSpecHandler(HTTPFileSystem()))
+
+    assert _is_http_filesystem(filesystem) is True
 
 
 @pytest.mark.parametrize(

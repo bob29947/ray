@@ -21,6 +21,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from uuid import uuid4
 
 import numpy as np
 
@@ -92,7 +93,7 @@ from ray.data._internal.planner.exchange.sort_task_spec import SortKey
 from ray.data._internal.random_config import RandomSeedConfig
 from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data._internal.split import _get_num_rows, _split_at_indices
-from ray.data._internal.stats import DatasetStats, DatasetStatsSummary, _StatsManager
+from ray.data._internal.stats import DatasetStats, DatasetStatsSummary
 from ray.data._internal.tensor_extensions.arrow import (
     ArrowVariableShapedTensorType,
     get_arrow_extension_fixed_shape_tensor_types,
@@ -312,7 +313,11 @@ class Dataset:
         # Bind context to logical plan.
         self._logical_plan.context = context
 
-        self._set_uuid(_StatsManager.gen_dataset_id_from_stats_actor())
+        # Generate the logical Dataset identity locally. Dataset construction is
+        # lazy and shouldn't synchronously create an actor and wait for an RPC.
+        # UUID4 keeps identities unique across drivers and worker processes; the
+        # stats actor receives this identity asynchronously when execution starts.
+        self._set_uuid(uuid4().hex)
 
     @classmethod
     def _from_parent(cls, parent: "Dataset", logical_plan: LogicalPlan) -> "Dataset":
