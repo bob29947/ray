@@ -15,7 +15,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
-from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
+from ray.data._internal.datasource.parquet_datasource import (
+    PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3,
+    ParquetDatasource,
+)
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.logical.operators import MapBatches, MapGroups, Read
 from ray.data._internal.planner.map_groups_partition_protocol import (
@@ -158,6 +161,22 @@ def _selectors_conflict(
     )
 
 
+def _is_resolved_s3_object_path(path: Any) -> bool:
+    """Return whether ``path`` has PyArrow's resolved ``bucket/key`` shape."""
+
+    if not isinstance(path, str) or not path or path.startswith("/"):
+        return False
+    bucket, separator, key = path.partition("/")
+    return bool(
+        separator
+        and bucket
+        and bucket not in (".", "..")
+        and key
+        and "://" not in path
+        and "\\" not in bucket
+    )
+
+
 def _validate_v1_parquet_datasource(
     read_op: Read,
     datasource: ParquetDatasource,
@@ -169,21 +188,34 @@ def _validate_v1_parquet_datasource(
         import pyarrow.fs as pafs
 
         filesystem = datasource._filesystem
-        if type(filesystem) is not pafs.LocalFileSystem:
+        is_local = type(filesystem) is pafs.LocalFileSystem
+        s3_filesystem_type = getattr(pafs, "S3FileSystem", None)
+        is_native_s3 = (
+            s3_filesystem_type is not None
+            and type(filesystem) is s3_filesystem_type
+        )
+        if not is_local and not is_native_s3:
             return None, "parquet_filesystem_not_local"
     except (AttributeError, ImportError):
         return None, "parquet_filesystem_not_local"
 
+    if is_native_s3 and (
+        getattr(datasource, "_parquet_range_source_access", None)
+        != PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3
+    ):
+        return None, "parquet_s3_source_access_unverified"
+
     paths = getattr(datasource, "_pq_paths", None)
-    if (
-        not isinstance(paths, list)
-        or not paths
-        or any(
+    if not isinstance(paths, list) or not paths:
+        return None, "parquet_source_paths_invalid"
+    if is_local:
+        if any(
             not isinstance(path, str) or not path or not os.path.isabs(path)
             for path in paths
-        )
-    ):
-        return None, "parquet_source_paths_invalid"
+        ):
+            return None, "parquet_source_paths_invalid"
+    elif any(not _is_resolved_s3_object_path(path) for path in paths):
+        return None, "parquet_s3_source_paths_invalid"
 
     projection_map = getattr(datasource, "_projection_map", None)
     if projection_map is None or projection_map == {}:

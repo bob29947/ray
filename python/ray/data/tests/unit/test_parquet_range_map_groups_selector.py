@@ -5,7 +5,11 @@ import pyarrow.fs as pafs
 import pytest
 
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
-from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
+from ray.data._internal.datasource.parquet_datasource import (
+    PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3,
+    ParquetDatasource,
+    _parquet_range_source_access_marker,
+)
 from ray.data._internal.logical.operators import InputData, MapBatches, MapGroups, Read
 from ray.data._internal.planner.map_groups_partition_protocol import (
     MAP_GROUPS_PARTITION_EXECUTION_ENABLED_CONFIG,
@@ -131,6 +135,104 @@ def test_selects_exact_natural_gpu_pipeline_without_io():
     assert candidate.compute is candidate.tokenizer_op.compute
     assert candidate.ray_remote_args == {"num_cpus": 1, "num_gpus": 1}
     assert candidate.partition_contract is None
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        ("s3://bucket/key.parquet", PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3),
+        (
+            ["s3://bucket/a.parquet", "s3://other-bucket/b.parquet"],
+            PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3,
+        ),
+        ("s3a://bucket/key.parquet", None),
+        ("s3://bucket/key.parquet?endpoint=localhost", None),
+        ("s3://bucket/key.parquet#fragment", None),
+        ("s3://[malformed/key.parquet", None),
+        (["s3://bucket/a.parquet", "/tmp/b.parquet"], None),
+        ([], None),
+    ],
+)
+def test_native_s3_source_marker_requires_plain_implicit_s3_paths(
+    monkeypatch, paths, expected
+):
+    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("AWS_ENDPOINT_URL_S3", raising=False)
+
+    assert _parquet_range_source_access_marker(paths, None) == expected
+
+
+def test_native_s3_source_marker_rejects_explicit_filesystem():
+    assert (
+        _parquet_range_source_access_marker(
+            "s3://bucket/key.parquet", pafs.S3FileSystem(anonymous=True)
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("variable", ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"])
+def test_native_s3_source_marker_rejects_custom_ambient_endpoint(
+    monkeypatch, variable
+):
+    monkeypatch.setenv(variable, "http://localhost:9000")
+
+    assert (
+        _parquet_range_source_access_marker("s3://bucket/key.parquet", None) is None
+    )
+
+
+def test_selects_marked_native_s3_source_without_io():
+    datasource = _datasource(
+        _supports_distributed_reads=True,
+        _filesystem=pafs.S3FileSystem(anonymous=True),
+        _pq_paths=["bucket/prefix/input.parquet"],
+        _parquet_range_source_access=PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3,
+    )
+    op, context = _candidate_plan(datasource=datasource)
+
+    result = _select(op, context)
+
+    assert result.selected
+    assert result.candidate.datasource is datasource
+
+
+@pytest.mark.parametrize("marker", [None, "custom_s3", True])
+def test_native_s3_requires_verified_constructor_marker(marker):
+    datasource = _datasource(
+        _supports_distributed_reads=True,
+        _filesystem=pafs.S3FileSystem(anonymous=True),
+        _pq_paths=["bucket/prefix/input.parquet"],
+        _parquet_range_source_access=marker,
+    )
+    op, context = _candidate_plan(datasource=datasource)
+
+    assert (
+        _select(op, context).fallback_reason
+        == "parquet_s3_source_access_unverified"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "s3://bucket/key.parquet",
+        "/bucket/key.parquet",
+        "bucket",
+        "bucket/",
+        "../bucket/key.parquet",
+    ],
+)
+def test_native_s3_requires_resolved_bucket_key_paths(path):
+    datasource = _datasource(
+        _supports_distributed_reads=True,
+        _filesystem=pafs.S3FileSystem(anonymous=True),
+        _pq_paths=[path],
+        _parquet_range_source_access=PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3,
+    )
+    op, context = _candidate_plan(datasource=datasource)
+
+    assert _select(op, context).fallback_reason == "parquet_s3_source_paths_invalid"
 
 
 def test_selects_explicit_partition_equivalent_group_udf():

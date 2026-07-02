@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import ray.data._internal.datasource.parquet_datasource as parquet_datasource_module
+import ray.data._internal.datasource.parquet_range_v1 as parquet_range_v1_module
 from ray.data._internal.datasource.parquet_datasource import (
     ParquetDatasource,
     _ParquetFragment,
@@ -221,6 +222,127 @@ def test_adapter_never_resolves_or_relists_paths(tmp_path, monkeypatch):
         projection=["User"],
     )
     assert len(row_groups) == 1
+
+
+def test_extracts_native_s3_fragments_without_relisting(tmp_path, monkeypatch):
+    path = tmp_path / "data.parquet"
+    _write_parquet(path, [0, 1, 2, 3])
+    local_fragment = next(
+        pds.dataset(str(path), format="parquet").get_fragments()
+    )
+    remote_fragment = SimpleNamespace(
+        path="bucket/prefix/data.parquet",
+        metadata=local_fragment.metadata,
+        row_groups=local_fragment.row_groups,
+    )
+    datasource = SimpleNamespace(
+        _pq_fragments=[
+            SimpleNamespace(original=remote_fragment, file_size=path.stat().st_size)
+        ],
+        _pq_paths=[remote_fragment.path],
+        _filesystem=pa_fs.S3FileSystem(anonymous=True),
+        _parquet_range_source_access="native_s3_default",
+        _partition_columns=[],
+        _include_paths=False,
+        _include_row_hash=False,
+    )
+
+    class FakeS3FileSystem:
+        def invalidate_cache(self, _path):
+            pass
+
+        def info(self, source_path):
+            assert source_path == remote_fragment.path
+            return {
+                "Size": path.stat().st_size,
+                "ETag": '"abc123"',
+                "LastModified": "2026-07-02T00:00:00+00:00",
+            }
+
+    monkeypatch.setattr(
+        parquet_range_v1_module,
+        "_create_ambient_s3_filesystem",
+        FakeS3FileSystem,
+    )
+    result = try_extract_v1_parquet_row_group_metadata(
+        datasource,
+        key="User",
+        projection=["User", "Card"],
+    )
+
+    assert result.extracted
+    assert len(result.row_groups) == 2
+    assert {entry.path for entry in result.row_groups} == {
+        "s3://bucket/prefix/data.parquet"
+    }
+    assert all(
+        entry.source_identity.startswith("s3-v1:") for entry in result.row_groups
+    )
+
+
+@pytest.mark.parametrize(
+    ("resolved_path", "expected_uri"),
+    [
+        ("bucket/a%20b.parquet", "s3://bucket/a%2520b.parquet"),
+        ("bucket/a#b?.parquet", "s3://bucket/a%23b%3F.parquet"),
+        ("bucket/folder/a b.parquet", "s3://bucket/folder/a%20b.parquet"),
+    ],
+)
+def test_resolved_s3_fragment_path_is_encoded_exactly_once(
+    resolved_path, expected_uri
+):
+    assert parquet_range_v1_module._as_s3_uri(resolved_path) == expected_uri
+
+
+def test_native_s3_footer_mutation_fails_closed(tmp_path, monkeypatch):
+    path = tmp_path / "data.parquet"
+    _write_parquet(path, [0, 1])
+    local_fragment = next(
+        pds.dataset(str(path), format="parquet").get_fragments()
+    )
+    remote_fragment = SimpleNamespace(
+        path="bucket/data.parquet",
+        metadata=local_fragment.metadata,
+        row_groups=local_fragment.row_groups,
+    )
+    datasource = SimpleNamespace(
+        _pq_fragments=[
+            SimpleNamespace(original=remote_fragment, file_size=path.stat().st_size)
+        ],
+        _pq_paths=[remote_fragment.path],
+        _filesystem=pa_fs.S3FileSystem(anonymous=True),
+        _parquet_range_source_access="native_s3_default",
+        _partition_columns=[],
+        _include_paths=False,
+        _include_row_hash=False,
+    )
+
+    class MutatingS3FileSystem:
+        calls = 0
+
+        def invalidate_cache(self, _path):
+            pass
+
+        def info(self, _path):
+            self.calls += 1
+            return {
+                "Size": path.stat().st_size,
+                "ETag": f'"etag-{self.calls}"',
+                "LastModified": "2026-07-02T00:00:00+00:00",
+            }
+
+    monkeypatch.setattr(
+        parquet_range_v1_module,
+        "_create_ambient_s3_filesystem",
+        MutatingS3FileSystem,
+    )
+    result = try_extract_v1_parquet_row_group_metadata(
+        datasource,
+        key="User",
+        projection=["User"],
+    )
+
+    assert result.rejection_reason == "source_changed_during_planning"
 
 
 def test_honors_existing_row_group_subset_and_aggregates_nested_leaves(

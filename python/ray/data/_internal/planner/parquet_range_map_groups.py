@@ -1,4 +1,4 @@
-"""Fused local-cuDF execution for metadata-planned ``map_groups``.
+"""Fused cuDF execution for metadata-planned ``map_groups``.
 
 This module is intentionally a physical backend, not a user-facing API.  The
 ordinary application remains ``read_parquet().map_batches().groupby().map_groups()``.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections.abc
 import math
+import os
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -22,7 +23,12 @@ from ray.data._internal.datasource.parquet_range import (
     ParquetRangeLayout,
     ParquetRowGroupFragment,
 )
+from ray.data._internal.datasource.parquet_range_s3 import (
+    S3SourceIdentity,
+    verify_s3_source_identity,
+)
 from ray.data._internal.datasource.parquet_range_v1 import (
+    PosixSourceIdentity,
     verify_posix_source_identity,
 )
 from ray.data._internal.execution.interfaces import (
@@ -80,6 +86,8 @@ class ParquetRangeMapGroupsWork:
     estimated_scanned_rows: int
     estimated_encoded_bytes: int
     estimated_uncompressed_bytes: int
+    source_kind: str = "posix"
+    s3_row_groups_per_read: int = 0
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,170 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     range_unaccounted_time_s: float = 0.0
     worker_range_index: int = 0
     worker_initialization_reused: bool = False
+    source_kind: str = "posix"
+    read_backend: str = "cudf-posix"
+    s3_kvikio_num_threads: int = 0
+    s3_kvikio_task_size_bytes: int = 0
+
+
+def _source_kind_from_identity(identity: str) -> str:
+    """Validate an opaque planner identity and return its executor provider."""
+
+    if isinstance(identity, str) and identity.startswith("posix-v1:"):
+        PosixSourceIdentity.decode(identity)
+        return "posix"
+    if isinstance(identity, str) and identity.startswith("s3-v1:"):
+        S3SourceIdentity.decode(identity)
+        return "s3"
+    raise ValueError("The range plan contains an unsupported source identity.")
+
+
+def _source_kind_for_fragments(
+    fragments: Tuple[ParquetRowGroupFragment, ...],
+) -> str:
+    kinds = {
+        _source_kind_from_identity(fragment.source_identity)
+        for fragment in fragments
+    }
+    if len(kinds) != 1:
+        raise ValueError("A range cannot mix Parquet source providers.")
+    return next(iter(kinds))
+
+
+def _verify_source_identity(fragment: ParquetRowGroupFragment) -> bool:
+    source_kind = _source_kind_from_identity(fragment.source_identity)
+    if source_kind == "posix":
+        return verify_posix_source_identity(
+            fragment.path, fragment.source_identity
+        )
+    return verify_s3_source_identity(fragment.path, fragment.source_identity)
+
+
+def _configure_s3_kvikio_runtime(
+    *, num_threads: int, task_size_bytes: int
+) -> Dict[str, int]:
+    """Require and verify actor-local KvikIO remote-read settings."""
+
+    if num_threads <= 0 or task_size_bytes <= 0:
+        raise ValueError("KvikIO thread and task-size settings must be positive.")
+    _materialize_ambient_aws_credentials()
+    os.environ["KVIKIO_NTHREADS"] = str(num_threads)
+    os.environ["KVIKIO_TASK_SIZE"] = str(task_size_bytes)
+    try:
+        import kvikio.defaults as kvikio_defaults
+        from kvikio.remote_file import is_remote_file_available
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "Native S3 range execution requires KvikIO remote I/O."
+        ) from exc
+    if not is_remote_file_available():
+        raise RuntimeError(
+            "KvikIO has no remote-file support; refusing whole-object fallback."
+        )
+    kvikio_defaults.set(
+        {"num_threads": int(num_threads), "task_size": int(task_size_bytes)}
+    )
+    realized = {
+        "num_threads": int(kvikio_defaults.get("num_threads")),
+        "task_size_bytes": int(kvikio_defaults.get("task_size")),
+    }
+    requested = {
+        "num_threads": int(num_threads),
+        "task_size_bytes": int(task_size_bytes),
+    }
+    if realized != requested:
+        raise RuntimeError(
+            "KvikIO runtime settings mismatch: "
+            f"requested={requested!r}, realized={realized!r}"
+        )
+    import cudf
+
+    cudf.set_option("kvikio_remote_io", True)
+    if not cudf.get_option("kvikio_remote_io"):
+        raise RuntimeError("cuDF did not enable KvikIO remote I/O.")
+    return realized
+
+
+def _materialize_ambient_aws_credentials() -> None:
+    """Expose the ambient AWS provider chain to KvikIO in this worker.
+
+    PyArrow and s3fs consume the AWS provider chain directly.  KvikIO's
+    remote reader consumes the standard AWS environment variables instead,
+    so resolve the same chain once in the short-lived fused worker process.
+    Secret values are never returned, serialized, or included in metrics.
+    """
+
+    if any(
+        os.environ.get(variable)
+        for variable in ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3")
+    ):
+        raise RuntimeError(
+            "Native S3 range execution does not support endpoint overrides."
+        )
+    try:
+        import botocore.session
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "Native S3 range execution requires the AWS credential provider."
+        ) from exc
+    session = botocore.session.get_session()
+    credentials = session.get_credentials()
+    if credentials is None:
+        raise RuntimeError(
+            "No ambient AWS credentials are available for native S3 execution."
+        )
+    frozen = credentials.get_frozen_credentials()
+    if not frozen.access_key or not frozen.secret_key:
+        raise RuntimeError(
+            "The ambient AWS credential provider returned incomplete credentials."
+        )
+    os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+    if frozen.token:
+        os.environ["AWS_SESSION_TOKEN"] = frozen.token
+    else:
+        os.environ.pop("AWS_SESSION_TOKEN", None)
+
+    region = (
+        os.environ.get("AWS_DEFAULT_REGION")
+        or os.environ.get("AWS_REGION")
+        or session.get_config_variable("region")
+    )
+    if not region:
+        raise RuntimeError(
+            "No AWS region is available for native S3 range execution."
+        )
+    os.environ["AWS_DEFAULT_REGION"] = str(region)
+    os.environ["AWS_REGION"] = str(region)
+
+
+def _row_group_chunks(
+    row_group_ids: Tuple[int, ...], chunk_size: int
+) -> Iterator[Tuple[int, ...]]:
+    if chunk_size <= 0:
+        yield row_group_ids
+        return
+    for offset in range(0, len(row_group_ids), chunk_size):
+        yield row_group_ids[offset : offset + chunk_size]
+
+
+def _cudf_parquet_read_kwargs(
+    work: ParquetRangeMapGroupsWork, row_group_ids: Tuple[int, ...]
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "columns": list(work.projection),
+        "row_groups": list(row_group_ids),
+    }
+    if work.source_kind == "s3":
+        kwargs.update(
+            {
+                "engine": "cudf",
+                "dataset_kwargs": {"partitioning": None},
+                "use_pandas_metadata": False,
+                "categorical_partitions": False,
+            }
+        )
+    return kwargs
 
 
 @dataclass(frozen=True)
@@ -517,6 +689,7 @@ def _execute_range(
     group_zero_copy_batch: bool,
     target_max_block_size: int,
     rmm_pool_state: _RmmPoolState,
+    source_runtime_state: Optional[Dict[str, int]] = None,
     initialization_timings: Optional[Dict[str, float]] = None,
     worker_range_index: int = 0,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
@@ -545,26 +718,30 @@ def _execute_range(
     def raw_frames() -> Iterator[Any]:
         nonlocal read_time_s, input_rows
         for fragment in work.fragments:
-            verify_posix_source_identity(fragment.path, fragment.source_identity)
-            started = time.perf_counter()
-            # One multi-row-group read per file is substantially faster than
-            # repeatedly re-entering cuDF's Parquet reader. Exact range
-            # filtering below removes overlap amplification before the UDF.
-            frame = cudf.read_parquet(
-                fragment.path,
-                columns=list(work.projection),
-                row_groups=list(fragment.row_group_ids),
+            _verify_source_identity(fragment)
+            chunks = _row_group_chunks(
+                fragment.row_group_ids,
+                work.s3_row_groups_per_read if work.source_kind == "s3" else 0,
             )
-            frame = _normalize_cudf_frame(frame, work)
-            frame = frame[
-                (frame[work.partition_key] >= work.lower_bound)
-                & (frame[work.partition_key] <= work.upper_bound)
-            ].reset_index(drop=True)
-            read_time_s += time.perf_counter() - started
-            input_rows += len(frame)
-            if len(frame):
-                yield frame
-            verify_posix_source_identity(fragment.path, fragment.source_identity)
+            for row_group_ids in chunks:
+                started = time.perf_counter()
+                # Local sources use one multi-row-group read per file. S3
+                # sources use bounded row-group chunks so remote-read
+                # transients fit smaller GPUs without materializing an object.
+                frame = cudf.read_parquet(
+                    fragment.path,
+                    **_cudf_parquet_read_kwargs(work, row_group_ids),
+                )
+                frame = _normalize_cudf_frame(frame, work)
+                frame = frame[
+                    (frame[work.partition_key] >= work.lower_bound)
+                    & (frame[work.partition_key] <= work.upper_bound)
+                ].reset_index(drop=True)
+                read_time_s += time.perf_counter() - started
+                input_rows += len(frame)
+                if len(frame):
+                    yield frame
+            _verify_source_identity(fragment)
 
     tokenized_batches: List[Any] = []
     for raw_batch in _iter_exact_cudf_batches(raw_frames(), tokenizer_batch_size, cudf):
@@ -679,6 +856,7 @@ def _execute_range(
         + output_time_s
     )
     initialization_timings = initialization_timings or {}
+    source_runtime_state = source_runtime_state or {}
     stats = ParquetRangeMapGroupsStats(
         partition_id=work.partition_id,
         lower_bound=work.lower_bound,
@@ -713,6 +891,14 @@ def _execute_range(
         range_unaccounted_time_s=max(0.0, range_elapsed_time_s - accounted_time_s),
         worker_range_index=worker_range_index,
         worker_initialization_reused=worker_range_index > 0,
+        source_kind=work.source_kind,
+        read_backend=(
+            "cudf-kvikio-s3" if work.source_kind == "s3" else "cudf-posix"
+        ),
+        s3_kvikio_num_threads=int(source_runtime_state.get("num_threads", 0)),
+        s3_kvikio_task_size_bytes=int(
+            source_runtime_state.get("task_size_bytes", 0)
+        ),
     )
     return stats
 
@@ -804,6 +990,7 @@ def _select_execution_backend(
     has_partition_contract: bool,
     num_ranges: int,
     worker_concurrency: Optional[int],
+    requires_dedicated_workers: bool = False,
 ) -> Tuple[str, int, bool]:
     """Choose the physical worker pool without changing UDF semantics.
 
@@ -818,7 +1005,11 @@ def _select_execution_backend(
     resolved_concurrency = _resolve_worker_concurrency(
         worker_concurrency, num_ranges
     )
-    if has_partition_contract and num_ranges <= resolved_concurrency:
+    if (
+        has_partition_contract
+        and not requires_dedicated_workers
+        and num_ranges <= resolved_concurrency
+    ):
         return "task_pool", resolved_concurrency, False
     return (
         "actor_pool",
@@ -844,7 +1035,15 @@ def _make_work(
     partition_key: str,
     group_keys: Tuple[str, ...],
     source_schema: Any,
+    s3_row_groups_per_read: int = 0,
 ) -> Tuple[ParquetRangeMapGroupsWork, ...]:
+    source_kind = _source_kind_for_fragments(
+        tuple(
+            fragment
+            for partition in layout.partitions
+            for fragment in partition.fragments
+        )
+    )
     return tuple(
         ParquetRangeMapGroupsWork(
             partition_id=partition.partition_id,
@@ -858,6 +1057,10 @@ def _make_work(
             estimated_scanned_rows=partition.estimated_scanned_rows,
             estimated_encoded_bytes=partition.estimated_encoded_bytes,
             estimated_uncompressed_bytes=partition.estimated_uncompressed_bytes,
+            source_kind=source_kind,
+            s3_row_groups_per_read=(
+                s3_row_groups_per_read if source_kind == "s3" else 0
+            ),
         )
         for partition in layout.partitions
     )
@@ -900,22 +1103,56 @@ def build_parquet_range_map_groups_operator(
 ) -> PhysicalOperator:
     """Build the shuffle-free fixed-GPU physical operator for a validated plan."""
 
+    if len(layout.partitions) != map_groups_op.num_partitions:
+        raise ValueError(
+            "The range layout must contain exactly one range per requested partition."
+        )
+    s3_row_groups_per_read = data_context.get_config(
+        "parquet_range_map_groups_s3_row_groups_per_read", 16
+    )
+    s3_kvikio_num_threads = data_context.get_config(
+        "parquet_range_map_groups_s3_kvikio_num_threads", 8
+    )
+    s3_kvikio_task_size_bytes = data_context.get_config(
+        "parquet_range_map_groups_s3_kvikio_task_size_bytes", 4 * 1024**2
+    )
+    for config_name, config_value in (
+        ("parquet_range_map_groups_s3_row_groups_per_read", s3_row_groups_per_read),
+        ("parquet_range_map_groups_s3_kvikio_num_threads", s3_kvikio_num_threads),
+        (
+            "parquet_range_map_groups_s3_kvikio_task_size_bytes",
+            s3_kvikio_task_size_bytes,
+        ),
+    ):
+        if (
+            isinstance(config_value, bool)
+            or not isinstance(config_value, int)
+            or config_value <= 0
+        ):
+            raise ValueError(f"{config_name} must be a positive integer")
+
     works = _make_work(
         layout,
         projection=projection,
         partition_key=partition_key,
         group_keys=group_keys,
         source_schema=source_schema,
+        s3_row_groups_per_read=s3_row_groups_per_read,
     )
     if len(works) != map_groups_op.num_partitions:
         raise ValueError(
             "The range layout must contain exactly one range per requested partition."
         )
+    source_kind = works[0].source_kind
     execution_backend, resolved_worker_concurrency, actor_reuse_enabled = (
         _select_execution_backend(
             has_partition_contract=partition_contract is not None,
             num_ranges=len(works),
             worker_concurrency=worker_concurrency,
+            # KvikIO configuration and temporary IAM credentials are
+            # process-local. Keep them inside dedicated fused actors rather
+            # than returning a modified generic task worker to Ray's pool.
+            requires_dedicated_workers=source_kind == "s3",
         )
     )
 
@@ -1001,6 +1238,7 @@ def build_parquet_range_map_groups_operator(
     # This dictionary is process-local after Ray deserializes the actor's map
     # transformer. The init hook populates it before execute can run.
     allocator_state: Dict[str, _RmmPoolState] = {}
+    source_runtime_state: Dict[str, int] = {}
     initialization_timings: Dict[str, float] = {}
     execution_state = {"ranges_processed": 0}
 
@@ -1013,6 +1251,15 @@ def build_parquet_range_map_groups_operator(
             reserve_bytes=rmm_pool_reserve_bytes,
         )
         initialization_timings["rmm"] = time.perf_counter() - started
+        if source_kind == "s3":
+            started = time.perf_counter()
+            source_runtime_state.update(
+                _configure_s3_kvikio_runtime(
+                    num_threads=s3_kvikio_num_threads,
+                    task_size_bytes=s3_kvikio_task_size_bytes,
+                )
+            )
+            initialization_timings["s3"] = time.perf_counter() - started
         started = time.perf_counter()
         tokenizer_init_fn()
         initialization_timings["tokenizer"] = time.perf_counter() - started
@@ -1039,6 +1286,10 @@ def build_parquet_range_map_groups_operator(
             init_fn()
             rmm_pool_state = allocator_state["rmm"]
         for work in blocks:
+            if work.source_kind == "s3":
+                # Refresh a role credential before each range so a long-lived
+                # actor doesn't retain an expired token from initialization.
+                _materialize_ambient_aws_credentials()
             worker_range_index = execution_state["ranges_processed"]
             range_outputs = _execute_range(
                 work,
@@ -1050,6 +1301,7 @@ def build_parquet_range_map_groups_operator(
                 group_zero_copy_batch=group_zero_copy_batch,
                 target_max_block_size=target_max_block_size,
                 rmm_pool_state=rmm_pool_state,
+                source_runtime_state=source_runtime_state,
                 initialization_timings=_initialization_timings_for_worker_range(
                     initialization_timings, worker_range_index
                 ),
@@ -1110,6 +1362,19 @@ def build_parquet_range_map_groups_operator(
         "load_skew": metrics.load_skew,
         "estimated_peak_gpu_memory_bytes": estimated_peak_gpu_memory_bytes,
         "gpu_memory_budget_bytes": gpu_memory_budget_bytes,
+        "source_kind": source_kind,
+        "read_backend": (
+            "cudf-kvikio-s3" if source_kind == "s3" else "cudf-posix"
+        ),
+        "s3_row_groups_per_read": (
+            s3_row_groups_per_read if source_kind == "s3" else 0
+        ),
+        "s3_kvikio_num_threads": (
+            s3_kvikio_num_threads if source_kind == "s3" else 0
+        ),
+        "s3_kvikio_task_size_bytes": (
+            s3_kvikio_task_size_bytes if source_kind == "s3" else 0
+        ),
         "rmm_pool_initial_bytes": rmm_pool_initial_bytes,
         "rmm_pool_reserve_bytes": rmm_pool_reserve_bytes,
         "group_execution_mode": (

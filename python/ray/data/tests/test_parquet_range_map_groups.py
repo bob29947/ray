@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+import types
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -9,9 +12,11 @@ import pytest
 import ray.cloudpickle as ray_pickle
 from ray.data.context import DataContext
 from ray.data._internal.datasource.parquet_range import (
+    ParquetRowGroupFragment,
     ParquetRowGroupMetadata,
     plan_parquet_row_groups,
 )
+from ray.data._internal.datasource.parquet_range_s3 import S3SourceIdentity
 from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.planner.map_groups_partition_protocol import (
     MapGroupsPartitionContract,
@@ -22,10 +27,13 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     ParquetRangeMapGroupsStats,
     ParquetRangeMapGroupsTaskPoolMapOperator,
     ParquetRangeMapGroupsWork,
+    _cudf_parquet_read_kwargs,
     _default_rmm_pool_initial_bytes,
+    _configure_s3_kvikio_runtime,
     _initialization_timings_for_worker_range,
     _iter_exact_cudf_batches,
     _iter_group_outputs,
+    _materialize_ambient_aws_credentials,
     _iter_partition_outputs,
     _invoke_row_preserving_tokenizer,
     _iter_group_views,
@@ -33,7 +41,9 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _make_work,
     _resolve_rmm_pool_config,
     _resolve_worker_concurrency,
+    _row_group_chunks,
     _select_execution_backend,
+    _source_kind_for_fragments,
     _validate_group_keys,
     _work_descriptor_metadata,
     build_parquet_range_map_groups_operator,
@@ -53,7 +63,7 @@ def _row_group(
 ):
     return ParquetRowGroupMetadata(
         path=path,
-        source_identity=f"identity:{path}",
+        source_identity="posix-v1:1:2:3:4",
         row_group_id=row_group_id,
         num_rows=rows,
         key_min=key_min,
@@ -134,6 +144,145 @@ def test_partition_execution_uses_a_smaller_startup_pool_by_default():
     assert _default_rmm_pool_initial_bytes(object()) == 1 * 1024**3
 
 
+def test_source_kind_validation_accepts_s3_and_rejects_mixed_sources():
+    s3_identity = S3SourceIdentity(
+        size=10,
+        etag="abc123",
+        last_modified="2026-07-02T00:00:00.000000Z",
+    ).encode()
+    s3_fragment = ParquetRowGroupFragment(
+        path="s3://bucket/data.parquet",
+        source_identity=s3_identity,
+        row_group_ids=(0,),
+    )
+    posix_fragment = ParquetRowGroupFragment(
+        path="/tmp/data.parquet",
+        source_identity="posix-v1:1:2:3:4",
+        row_group_ids=(0,),
+    )
+
+    assert _source_kind_for_fragments((s3_fragment,)) == "s3"
+    with pytest.raises(ValueError, match="cannot mix"):
+        _source_kind_for_fragments((s3_fragment, posix_fragment))
+
+
+def test_row_group_chunks_bound_remote_read_work():
+    assert list(_row_group_chunks((0, 1, 2, 3, 4), 2)) == [
+        (0, 1),
+        (2, 3),
+        (4,),
+    ]
+    assert list(_row_group_chunks((0, 1), 0)) == [(0, 1)]
+
+
+def test_configure_s3_kvikio_runtime_is_fail_closed_and_verified(monkeypatch):
+    values = {"num_threads": 1, "task_size": 1}
+    defaults = types.ModuleType("kvikio.defaults")
+    defaults.set = lambda requested: values.update(requested)
+    defaults.get = lambda key: values[key]
+    remote_file = types.ModuleType("kvikio.remote_file")
+    remote_file.is_remote_file_available = lambda: True
+    kvikio = types.ModuleType("kvikio")
+    kvikio.__path__ = []
+    cudf = types.ModuleType("cudf")
+    options = {}
+    cudf.set_option = lambda key, value: options.__setitem__(key, value)
+    cudf.get_option = lambda key: options.get(key)
+    monkeypatch.setitem(sys.modules, "kvikio", kvikio)
+    monkeypatch.setitem(sys.modules, "kvikio.defaults", defaults)
+    monkeypatch.setitem(sys.modules, "kvikio.remote_file", remote_file)
+    monkeypatch.setitem(sys.modules, "cudf", cudf)
+    monkeypatch.setattr(
+        "ray.data._internal.planner.parquet_range_map_groups."
+        "_materialize_ambient_aws_credentials",
+        lambda: None,
+    )
+
+    assert _configure_s3_kvikio_runtime(
+        num_threads=32, task_size_bytes=16 * 1024**2
+    ) == {"num_threads": 32, "task_size_bytes": 16 * 1024**2}
+    assert options["kvikio_remote_io"] is True
+
+
+def test_materialize_ambient_aws_credentials_for_kvikio(monkeypatch):
+    frozen = SimpleNamespace(
+        access_key="temporary-access",
+        secret_key="temporary-secret",
+        token="temporary-token",
+    )
+    credentials = SimpleNamespace(get_frozen_credentials=lambda: frozen)
+    session = SimpleNamespace(
+        get_credentials=lambda: credentials,
+        get_config_variable=lambda name: "us-west-2" if name == "region" else None,
+    )
+    session_module = types.ModuleType("botocore.session")
+    session_module.get_session = lambda: session
+    botocore = types.ModuleType("botocore")
+    botocore.__path__ = []
+    botocore.session = session_module
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.session", session_module)
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    _materialize_ambient_aws_credentials()
+
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "temporary-access"
+    assert os.environ["AWS_SECRET_ACCESS_KEY"] == "temporary-secret"
+    assert os.environ["AWS_SESSION_TOKEN"] == "temporary-token"
+    assert os.environ["AWS_DEFAULT_REGION"] == "us-west-2"
+    assert os.environ["AWS_REGION"] == "us-west-2"
+
+
+def test_materialize_ambient_aws_credentials_fails_without_provider(monkeypatch):
+    session_module = types.ModuleType("botocore.session")
+    session_module.get_session = lambda: SimpleNamespace(get_credentials=lambda: None)
+    botocore = types.ModuleType("botocore")
+    botocore.__path__ = []
+    botocore.session = session_module
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.session", session_module)
+
+    with pytest.raises(RuntimeError, match="No ambient AWS credentials"):
+        _materialize_ambient_aws_credentials()
+
+
+def test_materialize_ambient_aws_credentials_requires_region(monkeypatch):
+    frozen = SimpleNamespace(access_key="access", secret_key="secret", token=None)
+    credentials = SimpleNamespace(get_frozen_credentials=lambda: frozen)
+    session_module = types.ModuleType("botocore.session")
+    session_module.get_session = lambda: SimpleNamespace(
+        get_credentials=lambda: credentials,
+        get_config_variable=lambda _name: None,
+    )
+    botocore = types.ModuleType("botocore")
+    botocore.__path__ = []
+    botocore.session = session_module
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.session", session_module)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+
+    with pytest.raises(RuntimeError, match="No AWS region"):
+        _materialize_ambient_aws_credentials()
+
+
+@pytest.mark.parametrize("variable", ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"])
+def test_materialize_ambient_aws_credentials_rejects_endpoint_override(
+    monkeypatch, variable
+):
+    monkeypatch.setenv(variable, "http://localhost:9000")
+
+    with pytest.raises(RuntimeError, match="endpoint overrides"):
+        _materialize_ambient_aws_credentials()
+
+
 @pytest.mark.parametrize(
     (
         "has_partition_contract",
@@ -165,6 +314,15 @@ def test_select_execution_backend(
         )
         == expected
     )
+
+
+def test_dedicated_source_runtime_forces_actor_backend():
+    assert _select_execution_backend(
+        has_partition_contract=True,
+        num_ranges=4,
+        worker_concurrency=4,
+        requires_dedicated_workers=True,
+    ) == ("actor_pool", 4, False)
 
 
 @pytest.mark.parametrize("worker_concurrency", [True, False, 0, -1, 1.5, "4"])
@@ -221,6 +379,45 @@ def test_builder_uses_fixed_actor_pool_for_oversubscribed_partition_ranges():
     assert op._parquet_range_plan_metrics["worker_concurrency"] == 2
     assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is True
     assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 2
+
+
+def test_builder_uses_dedicated_actor_pool_for_native_s3():
+    identity = S3SourceIdentity(
+        size=100,
+        etag="abc123",
+        last_modified="2026-07-02T00:00:00.000000Z",
+    ).encode()
+    row_group = _row_group("s3://bucket/data.parquet", 0, 0, 9)
+    row_group = row_group.__class__(
+        **{**row_group.__dict__, "source_identity": identity}
+    )
+    layout = plan_parquet_row_groups([row_group], num_partitions=1)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=1)
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        partition_contract=MapGroupsPartitionContract(
+            udf=_identity_partition,
+            batch_format="cudf",
+        ),
+        data_context=DataContext.get_current(),
+        ray_remote_args={"num_gpus": 1},
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=1,
+    )
+
+    assert isinstance(op, ParquetRangeMapGroupsActorPoolMapOperator)
+    assert op._parquet_range_plan_metrics["source_kind"] == "s3"
+    assert op._parquet_range_plan_metrics["execution_backend"] == "actor_pool"
+    assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is False
+    assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 1
 
 
 def test_builder_bounds_ordinary_actor_pool_and_reuses_workers():
@@ -934,7 +1131,7 @@ def test_make_work_preserves_range_and_fragment_shape_including_empty_ranges():
         (3, 75, 99),
     ]
     assert works[0].fragments[0].path == "first.parquet"
-    assert works[0].fragments[0].source_identity == "identity:first.parquet"
+    assert works[0].fragments[0].source_identity == "posix-v1:1:2:3:4"
     assert works[1].fragments == ()
     assert works[2].fragments == ()
     assert works[3].fragments[0].row_group_ids == (3,)
@@ -950,6 +1147,39 @@ def test_make_work_preserves_range_and_fragment_shape_including_empty_ranges():
     assert all(work.partition_key == "User" for work in works)
     assert all(work.group_keys == ("User", "Card") for work in works)
     assert all(work.source_schema is schema for work in works)
+
+
+def test_make_work_marks_native_s3_reads_and_row_group_chunking():
+    identity = S3SourceIdentity(
+        size=100,
+        etag="abc123",
+        last_modified="2026-07-02T00:00:00.000000Z",
+    ).encode()
+    row_group = _row_group("s3://bucket/data.parquet", 0, 0, 9)
+    row_group = row_group.__class__(
+        **{**row_group.__dict__, "source_identity": identity}
+    )
+    layout = plan_parquet_row_groups([row_group], num_partitions=1)
+
+    works = _make_work(
+        layout,
+        projection=("User", "Card"),
+        partition_key="User",
+        group_keys=("User", "Card"),
+        source_schema=_source_schema(),
+        s3_row_groups_per_read=32,
+    )
+
+    assert works[0].source_kind == "s3"
+    assert works[0].s3_row_groups_per_read == 32
+    assert _cudf_parquet_read_kwargs(works[0], (1, 2)) == {
+        "columns": ["User", "Card"],
+        "row_groups": [1, 2],
+        "engine": "cudf",
+        "dataset_kwargs": {"partitioning": None},
+        "use_pandas_metadata": False,
+        "categorical_partitions": False,
+    }
 
 
 def test_builder_rejects_layout_that_cannot_shape_one_work_per_partition():

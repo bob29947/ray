@@ -2,6 +2,7 @@ import hashlib
 import logging
 import math
 import os
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -138,6 +139,51 @@ _MIN_PYARROW_VERSION_FOR_SCANNER_DEFAULTS = parse_version("12.0.1")
 # ray.data.arrow_pickled_object columns. Disabled by default because
 # pickle.load on attacker-controlled data enables arbitrary code execution.
 AUTOLOAD_PICKLE_OBJECT_SCALAR_ENV_VAR = "RAY_DATA_AUTOLOAD_PICKLE_OBJECT_SCALAR"
+
+# Provenance marker for the range ``map_groups`` optimizer.  A native S3
+# filesystem alone isn't enough to establish how it was configured: callers can
+# pass an S3-compatible endpoint or a filesystem with non-default access
+# semantics.  Only the ordinary ``read_parquet("s3://...")`` constructor path
+# sets this marker, before URI resolution strips the scheme from fragment paths.
+PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3 = "native_s3_default"
+
+
+def _parquet_range_source_access_marker(
+    paths: Union[str, List[str]], filesystem: Optional["pyarrow.fs.FileSystem"]
+) -> Optional[str]:
+    """Return a range-backend source marker for plain, implicit S3 inputs.
+
+    This deliberately recognizes only ``s3://`` URIs resolved by Ray/PyArrow
+    with ambient configuration.  Explicit filesystems, alternate schemes,
+    endpoint-bearing URIs, and mixed path lists remain unmarked and therefore
+    use the ordinary reader.
+    """
+
+    if filesystem is not None or any(
+        os.environ.get(variable)
+        for variable in ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3")
+    ):
+        return None
+    source_paths = [paths] if isinstance(paths, str) else paths
+    if not isinstance(source_paths, list) or not source_paths:
+        return None
+    for path in source_paths:
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            parsed = urlsplit(path)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or "@" in parsed.netloc
+            or ":" in parsed.netloc
+        ):
+            return None
+    return PARQUET_RANGE_SOURCE_ACCESS_NATIVE_S3
 
 
 class _ParquetFragment:
@@ -398,6 +444,10 @@ class ParquetDatasource(Datasource):
         super().__init__()
         _check_pyarrow_version()
 
+        parquet_range_source_access = _parquet_range_source_access_marker(
+            paths, filesystem
+        )
+
         supports_distributed_reads = not _is_local_scheme(paths)
         if not supports_distributed_reads and ray.util.client.ray.is_connected():
             raise ValueError(
@@ -536,6 +586,7 @@ class ParquetDatasource(Datasource):
             shuffle=shuffle,
             include_paths=include_paths,
             include_row_hash=include_row_hash,
+            parquet_range_source_access=parquet_range_source_access,
         )
 
     def _init_state(
@@ -559,6 +610,7 @@ class ParquetDatasource(Datasource):
         shuffle: Union["FileShuffleConfig", Literal["files"], None],
         include_paths: bool,
         include_row_hash: bool = False,
+        parquet_range_source_access: Optional[str] = None,
     ):
         """Shared initialization for all instance state and sampling estimates.
 
@@ -592,6 +644,7 @@ class ParquetDatasource(Datasource):
         self._file_metadata_shuffler = None
         self._include_paths = include_paths
         self._include_row_hash = include_row_hash
+        self._parquet_range_source_access = parquet_range_source_access
         self._partitioning = partitioning
         _validate_shuffle_arg(shuffle)
         self._shuffle = shuffle

@@ -1,4 +1,4 @@
-"""V1 local-Parquet adapter for the source-neutral range planner.
+"""V1 Parquet adapter for the source-neutral range planner.
 
 This module only adapts state already owned by ``ParquetDatasource``.  It never
 resolves, expands, or relists input paths.  PyArrow and filesystem-specific
@@ -19,6 +19,14 @@ from ray.data._internal.datasource.parquet_range import (
     ParquetColumnSize,
     ParquetRangePlanningError,
     ParquetRowGroupMetadata,
+)
+from ray.data._internal.datasource.parquet_range_s3 import (
+    S3ObjectLocation,
+    S3SourceIdentity,
+    S3SourceIdentityError,
+    _create_ambient_s3_filesystem,
+    capture_s3_source_identity,
+    parse_s3_uri,
 )
 
 
@@ -165,14 +173,14 @@ def verify_posix_source_identity(path: Any, expected: str) -> bool:
     return True
 
 
-def _capture_for_planning(path: Any) -> PosixSourceIdentity:
+def _capture_posix_for_planning(path: Any) -> PosixSourceIdentity:
     try:
         return _stat_posix_source(path)
     except ParquetSourceIdentityError as exc:
         raise _planning_error(str(exc), exc.reason_code) from exc
 
 
-def _validate_local_v1_state(datasource: Any) -> Tuple[Any, ...]:
+def _validate_v1_state(datasource: Any) -> Tuple[Tuple[Any, ...], str]:
     try:
         fragments = tuple(datasource._pq_fragments)
         filesystem = datasource._filesystem
@@ -184,9 +192,21 @@ def _validate_local_v1_state(datasource: Any) -> Tuple[Any, ...]:
 
     import pyarrow.fs as pa_fs
 
-    if not isinstance(filesystem, pa_fs.LocalFileSystem):
+    if type(filesystem) is pa_fs.LocalFileSystem:
+        source_kind = "posix"
+    elif type(filesystem) is pa_fs.S3FileSystem:
+        if (
+            getattr(datasource, "_parquet_range_source_access", None)
+            != "native_s3_default"
+        ):
+            raise _planning_error(
+                "Native S3 range planning requires a verified ambient-IAM source.",
+                "s3_source_access_unverified",
+            )
+        source_kind = "s3"
+    else:
         raise _planning_error(
-            "Metadata range planning currently requires a local POSIX filesystem.",
+            "Metadata range planning requires local POSIX or verified native S3.",
             "unsupported_filesystem",
         )
     if not fragments:
@@ -209,7 +229,53 @@ def _validate_local_v1_state(datasource: Any) -> Tuple[Any, ...]:
                 "ParquetDatasource paths and fragments are out of sync.",
                 "fragment_state_mismatch",
             )
-    return fragments
+    return fragments, source_kind
+
+
+def _as_s3_uri(path: Any) -> str:
+    if (
+        not isinstance(path, str)
+        or not path
+        or "://" in path
+        or path.startswith("/")
+    ):
+        raise S3SourceIdentityError(
+            "A resolved S3 fragment path must be a protocol-free bucket/key.",
+            reason_code="invalid_source_path",
+        )
+    bucket, separator, key = path.partition("/")
+    if (
+        not separator
+        or not bucket
+        or not key
+        or bucket in (".", "..")
+        or ":" in bucket
+        or "@" in bucket
+        or any(char.isspace() for char in bucket)
+    ):
+        raise S3SourceIdentityError(
+            "A resolved S3 fragment path must be a protocol-free bucket/key.",
+            reason_code="invalid_source_path",
+        )
+    try:
+        # PyArrow fragment paths are already decoded.  Quote from their
+        # bucket/key components instead of reparsing the raw path, which would
+        # otherwise turn a literal "%20" in an object key into a space.
+        location = S3ObjectLocation(bucket=bucket.lower(), key=key)
+        return parse_s3_uri(location.uri).uri
+    except S3SourceIdentityError as exc:
+        raise S3SourceIdentityError(
+            "A resolved S3 fragment path must be a protocol-free bucket/key.",
+            reason_code="invalid_source_path",
+        ) from exc
+
+
+def _capture_s3_for_planning(path: str, filesystem: Any) -> S3SourceIdentity:
+    try:
+        encoded = capture_s3_source_identity(path, filesystem=filesystem)
+        return S3SourceIdentity.decode(encoded)
+    except S3SourceIdentityError as exc:
+        raise _planning_error(str(exc), exc.reason_code) from exc
 
 
 def _normalize_key(key: str) -> str:
@@ -430,7 +496,7 @@ def _extract_v1_metadata(
     key: str,
     projection: Optional[Sequence[str]],
 ) -> Tuple[Tuple[ParquetRowGroupMetadata, ...], Optional[Tuple[str, ...]]]:
-    fragments = _validate_local_v1_state(datasource)
+    fragments, source_kind = _validate_v1_state(datasource)
     key = _normalize_key(key)
     normalized_projection = _normalize_projection(
         datasource, projection, key=key
@@ -439,6 +505,12 @@ def _extract_v1_metadata(
     entries = []
     seen_paths = set()
     expected_paths = getattr(datasource, "_pq_paths", None)
+    try:
+        s3_filesystem = (
+            _create_ambient_s3_filesystem() if source_kind == "s3" else None
+        )
+    except S3SourceIdentityError as exc:
+        raise _planning_error(str(exc), exc.reason_code) from exc
     for fragment_index, wrapped_fragment in enumerate(fragments):
         try:
             fragment = wrapped_fragment.original
@@ -449,15 +521,24 @@ def _extract_v1_metadata(
                 "ParquetDatasource contains an invalid fragment wrapper.",
                 "invalid_fragment_state",
             ) from exc
-        try:
-            path = _as_posix_path(path)
-        except ParquetSourceIdentityError as exc:
-            raise _planning_error(str(exc), exc.reason_code) from exc
-        if expected_paths is not None and path != expected_paths[fragment_index]:
+        raw_path = path
+        if expected_paths is not None and raw_path != expected_paths[fragment_index]:
             raise _planning_error(
                 "ParquetDatasource paths and fragments are out of sync.",
                 "fragment_state_mismatch",
             )
+        if source_kind == "posix":
+            try:
+                path = _as_posix_path(raw_path)
+            except ParquetSourceIdentityError as exc:
+                raise _planning_error(str(exc), exc.reason_code) from exc
+            identity_before = _capture_posix_for_planning(path)
+        else:
+            try:
+                path = _as_s3_uri(raw_path)
+            except S3SourceIdentityError as exc:
+                raise _planning_error(str(exc), exc.reason_code) from exc
+            identity_before = _capture_s3_for_planning(path, s3_filesystem)
         if path in seen_paths:
             raise _planning_error(
                 f"Duplicate resolved fragment for {path!r}.",
@@ -465,13 +546,12 @@ def _extract_v1_metadata(
             )
         seen_paths.add(path)
 
-        identity_before = _capture_for_planning(path)
         if (
             isinstance(listed_size, numbers.Integral)
             and int(listed_size) != identity_before.size
         ):
             raise _planning_error(
-                f"Local Parquet source {path!r} changed after V1 discovery.",
+                f"Parquet source {path!r} changed after V1 discovery.",
                 "source_changed",
             )
         try:
@@ -482,10 +562,14 @@ def _extract_v1_metadata(
                 "footer_read_failed",
             ) from exc
 
-        identity_after = _capture_for_planning(path)
+        identity_after = (
+            _capture_posix_for_planning(path)
+            if source_kind == "posix"
+            else _capture_s3_for_planning(path, s3_filesystem)
+        )
         if identity_after != identity_before:
             raise _planning_error(
-                f"Local Parquet source {path!r} changed while reading metadata.",
+                f"Parquet source {path!r} changed while reading metadata.",
                 "source_changed_during_planning",
             )
 
