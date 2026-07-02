@@ -177,6 +177,37 @@ def sorted_parquet_path(tmp_path):
 
 
 @pytest.fixture
+def balanced_four_range_parquet_path(tmp_path):
+    path = tmp_path / "balanced-four-ranges.parquet"
+    table = pa.table(
+        {
+            "User": pa.array([0, 0, 30, 30, 60, 60, 90, 90], type=pa.int64()),
+            "Card": pa.array([10, 10, 11, 11, 20, 20, 21, 21], type=pa.int64()),
+            "Amount": pa.array(range(1, 9), type=pa.int32()),
+        }
+    )
+    pq.write_table(
+        table,
+        path,
+        row_group_size=2,
+        write_statistics=True,
+        compression="NONE",
+    )
+
+    metadata = pq.ParquetFile(path).metadata
+    assert metadata.num_row_groups == 4
+    user_index = table.schema.get_field_index("User")
+    assert [
+        (
+            metadata.row_group(index).column(user_index).statistics.min,
+            metadata.row_group(index).column(user_index).statistics.max,
+        )
+        for index in range(4)
+    ] == [(0, 0), (30, 30), (60, 60), (90, 90)]
+    yield path
+
+
+@pytest.fixture
 def gpu_assignment_collector(ray_with_two_gpus):
     collector = ray.remote(_GpuAssignmentCollector).remote()
     try:
@@ -194,11 +225,13 @@ def _run_natural_pipeline(
     range_backend_enabled,
     partition_execution_enabled=False,
     group_zero_copy_batch=False,
+    num_partitions=2,
+    worker_concurrency=2,
 ):
     context = DataContext.get_current()
     context.use_datasource_v2 = False
     context.shuffle_strategy = shuffle_strategy
-    context.gpu_shuffle_num_actors = 2
+    context.gpu_shuffle_num_actors = worker_concurrency
     context.set_config(_RANGE_BACKEND_CONFIG, range_backend_enabled)
     context.set_config(
         "map_groups_partition_execution_enabled", partition_execution_enabled
@@ -219,17 +252,17 @@ def _run_natural_pipeline(
                 "constructor_offset": 5,
                 "constructor_tag": "constructor-args-observed",
             },
-            compute=ActorPoolStrategy(size=2),
+            compute=ActorPoolStrategy(size=worker_concurrency),
             num_gpus=1,
             udf_modifying_row_count=False,
         )
-        .groupby(_GROUP_KEYS, num_partitions=2)
+        .groupby(_GROUP_KEYS, num_partitions=num_partitions)
         .map_groups(
             _summarize_group,
             batch_format="cudf",
             zero_copy_batch=group_zero_copy_batch,
             fn_kwargs={"summary_offset": 11},
-            compute=TaskPoolStrategy(size=2),
+            compute=TaskPoolStrategy(size=worker_concurrency),
             num_gpus=1,
         )
         .materialize()
@@ -247,12 +280,12 @@ def _plan_stats(dataset):
     return dataset.stats()
 
 
-def _assert_expected_groups(frame):
+def _assert_expected_groups(frame, users=(0, 1, 100, 101)):
     assert len(frame) == 4
     assert frame[_GROUP_KEYS].drop_duplicates().shape[0] == 4
     expected = pd.DataFrame(
         {
-            "User": np.array([0, 1, 100, 101], dtype=np.int64),
+            "User": np.array(users, dtype=np.int64),
             "Card": np.array([10, 11, 20, 21], dtype=np.int64),
             "Rows": np.array([2, 2, 2, 2], dtype=np.int64),
             # Token = ((Amount * 3 + 5) * 2 + 7); add 11 per group.
@@ -370,6 +403,70 @@ def test_natural_api_uses_partition_equivalent_group_udf_once_per_range(
     assert sum(worker["groups_invoked"] for worker in workers) == 4
     assert sum(worker["group_udf_invocations"] for worker in workers) == 0
     assert sum(worker["partition_udf_invocations"] for worker in workers) == 2
+
+
+def test_partition_execution_reuses_fixed_gpu_actors_across_ranges(
+    ray_with_two_gpus,
+    restore_data_context,
+    balanced_four_range_parquet_path,
+    gpu_assignment_collector,
+):
+    common = {
+        "path": balanced_four_range_parquet_path,
+        "collector": gpu_assignment_collector,
+        "shuffle_strategy": ShuffleStrategy.HASH_SHUFFLE,
+        "partition_execution_enabled": True,
+        "group_zero_copy_batch": True,
+        "num_partitions": 4,
+        "worker_concurrency": 2,
+    }
+    hash_output = _run_natural_pipeline(
+        **common,
+        run_label="steady-state-hash",
+        range_backend_enabled=False,
+    )
+    fast_output = _run_natural_pipeline(
+        **common,
+        run_label="steady-state-range",
+        range_backend_enabled=True,
+    )
+
+    hash_frame = _logical_output(hash_output)
+    fast_frame = _logical_output(fast_output)
+    pd.testing.assert_frame_equal(hash_frame, fast_frame, check_dtype=True)
+    _assert_expected_groups(fast_frame, users=(0, 30, 60, 90))
+
+    hash_stats = _plan_stats(hash_output)
+    fast_stats = _plan_stats(fast_output)
+    assert "HashShuffle" in hash_stats, hash_stats
+    assert "ParquetRangeMapGroups" in fast_stats, fast_stats
+    assert "Shuffle" not in fast_stats, fast_stats
+
+    metrics = fast_output.get_stats_summary().extra_metrics
+    plan_metrics = metrics["parquet_range_map_groups_plan"]
+    assert plan_metrics["group_execution_mode"] == "partition_v1"
+    assert plan_metrics["execution_backend"] == "actor_pool"
+    assert plan_metrics["num_partitions"] == 4
+    assert plan_metrics["worker_concurrency"] == 2
+    assert plan_metrics["actor_reuse_enabled"] is True
+    assert plan_metrics["max_ranges_per_worker"] == 2
+
+    workers = metrics["parquet_range_map_groups_workers"]
+    assert len(workers) == 4
+    assert sum(worker["groups_invoked"] for worker in workers) == 4
+    assert sum(worker["partition_udf_invocations"] for worker in workers) == 4
+    first_ranges = [worker for worker in workers if worker["worker_range_index"] == 0]
+    reused_ranges = [worker for worker in workers if worker["worker_range_index"] > 0]
+    assert len(first_ranges) == 2
+    assert len(reused_ranges) == 2
+    assert all(not worker["worker_initialization_reused"] for worker in first_ranges)
+    assert all(worker["worker_initialization_reused"] for worker in reused_ranges)
+    assert any(worker["worker_range_index"] == 1 for worker in reused_ranges)
+    assert all(worker["worker_init_time_s"] > 0 for worker in first_ranges)
+    assert all(worker["worker_init_time_s"] == 0 for worker in reused_ranges)
+    assert all(worker["rmm_init_time_s"] == 0 for worker in reused_ranges)
+    assert all(worker["tokenizer_init_time_s"] == 0 for worker in reused_ranges)
+    assert all(worker["group_init_time_s"] == 0 for worker in reused_ranges)
 
 
 def test_group_boundaries_keep_float_nan_keys_together(ray_with_two_gpus, tmp_path):
