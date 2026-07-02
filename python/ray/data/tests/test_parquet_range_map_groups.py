@@ -7,17 +7,23 @@ import pyarrow as pa
 import pytest
 
 import ray.cloudpickle as ray_pickle
+from ray.data.context import DataContext
 from ray.data._internal.datasource.parquet_range import (
     ParquetRowGroupMetadata,
     plan_parquet_row_groups,
 )
+from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.planner.map_groups_partition_protocol import (
+    MapGroupsPartitionContract,
     MapGroupsPartitionContext,
 )
 from ray.data._internal.planner.parquet_range_map_groups import (
+    ParquetRangeMapGroupsActorPoolMapOperator,
     ParquetRangeMapGroupsStats,
+    ParquetRangeMapGroupsTaskPoolMapOperator,
     ParquetRangeMapGroupsWork,
     _default_rmm_pool_initial_bytes,
+    _initialization_timings_for_worker_range,
     _iter_exact_cudf_batches,
     _iter_group_outputs,
     _iter_partition_outputs,
@@ -26,6 +32,8 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _is_sorted_by_group_keys,
     _make_work,
     _resolve_rmm_pool_config,
+    _resolve_worker_concurrency,
+    _select_execution_backend,
     _validate_group_keys,
     _work_descriptor_metadata,
     build_parquet_range_map_groups_operator,
@@ -66,6 +74,36 @@ def _source_schema():
     )
 
 
+def _identity_batch(batch):
+    return batch
+
+
+def _identity_partition(batch, _context):
+    return batch
+
+
+def _builder_udf_ops(num_partitions):
+    common = {
+        "fn": _identity_batch,
+        "fn_args": (),
+        "fn_kwargs": {},
+        "fn_constructor_args": (),
+        "fn_constructor_kwargs": {},
+        "compute": None,
+        "zero_copy_batch": True,
+    }
+    tokenizer_op = SimpleNamespace(**common, batch_size=10)
+    map_groups_op = SimpleNamespace(**common, num_partitions=num_partitions)
+    return tokenizer_op, map_groups_op
+
+
+def _builder_layout(num_partitions):
+    return plan_parquet_row_groups(
+        [_row_group("data.parquet", 0, 0, num_partitions * 2 - 1, rows=100)],
+        num_partitions=num_partitions,
+    )
+
+
 def _stats(partition_id=0):
     return ParquetRangeMapGroupsStats(
         partition_id=partition_id,
@@ -94,6 +132,235 @@ def _stats(partition_id=0):
 def test_partition_execution_uses_a_smaller_startup_pool_by_default():
     assert _default_rmm_pool_initial_bytes(None) == 8 * 1024**3
     assert _default_rmm_pool_initial_bytes(object()) == 1 * 1024**3
+
+
+@pytest.mark.parametrize(
+    (
+        "has_partition_contract",
+        "num_ranges",
+        "worker_concurrency",
+        "expected",
+    ),
+    [
+        (True, 4, None, ("task_pool", 4, False)),
+        (True, 4, 4, ("task_pool", 4, False)),
+        (True, 8, 4, ("actor_pool", 4, True)),
+        # Don't create idle workers if the configured pool exceeds the range count.
+        (True, 4, 8, ("task_pool", 4, False)),
+        # Per-group execution uses the same bounded actor pool and serial reuse.
+        (False, 8, 4, ("actor_pool", 4, True)),
+    ],
+)
+def test_select_execution_backend(
+    has_partition_contract,
+    num_ranges,
+    worker_concurrency,
+    expected,
+):
+    assert (
+        _select_execution_backend(
+            has_partition_contract=has_partition_contract,
+            num_ranges=num_ranges,
+            worker_concurrency=worker_concurrency,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("worker_concurrency", [True, False, 0, -1, 1.5, "4"])
+def test_resolve_worker_concurrency_rejects_invalid_values(worker_concurrency):
+    with pytest.raises(ValueError, match="worker_concurrency must be a positive"):
+        _resolve_worker_concurrency(worker_concurrency, num_ranges=4)
+
+
+def test_resolve_worker_concurrency_requires_a_nonempty_plan():
+    with pytest.raises(ValueError, match="at least one range"):
+        _resolve_worker_concurrency(1, num_ranges=0)
+
+
+def test_initialization_timings_are_only_charged_to_first_worker_range():
+    timings = {"total": 1.5, "rmm": 1.0, "tokenizer": 0.5}
+
+    assert _initialization_timings_for_worker_range(timings, 0) is timings
+    assert _initialization_timings_for_worker_range(timings, 1) is None
+    assert _initialization_timings_for_worker_range(timings, 10) is None
+    with pytest.raises(ValueError, match="worker_range_index must be nonnegative"):
+        _initialization_timings_for_worker_range(timings, -1)
+
+
+def test_builder_uses_fixed_actor_pool_for_oversubscribed_partition_ranges():
+    layout = _builder_layout(num_partitions=4)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=4)
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        partition_contract=MapGroupsPartitionContract(
+            udf=_identity_partition,
+            batch_format="cudf",
+        ),
+        data_context=DataContext.get_current(),
+        ray_remote_args={"num_gpus": 1},
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=2,
+    )
+
+    assert isinstance(op, ParquetRangeMapGroupsActorPoolMapOperator)
+    assert op._actor_pool.min_size() == 2
+    assert op._actor_pool.max_size() == 2
+    assert op._actor_pool.max_tasks_in_flight_per_actor() == 1
+    assert op._ray_remote_args["max_restarts"] == 0
+    assert op._ray_remote_args["max_task_retries"] == 0
+    assert op._parquet_range_plan_metrics["execution_backend"] == "actor_pool"
+    assert op._parquet_range_plan_metrics["worker_concurrency"] == 2
+    assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is True
+    assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 2
+
+
+def test_builder_bounds_ordinary_actor_pool_and_reuses_workers():
+    layout = _builder_layout(num_partitions=8)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=8)
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        data_context=DataContext.get_current(),
+        ray_remote_args={"num_gpus": 1},
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=4,
+    )
+
+    assert isinstance(op, ParquetRangeMapGroupsActorPoolMapOperator)
+    assert op._actor_pool.min_size() == 4
+    assert op._actor_pool.max_size() == 4
+    assert op._actor_pool.max_tasks_in_flight_per_actor() == 1
+    assert op._ray_remote_args["max_restarts"] == 0
+    assert op._ray_remote_args["max_task_retries"] == 0
+    assert op._parquet_range_plan_metrics["group_execution_mode"] == "per_group"
+    assert op._parquet_range_plan_metrics["worker_concurrency"] == 4
+    assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is True
+    assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 2
+
+
+def test_builder_keeps_task_pool_for_one_partition_range_per_worker():
+    layout = _builder_layout(num_partitions=4)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=4)
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        partition_contract=MapGroupsPartitionContract(
+            udf=_identity_partition,
+            batch_format="cudf",
+        ),
+        data_context=DataContext.get_current(),
+        ray_remote_args={"num_gpus": 1},
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=4,
+    )
+
+    assert isinstance(op, ParquetRangeMapGroupsTaskPoolMapOperator)
+    assert op._max_concurrency == 4
+    assert op._ray_remote_args["max_retries"] == 0
+    assert op._parquet_range_plan_metrics["execution_backend"] == "task_pool"
+    assert op._parquet_range_plan_metrics["worker_concurrency"] == 4
+    assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is False
+    assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 1
+
+
+def test_reusable_actor_transform_initializes_once_and_charges_first_range(
+    monkeypatch,
+):
+    import ray.data._internal.planner.parquet_range_map_groups as backend
+
+    layout = _builder_layout(num_partitions=2)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=2)
+    configured_pools = []
+    range_calls = []
+
+    def configure_pool(**kwargs):
+        state = SimpleNamespace(config=kwargs)
+        configured_pools.append(state)
+        return state
+
+    def execute_range(work, **kwargs):
+        range_calls.append((work.partition_id, kwargs))
+        if False:
+            yield None
+        return _stats(work.partition_id)
+
+    monkeypatch.setattr(backend, "_configure_rmm_pool", configure_pool)
+    monkeypatch.setattr(backend, "_execute_range", execute_range)
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        partition_contract=MapGroupsPartitionContract(
+            udf=_identity_partition,
+            batch_format="cudf",
+        ),
+        data_context=DataContext.get_current(),
+        ray_remote_args={"num_gpus": 1},
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=1,
+    )
+    assert isinstance(op, ParquetRangeMapGroupsActorPoolMapOperator)
+
+    transformer = op._map_transformer
+    transformer.init()
+    works = _make_work(
+        layout,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=_source_schema(),
+    )
+    reported_stats = []
+    for task_index, work in enumerate(works):
+        assert (
+            list(
+                transformer.apply_transform(
+                    iter([work]),
+                    TaskContext(task_idx=task_index, op_name="range"),
+                    reported_stats.append,
+                )
+            )
+            == []
+        )
+
+    assert len(configured_pools) == 1
+    assert [partition_id for partition_id, _ in range_calls] == [0, 1]
+    first_kwargs = range_calls[0][1]
+    second_kwargs = range_calls[1][1]
+    assert first_kwargs["worker_range_index"] == 0
+    assert first_kwargs["initialization_timings"]["total"] >= 0
+    assert second_kwargs["worker_range_index"] == 1
+    assert second_kwargs["initialization_timings"] is None
+    assert [stats.partition_id for stats in reported_stats] == [0, 1]
 
 
 def test_rmm_pool_config_respects_budget_reserve_and_alignment():
@@ -685,7 +952,7 @@ def test_make_work_preserves_range_and_fragment_shape_including_empty_ranges():
     assert all(work.source_schema is schema for work in works)
 
 
-def test_builder_rejects_layout_that_cannot_shape_one_work_per_actor():
+def test_builder_rejects_layout_that_cannot_shape_one_work_per_partition():
     layout = plan_parquet_row_groups(
         [_row_group("data.parquet", 0, 0, 1)],
         num_partitions=4,
@@ -694,7 +961,7 @@ def test_builder_rejects_layout_that_cannot_shape_one_work_per_actor():
 
     with pytest.raises(
         ValueError,
-        match="exactly one range per requested actor",
+        match="exactly one range per requested partition",
     ):
         build_parquet_range_map_groups_operator(
             layout=layout,

@@ -346,6 +346,7 @@ def try_plan_parquet_range_map_groups(
             source_schema=candidate.datasource._file_schema,
             tokenizer_op=candidate.tokenizer_op,
             map_groups_op=candidate.map_groups_op,
+            worker_concurrency=candidate.worker_concurrency,
             partition_contract=candidate.partition_contract,
             partition_contract_fallback_reason=(
                 candidate.partition_contract_fallback_reason

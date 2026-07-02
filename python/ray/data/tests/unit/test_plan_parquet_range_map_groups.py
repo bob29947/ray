@@ -72,6 +72,7 @@ def _happy_state(monkeypatch):
         partition_key="User",
         group_keys=("User", "Card"),
         num_partitions=2,
+        worker_concurrency=2,
         projection=("User", "Card", "payload"),
         compute=SimpleNamespace(),
         ray_remote_args={
@@ -160,6 +161,7 @@ def test_selected_plan_builds_once_and_merges_local_label_selector(monkeypatch):
     state.builder.assert_called_once()
     builder_args = state.builder.call_args.kwargs
     assert builder_args["layout"] is state.layout
+    assert builder_args["worker_concurrency"] == 2
     assert builder_args["ray_remote_args"] == {
         "num_cpus": 1,
         "num_gpus": 1,

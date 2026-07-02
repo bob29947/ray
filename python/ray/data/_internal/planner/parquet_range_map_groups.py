@@ -115,6 +115,8 @@ class ParquetRangeMapGroupsStats(CustomOpStats):
     execution_setup_time_s: float = 0.0
     range_elapsed_time_s: float = 0.0
     range_unaccounted_time_s: float = 0.0
+    worker_range_index: int = 0
+    worker_initialization_reused: bool = False
 
 
 @dataclass(frozen=True)
@@ -516,6 +518,7 @@ def _execute_range(
     target_max_block_size: int,
     rmm_pool_state: _RmmPoolState,
     initialization_timings: Optional[Dict[str, float]] = None,
+    worker_range_index: int = 0,
 ) -> Generator[Block, None, ParquetRangeMapGroupsStats]:
     """Execute one range with per-group or explicitly equivalent partition code."""
 
@@ -708,6 +711,8 @@ def _execute_range(
         execution_setup_time_s=execution_setup_time_s,
         range_elapsed_time_s=range_elapsed_time_s,
         range_unaccounted_time_s=max(0.0, range_elapsed_time_s - accounted_time_s),
+        worker_range_index=worker_range_index,
+        worker_initialization_reused=worker_range_index > 0,
     )
     return stats
 
@@ -749,7 +754,7 @@ class _ParquetRangeMapGroupsMetricsMixin:
 class ParquetRangeMapGroupsActorPoolMapOperator(
     _ParquetRangeMapGroupsMetricsMixin, ActorPoolMapOperator
 ):
-    """Fixed actor pool used for the ordinary per-group compatibility path."""
+    """Fixed GPU actors for per-group execution or reusable partition workers."""
 
     def __init__(
         self,
@@ -763,7 +768,8 @@ class ParquetRangeMapGroupsActorPoolMapOperator(
     def start(self, options: ExecutionOptions) -> None:
         super().start(options)
         # All actors must be live before the first range is dispatched. With one
-        # in-flight task per actor, this guarantees a distinct actor/GPU per range.
+        # in-flight task per actor, concurrent ranges use distinct actors/GPUs;
+        # an oversubscribed plan later reuses each initialized actor serially.
         pending = self._actor_pool.get_pending_actor_refs()
         if pending:
             ray.get(pending, timeout=self._actor_start_timeout_s)
@@ -773,6 +779,62 @@ class ParquetRangeMapGroupsTaskPoolMapOperator(
     _ParquetRangeMapGroupsMetricsMixin, TaskPoolMapOperator
 ):
     """Task-backed execution for an explicitly side-effect-free partition UDF."""
+
+
+def _resolve_worker_concurrency(
+    worker_concurrency: Optional[int], num_ranges: int
+) -> int:
+    """Return the bounded number of GPU workers for a non-empty range plan."""
+
+    if num_ranges <= 0:
+        raise ValueError("A Parquet range plan must contain at least one range.")
+    if worker_concurrency is None:
+        return num_ranges
+    if (
+        isinstance(worker_concurrency, bool)
+        or not isinstance(worker_concurrency, int)
+        or worker_concurrency <= 0
+    ):
+        raise ValueError("worker_concurrency must be a positive integer")
+    return min(worker_concurrency, num_ranges)
+
+
+def _select_execution_backend(
+    *,
+    has_partition_contract: bool,
+    num_ranges: int,
+    worker_concurrency: Optional[int],
+) -> Tuple[str, int, bool]:
+    """Choose the physical worker pool without changing UDF semantics.
+
+    A one-range-per-worker partition plan keeps the lower-latency task backend.
+    When there are more independent ranges than GPU workers, fixed actors safely
+    amortize CUDA, RMM, and callable initialization across serial range tasks.
+    The ordinary per-group compatibility path always uses actors, but observes the
+    same fixed worker limit and reuses initialized actors when ranges outnumber
+    workers.
+    """
+
+    resolved_concurrency = _resolve_worker_concurrency(
+        worker_concurrency, num_ranges
+    )
+    if has_partition_contract and num_ranges <= resolved_concurrency:
+        return "task_pool", resolved_concurrency, False
+    return (
+        "actor_pool",
+        resolved_concurrency,
+        num_ranges > resolved_concurrency,
+    )
+
+
+def _initialization_timings_for_worker_range(
+    initialization_timings: Dict[str, float], worker_range_index: int
+) -> Optional[Dict[str, float]]:
+    """Charge process initialization only to the first range on a worker."""
+
+    if worker_range_index < 0:
+        raise ValueError("worker_range_index must be nonnegative")
+    return initialization_timings if worker_range_index == 0 else None
 
 
 def _make_work(
@@ -834,6 +896,7 @@ def build_parquet_range_map_groups_operator(
     ray_remote_args: Dict[str, Any],
     estimated_peak_gpu_memory_bytes: int = 0,
     gpu_memory_budget_bytes: int = 0,
+    worker_concurrency: Optional[int] = None,
 ) -> PhysicalOperator:
     """Build the shuffle-free fixed-GPU physical operator for a validated plan."""
 
@@ -846,8 +909,15 @@ def build_parquet_range_map_groups_operator(
     )
     if len(works) != map_groups_op.num_partitions:
         raise ValueError(
-            "The range layout must contain exactly one range per requested actor."
+            "The range layout must contain exactly one range per requested partition."
         )
+    execution_backend, resolved_worker_concurrency, actor_reuse_enabled = (
+        _select_execution_backend(
+            has_partition_contract=partition_contract is not None,
+            num_ranges=len(works),
+            worker_concurrency=worker_concurrency,
+        )
+    )
 
     def input_data_factory(_: int) -> List[RefBundle]:
         bundles = []
@@ -932,6 +1002,7 @@ def build_parquet_range_map_groups_operator(
     # transformer. The init hook populates it before execute can run.
     allocator_state: Dict[str, _RmmPoolState] = {}
     initialization_timings: Dict[str, float] = {}
+    execution_state = {"ranges_processed": 0}
 
     def init_fn() -> None:
         total_started = time.perf_counter()
@@ -968,6 +1039,7 @@ def build_parquet_range_map_groups_operator(
             init_fn()
             rmm_pool_state = allocator_state["rmm"]
         for work in blocks:
+            worker_range_index = execution_state["ranges_processed"]
             range_outputs = _execute_range(
                 work,
                 tokenizer_fn=tokenizer_fn,
@@ -978,7 +1050,10 @@ def build_parquet_range_map_groups_operator(
                 group_zero_copy_batch=group_zero_copy_batch,
                 target_max_block_size=target_max_block_size,
                 rmm_pool_state=rmm_pool_state,
-                initialization_timings=initialization_timings,
+                initialization_timings=_initialization_timings_for_worker_range(
+                    initialization_timings, worker_range_index
+                ),
+                worker_range_index=worker_range_index,
             )
             # Keep one block behind so completed worker metrics are attached to
             # its metadata. Earlier bounded blocks can flow to the writer while
@@ -993,6 +1068,7 @@ def build_parquet_range_map_groups_operator(
                 if pending_block is not None:
                     yield pending_block
                 pending_block = output_block
+            execution_state["ranges_processed"] = worker_range_index + 1
             report_custom_op_stats(stats)
             if pending_block is not None:
                 yield pending_block
@@ -1040,8 +1116,13 @@ def build_parquet_range_map_groups_operator(
             "partition_v1" if partition_contract is not None else "per_group"
         ),
         "group_partition_fallback_reason": partition_contract_fallback_reason,
-        "execution_backend": (
-            "task_pool" if partition_contract is not None else "actor_pool"
+        "execution_backend": execution_backend,
+        "worker_concurrency": resolved_worker_concurrency,
+        "actor_reuse_enabled": actor_reuse_enabled,
+        "max_ranges_per_worker": (
+            math.ceil(len(works) / resolved_worker_concurrency)
+            if actor_reuse_enabled
+            else 1
         ),
         "ranges": tuple(
             {
@@ -1060,7 +1141,7 @@ def build_parquet_range_map_groups_operator(
         f"amplification={metrics.scan_amplification:.3f}, "
         f"skew={metrics.load_skew:.3f})"
     )
-    if partition_contract is not None:
+    if execution_backend == "task_pool":
         task_args = dict(ray_remote_args)
         task_args["max_retries"] = 0
         return ParquetRangeMapGroupsTaskPoolMapOperator(
@@ -1075,7 +1156,7 @@ def build_parquet_range_map_groups_operator(
         )
 
     compute = ActorPoolStrategy(
-        size=len(works),
+        size=resolved_worker_concurrency,
         max_tasks_in_flight_per_actor=1,
         enable_true_multi_threading=False,
     )

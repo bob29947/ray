@@ -126,6 +126,7 @@ def test_selects_exact_natural_gpu_pipeline_without_io():
     assert candidate.partition_key == "User"
     assert candidate.group_keys == ("User", "Card")
     assert candidate.num_partitions == 2
+    assert candidate.worker_concurrency == 2
     assert candidate.projection == ("User", "Card", "payload")
     assert candidate.compute is candidate.tokenizer_op.compute
     assert candidate.ray_remote_args == {"num_cpus": 1, "num_gpus": 1}
@@ -273,7 +274,7 @@ def test_partition_preservation_protocol_is_strict(value, reason):
         ),
         (
             {"compute": TaskPoolStrategy(size=1)},
-            "group_task_pool_size_mismatch",
+            "tokenizer_group_pool_size_mismatch",
         ),
         ({"ray_remote_args": {"num_gpus": 0}}, "group_gpu_resource_not_one"),
     ],
@@ -328,7 +329,7 @@ def test_map_groups_allows_sync_generator_function():
         ),
         (
             {"compute": ActorPoolStrategy(size=1)},
-            "tokenizer_actor_pool_size_mismatch",
+            "tokenizer_group_pool_size_mismatch",
         ),
         (
             {
@@ -356,6 +357,33 @@ def test_tokenizer_gates_have_stable_reasons(changes, reason):
     op = _replace_tokenizer(op, **changes)
 
     assert _select(op, context).fallback_reason == reason
+
+
+def test_worker_concurrency_can_be_less_than_num_partitions():
+    op, context = _candidate_plan(
+        num_partitions=4,
+        tokenizer_compute=ActorPoolStrategy(size=2),
+        group_compute=TaskPoolStrategy(size=2),
+    )
+
+    result = _select(op, context)
+
+    assert result.selected
+    assert result.candidate.num_partitions == 4
+    assert result.candidate.worker_concurrency == 2
+
+
+def test_worker_concurrency_cannot_exceed_num_partitions():
+    op, context = _candidate_plan(
+        num_partitions=1,
+        tokenizer_compute=ActorPoolStrategy(size=2),
+        group_compute=TaskPoolStrategy(size=2),
+    )
+
+    assert (
+        _select(op, context).fallback_reason
+        == "worker_concurrency_exceeds_num_partitions"
+    )
 
 
 def test_tokenizer_rejects_async_callable_class_and_dynamic_resources():

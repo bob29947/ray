@@ -45,6 +45,7 @@ class ParquetRangeMapGroupsCandidate:
     partition_key: str
     group_keys: Tuple[str, ...]
     num_partitions: int
+    worker_concurrency: int
     projection: Tuple[str, ...]
     compute: ActorPoolStrategy
     ray_remote_args: Dict[str, Any]
@@ -342,8 +343,6 @@ def select_parquet_range_map_groups_candidate(
     tokenizer_pool_size = _fixed_actor_pool_size(tokenizer_op.compute)
     if tokenizer_pool_size is None:
         return _fallback("tokenizer_actor_pool_not_fixed")
-    if tokenizer_pool_size != num_partitions:
-        return _fallback("tokenizer_actor_pool_size_mismatch")
     if tokenizer_op.compute.enable_true_multi_threading or (
         tokenizer_op.compute.max_tasks_in_flight_per_actor not in (None, 1)
     ):
@@ -374,8 +373,11 @@ def select_parquet_range_map_groups_candidate(
     group_pool_size = _fixed_task_pool_size(map_groups_op.compute)
     if group_pool_size is None:
         return _fallback("group_task_pool_not_fixed")
-    if group_pool_size != num_partitions:
-        return _fallback("group_task_pool_size_mismatch")
+    if group_pool_size != tokenizer_pool_size:
+        return _fallback("tokenizer_group_pool_size_mismatch")
+    worker_concurrency = tokenizer_pool_size
+    if worker_concurrency > num_partitions:
+        return _fallback("worker_concurrency_exceeds_num_partitions")
     if not _uses_one_gpu(map_groups_op.ray_remote_args):
         return _fallback("group_gpu_resource_not_one")
 
@@ -418,6 +420,7 @@ def select_parquet_range_map_groups_candidate(
         partition_key=partition_key,
         group_keys=group_keys,
         num_partitions=num_partitions,
+        worker_concurrency=worker_concurrency,
         projection=projection,
         compute=tokenizer_op.compute,
         ray_remote_args=actor_args,
