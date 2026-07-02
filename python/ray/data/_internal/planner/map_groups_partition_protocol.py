@@ -64,12 +64,12 @@ def resolve_map_groups_partition_contract(
     ):
         return None, None
 
+    if not inspect.isfunction(fn):
+        return None, "group_partition_callable_unsupported"
     descriptor = getattr(fn, MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE, None)
     partition_udf = getattr(fn, MAP_GROUPS_PARTITION_UDF_ATTRIBUTE, None)
     if descriptor is None and partition_udf is None:
         return None, None
-    if not inspect.isfunction(fn):
-        return None, "group_partition_callable_unsupported"
     if type(descriptor) is not dict or set(descriptor) != {
         "version",
         "batch_format",

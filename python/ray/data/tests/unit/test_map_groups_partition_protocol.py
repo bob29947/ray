@@ -160,6 +160,26 @@ def test_partition_protocol_rejects_async_and_nonfunction_udfs():
     assert reason == "group_partition_callable_unsupported"
 
 
+def test_partition_protocol_does_not_inspect_nonfunction_callable_attributes():
+    class AttributeRaisingCallable:
+        def __getattribute__(self, name):
+            if name in {
+                MAP_GROUPS_PARTITION_PROTOCOL_ATTRIBUTE,
+                MAP_GROUPS_PARTITION_UDF_ATTRIBUTE,
+            }:
+                raise AssertionError("application attribute access during planning")
+            return super().__getattribute__(name)
+
+        def __call__(self, batch):
+            return batch
+
+    contract, reason = resolve_map_groups_partition_contract(
+        AttributeRaisingCallable(), _context(), batch_format="cudf"
+    )
+    assert contract is None
+    assert reason == "group_partition_callable_unsupported"
+
+
 def test_partition_protocol_validates_signature_and_zero_copy_before_execution():
     def incompatible(batch):
         return batch
