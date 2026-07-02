@@ -115,6 +115,11 @@ class ResourceManager:
         self._get_total_resources = get_total_resources
         self._global_limits = ExecutionResources.zero()
         self._global_limits_last_update_time = 0
+        # The V2 cluster-autoscaler coordinator returns an empty cached allocation
+        # until its first asynchronous response arrives. Don't cache that transient
+        # empty source value, or a short job can run at minimum liveness concurrency
+        # for the full global-limits cache interval.
+        self._global_limits_source_is_empty = True
         self._global_usage = ExecutionResources.zero()
         self._global_running_usage = ExecutionResources.zero()
         self._global_pending_usage = ExecutionResources.zero()
@@ -285,6 +290,7 @@ class ResourceManager:
         if (
             time.time() - self._global_limits_last_update_time
             < self.GLOBAL_LIMITS_UPDATE_INTERVAL_S
+            and not self._global_limits_source_is_empty
         ):
             return self._global_limits
 
@@ -292,6 +298,7 @@ class ResourceManager:
         default_limits = self._options.resource_limits
         exclude = self._options.exclude_resources
         total_resources = self._get_total_resources()
+        self._global_limits_source_is_empty = total_resources.is_zero()
         default_mem_fraction = self._object_store_memory_limit_fraction
         total_resources = total_resources.copy(
             object_store_memory=total_resources.object_store_memory
@@ -884,6 +891,11 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
 
         remaining_shared = remaining_shared.max(ExecutionResources.zero())
 
+        # Track shared allocations separately from each operator's reserved
+        # resources. We use this below to redistribute capacity without exceeding
+        # per-resource maximums.
+        shared_allocations: Dict[PhysicalOperator, ExecutionResources] = {}
+
         # Allocate the remaining shared resources to each operator.
         for i, op in enumerate(reversed(eligible_ops)):
             # By default, divide the remaining shared resources equally.
@@ -924,14 +936,28 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             )
 
             self._op_budgets[op] = self._op_budgets[op].add(op_shared)
+            shared_allocations[op] = op_shared
 
-        # Give any remaining shared resources to the most downstream uncapped op.
-        # This can happen when some ops have their shared allocation capped.
+        # Give each remaining resource to the most downstream operator with
+        # headroom for that resource. Resource maxima are intentionally
+        # per-dimension (for example, a CPU-only task pool has an infinite CPU
+        # maximum and a zero GPU maximum), so requiring the complete maximum to
+        # equal ``ExecutionResources.inf()`` strands otherwise usable capacity.
         if eligible_ops and not remaining_shared.is_zero():
             for op in reversed(eligible_ops):
                 _, max_resource_usage = op.min_max_resource_requirements()
-                if max_resource_usage == ExecutionResources.inf():
-                    self._op_budgets[op] = self._op_budgets[op].add(remaining_shared)
+                current_allocation = (
+                    self._get_total_reserved(op)
+                    .max(self._resource_manager.get_op_usage(op))
+                    .add(shared_allocations[op])
+                )
+                available_headroom = max_resource_usage.subtract(
+                    current_allocation
+                ).max(ExecutionResources.zero())
+                additional = remaining_shared.min(available_headroom)
+                self._op_budgets[op] = self._op_budgets[op].add(additional)
+                remaining_shared = remaining_shared.subtract(additional)
+                if remaining_shared.is_zero():
                     break
 
         # A materializing operator like `AllToAllOperator` waits for all its input

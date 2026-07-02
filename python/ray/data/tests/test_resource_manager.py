@@ -215,6 +215,43 @@ class TestResourceManager:
             assert resource_manager.get_global_limits() == expected_resource
             assert get_total_resources.call_count == 2
 
+    def test_global_limits_does_not_cache_empty_source(self):
+        get_total_resources = MagicMock(
+            side_effect=[
+                ExecutionResources.zero(),
+                ExecutionResources(cpu=4, gpu=1, object_store_memory=1000),
+            ]
+        )
+
+        with patch.object(
+            ResourceManager,
+            "GLOBAL_LIMITS_UPDATE_INTERVAL_S",
+            60,
+        ):
+            resource_manager = _resource_manager_for_limits_only_test(
+                ExecutionOptions(),
+                get_total_resources,
+            )
+
+            # An asynchronous autoscaling coordinator can initially expose an
+            # empty cached allocation. Recheck it immediately instead of running
+            # at liveness-only concurrency for the full cache interval.
+            assert resource_manager.get_global_limits() == ExecutionResources.zero()
+            assert resource_manager.get_global_limits() == ExecutionResources(
+                cpu=4,
+                gpu=1,
+                object_store_memory=500,
+            )
+            assert get_total_resources.call_count == 2
+
+            # Once the source reports a real allocation, normal caching resumes.
+            assert resource_manager.get_global_limits() == ExecutionResources(
+                cpu=4,
+                gpu=1,
+                object_store_memory=500,
+            )
+            assert get_total_resources.call_count == 2
+
     def test_update_usage(self):
         """Test calculating op_usage."""
         o1 = InputDataBuffer(DataContext.get_current(), [])

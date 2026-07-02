@@ -437,6 +437,75 @@ class TestReservationOpResourceAllocator:
             cpu=14, object_store_memory=110
         )
 
+    def test_redistributes_remaining_resources_by_dimension(self, restore_data_context):
+        """Don't strand CPU when downstream CPU tasks have a zero GPU maximum."""
+        DataContext.get_current().op_resource_reservation_enabled = True
+        DataContext.get_current().op_resource_reservation_ratio = 0.5
+
+        o1 = InputDataBuffer(DataContext.get_current(), [])
+        o2 = mock_map_op(
+            o1,
+            ray_remote_args={"num_cpus": 1, "num_gpus": 1},
+            name="GpuMap",
+        )
+        o3 = mock_map_op(o2, ray_remote_args={"num_cpus": 1}, name="CpuSink")
+
+        o2.min_max_resource_requirements = MagicMock(
+            return_value=(
+                ExecutionResources(cpu=1, gpu=1),
+                ExecutionResources(
+                    cpu=4,
+                    gpu=4,
+                    object_store_memory=float("inf"),
+                ),
+            )
+        )
+        o3.min_max_resource_requirements = MagicMock(
+            return_value=(
+                ExecutionResources(cpu=1),
+                ExecutionResources(
+                    cpu=float("inf"),
+                    gpu=0,
+                    object_store_memory=float("inf"),
+                ),
+            )
+        )
+
+        topo = build_streaming_topology(o3, ExecutionOptions())
+        global_limits = ExecutionResources(
+            cpu=64,
+            gpu=4,
+            object_store_memory=1000,
+        )
+        op_usages = {op: ExecutionResources.zero() for op in (o1, o2, o3)}
+
+        resource_manager = ResourceManager(
+            topo,
+            ExecutionOptions(),
+            MagicMock(),
+            DataContext.get_current(),
+        )
+        resource_manager.get_op_usage = MagicMock(side_effect=lambda op: op_usages[op])
+        resource_manager._mem_op_internal = {o1: 0, o2: 0, o3: 0}
+        resource_manager._mem_op_outputs = {o1: 0, o2: 0, o3: 0}
+
+        allocator = resource_manager._op_resource_allocator
+        assert isinstance(allocator, ReservationOpResourceAllocator)
+        allocator.update_budgets(limits=global_limits)
+
+        # The GPU operator is capped at four CPUs. Its remaining 22-CPU share
+        # should flow to the CPU-only sink even though that sink cannot use GPU.
+        assert allocator._op_budgets[o2] == ExecutionResources(
+            cpu=4,
+            gpu=4,
+            object_store_memory=375,
+        )
+        assert allocator._op_budgets[o3] == ExecutionResources(
+            cpu=60,
+            gpu=0,
+            object_store_memory=375,
+        )
+
     def test_budget_capped_by_max_resource_usage_all_capped(self, restore_data_context):
         """Test when all operators are capped, remaining shared resources are not given."""
         DataContext.get_current().op_resource_reservation_enabled = True
