@@ -26,7 +26,7 @@ from ray.data._internal.logical.optimizers import PhysicalOptimizer, get_executi
 from ray.data._internal.planner import create_planner
 from ray.data._internal.stats import DatasetStats
 from ray.data._internal.util import rows_same
-from ray.data.context import DataContext
+from ray.data.context import DataContext, ShuffleStrategy
 from ray.data.dataset import Dataset
 from ray.data.expressions import star
 from ray.data.tests.conftest import *  # noqa
@@ -932,6 +932,28 @@ def test_combine_repartition_aggregate(
         "+- Read[ReadRange]"
     )
     assert expected_optimized_plan in captured
+
+
+def test_combine_repartition_map_groups(
+    ray_start_regular_shared_2_cpus, configure_shuffle_method, capsys
+):
+    if configure_shuffle_method not in (
+        ShuffleStrategy.HASH_SHUFFLE,
+        ShuffleStrategy.GPU_SHUFFLE,
+    ):
+        pytest.skip("Only hash-based map_groups lowers to Repartition")
+
+    ds = ray.data.from_items([{"key": "a", "value": 1}]).repartition(30)
+    ds = ds.groupby("key").map_groups(lambda batch: batch)
+
+    ds.explain()
+
+    captured = capsys.readouterr().out
+    optimized_plan = captured.split(
+        "-------- Logical Plan (Optimized) --------", maxsplit=1
+    )[1]
+    assert "MapGroups[MapGroups(<lambda>)]" in optimized_plan
+    assert "Repartition[Repartition]" not in optimized_plan
 
 
 def test_combine_streaming_repartition_to_shuffle_repartition(

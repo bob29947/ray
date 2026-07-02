@@ -6,10 +6,12 @@ from ray.data._internal.logical.interfaces import (
 )
 from ray.data._internal.logical.operators import (
     Aggregate,
+    MapGroups,
     Repartition,
     Sort,
     StreamingRepartition,
 )
+from ray.data.context import ShuffleStrategy
 
 __all__ = [
     "CombineShuffles",
@@ -77,6 +79,20 @@ class CombineShuffles(Rule):
                 keys=op.keys,
                 sort=op.sort,
             )
+        elif isinstance(input_op, (Repartition, StreamingRepartition)) and isinstance(
+            op, MapGroups
+        ):
+            # Hash/GPU map_groups and the key-less case always start with their own
+            # repartition. Preserve the historical logical lowering, where
+            # CombineShuffles removed an immediately preceding repartition before
+            # the per-group MapBatches operator was planned. Besides avoiding a
+            # redundant exchange, this prevents empty blocks produced by a local
+            # repartition from losing their schema in a following hash shuffle.
+            if op.key is None or op.shuffle_strategy in (
+                ShuffleStrategy.HASH_SHUFFLE,
+                ShuffleStrategy.GPU_SHUFFLE,
+            ):
+                return op._with_new_input_dependencies([input_op.input_dependencies[0]])
         elif isinstance(input_op, Sort) and isinstance(op, Sort):
             return Sort(
                 sort_key=op.sort_key,
