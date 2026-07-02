@@ -100,6 +100,65 @@ def _pack_fixed_shape_tensor_columns(
     return output_tables, output_schema
 
 
+def _maybe_enable_byte_stream_split_for_packed_tensors(
+    output_schema: "pyarrow.Schema", write_kwargs: Dict[str, Any]
+) -> tuple[str, ...]:
+    """Use a compression-friendly encoding for eligible packed tensors.
+
+    BYTE_STREAM_SPLIT improves compression throughput for dense, fixed-width
+    values.  It is only selected for packed tensor fields whose dictionary
+    encoding is explicitly disabled and whose Parquet compression is enabled.
+    User-provided encoding choices remain authoritative.
+
+    Returns:
+        The column names for which BYTE_STREAM_SPLIT was selected.
+    """
+
+    from ray.data._internal.tensor_extensions.arrow import ArrowPackedTensorType
+
+    if "use_byte_stream_split" in write_kwargs or "column_encoding" in write_kwargs:
+        return ()
+
+    compression = write_kwargs.get("compression", "snappy")
+    use_dictionary = write_kwargs.get("use_dictionary", True)
+
+    def compression_enabled(column_name: str) -> bool:
+        configured = compression
+        if isinstance(configured, dict):
+            configured = configured.get(column_name)
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            return configured.lower() not in {"none", "uncompressed"}
+        # Leave unfamiliar per-column/configuration forms to PyArrow rather
+        # than guessing how they should be interpreted.
+        return False
+
+    def dictionary_enabled(column_name: str) -> bool:
+        if isinstance(use_dictionary, bool):
+            return use_dictionary
+        if isinstance(use_dictionary, (list, tuple, set)):
+            return column_name in use_dictionary
+        return True
+
+    packed_columns = tuple(
+        field.name
+        for field in output_schema
+        if isinstance(field.type, ArrowPackedTensorType)
+        and compression_enabled(field.name)
+        and not dictionary_enabled(field.name)
+    )
+    if packed_columns:
+        # A column list avoids changing the encoding of unrelated scalar
+        # fields in mixed schemas.
+        write_kwargs["use_byte_stream_split"] = list(packed_columns)
+        logger.debug(
+            "Enabling BYTE_STREAM_SPLIT for packed tensor columns: %s",
+            packed_columns,
+        )
+    return packed_columns
+
+
 def choose_row_group_limits(
     row_group_size: Optional[int],
     min_rows_per_file: Optional[int],
@@ -348,6 +407,9 @@ class ParquetDatasink(_FileDatasink):
             is True
         ):
             tables, output_schema = _pack_fixed_shape_tensor_columns(tables)
+            _maybe_enable_byte_stream_split_for_packed_tensors(
+                output_schema, write_kwargs
+            )
 
         row_group_size = write_kwargs.pop("row_group_size", None)
 

@@ -29,6 +29,8 @@ from ray.data._internal.datasource.parquet_datasource import (
 )
 from ray.data._internal.datasource.parquet_datasink import (
     PARQUET_WRITE_PACKED_TENSORS_CONFIG,
+    _maybe_enable_byte_stream_split_for_packed_tensors,
+    _pack_fixed_shape_tensor_columns,
 )
 from ray.data._internal.execution.interfaces.ref_bundle import (
     _ref_bundles_iterator_to_block_refs_list,
@@ -951,7 +953,9 @@ def test_write_parquet_packed_fixed_shape_tensors(
 
     path = tmp_path / ("packed" if packed else "ordinary")
     expected = np.arange(96, dtype=np.uint16).reshape(12, 8)
-    ray.data.from_numpy([expected]).write_parquet(str(path))
+    ray.data.from_numpy([expected]).write_parquet(
+        str(path), compression="zstd", use_dictionary=False
+    )
 
     files = list(path.glob("*.parquet"))
     assert files
@@ -964,9 +968,19 @@ def test_write_parquet_packed_fixed_shape_tensors(
         assert isinstance(output_type, ArrowPackedTensorType)
         assert output_type.shape == (8,)
         assert output_type.value_type == pa.uint16()
+        assert all(
+            "BYTE_STREAM_SPLIT"
+            in pq.ParquetFile(file).metadata.row_group(0).column(0).encodings
+            for file in files
+        )
     else:
         assert physical_types != {"FIXED_LEN_BYTE_ARRAY"}
         assert not isinstance(output_type, ArrowPackedTensorType)
+        assert all(
+            "BYTE_STREAM_SPLIT"
+            not in pq.ParquetFile(file).metadata.row_group(0).column(0).encodings
+            for file in files
+        )
 
     restored = ray.data.read_parquet(str(path))
     restored_type = restored.schema().base_schema.field("data").type
@@ -974,6 +988,46 @@ def test_write_parquet_packed_fixed_shape_tensors(
     assert isinstance(restored_type, ArrowPackedTensorType) is packed
     actual = restored.take_batch(batch_size=len(expected), batch_format="numpy")["data"]
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("write_kwargs", "expected_columns"),
+    [
+        ({"compression": "zstd", "use_dictionary": False}, ("tensor",)),
+        ({"compression": None, "use_dictionary": False}, ()),
+        ({"compression": "zstd", "use_dictionary": True}, ()),
+        (
+            {
+                "compression": "zstd",
+                "use_dictionary": False,
+                "use_byte_stream_split": False,
+            },
+            (),
+        ),
+        (
+            {
+                "compression": "zstd",
+                "use_dictionary": False,
+                "column_encoding": {"tensor": "PLAIN"},
+            },
+            (),
+        ),
+    ],
+)
+def test_packed_tensor_byte_stream_split_policy(write_kwargs, expected_columns):
+    tensor = pa.FixedShapeTensorArray.from_numpy_ndarray(
+        np.arange(24, dtype=np.uint16).reshape(3, 8)
+    )
+    tables, schema = _pack_fixed_shape_tensor_columns(
+        [pa.table({"scalar": [1, 2, 3], "tensor": tensor})]
+    )
+    assert tables[0].schema == schema
+
+    actual = _maybe_enable_byte_stream_split_for_packed_tensors(schema, write_kwargs)
+
+    assert actual == expected_columns
+    if expected_columns:
+        assert write_kwargs["use_byte_stream_split"] == ["tensor"]
 
 
 def test_parquet_reader_estimate_data_size(shutdown_only, tmp_path):
