@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -88,6 +89,29 @@ def test_dynamic_remote_args_no_label_when_unset(
     )
     args = op._get_dynamic_ray_remote_args()
     assert "label_selector" not in args
+
+
+def test_isolated_workers_preserve_runtime_env():
+    original_remote_args = {
+        "num_cpus": 1,
+        "runtime_env": {
+            "env_vars": {"AWS_REGION": "us-west-2", "EXISTING": "value"},
+        },
+    }
+    op = SimpleNamespace(id="operator-id")
+    isolated_args = TaskPoolMapOperator._add_unique_runtime_env(
+        op, original_remote_args
+    )
+
+    assert isolated_args["runtime_env"]["env_vars"] == {
+        "AWS_REGION": "us-west-2",
+        "EXISTING": "value",
+        "__RAY_DATA_OPERATOR_ID": "operator-id",
+    }
+    # Adding the isolation token must not mutate caller-owned remote args.
+    assert "__RAY_DATA_OPERATOR_ID" not in original_remote_args["runtime_env"][
+        "env_vars"
+    ]
 
 
 if __name__ == "__main__":

@@ -325,6 +325,26 @@ def test_dedicated_source_runtime_forces_actor_backend():
     ) == ("actor_pool", 4, False)
 
 
+def test_dedicated_source_runtime_allows_isolated_task_backend():
+    assert _select_execution_backend(
+        has_partition_contract=True,
+        num_ranges=4,
+        worker_concurrency=4,
+        requires_dedicated_workers=True,
+        allow_isolated_task_workers=True,
+    ) == ("task_pool", 4, False)
+
+    # Isolated tasks do not provide process-affine reuse. Oversubscribed plans
+    # still require actors so initialization is safely amortized.
+    assert _select_execution_backend(
+        has_partition_contract=True,
+        num_ranges=8,
+        worker_concurrency=4,
+        requires_dedicated_workers=True,
+        allow_isolated_task_workers=True,
+    ) == ("actor_pool", 4, True)
+
+
 @pytest.mark.parametrize("worker_concurrency", [True, False, 0, -1, 1.5, "4"])
 def test_resolve_worker_concurrency_rejects_invalid_values(worker_concurrency):
     with pytest.raises(ValueError, match="worker_concurrency must be a positive"):
@@ -418,6 +438,89 @@ def test_builder_uses_dedicated_actor_pool_for_native_s3():
     assert op._parquet_range_plan_metrics["execution_backend"] == "actor_pool"
     assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is False
     assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 1
+
+
+def test_builder_uses_isolated_task_pool_for_native_s3_when_enabled(
+    restore_data_context,
+):
+    identity = S3SourceIdentity(
+        size=100,
+        etag="abc123",
+        last_modified="2026-07-02T00:00:00.000000Z",
+    ).encode()
+    row_group = _row_group("s3://bucket/data.parquet", 0, 0, 9)
+    row_group = row_group.__class__(
+        **{**row_group.__dict__, "source_identity": identity}
+    )
+    layout = plan_parquet_row_groups([row_group], num_partitions=1)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=1)
+    data_context = DataContext.get_current()
+    data_context.set_config(
+        "parquet_range_map_groups_s3_isolated_task_pool_enabled", True
+    )
+
+    op = build_parquet_range_map_groups_operator(
+        layout=layout,
+        footer_planning_time_s=0.1,
+        projection=("User",),
+        partition_key="User",
+        group_keys=("User",),
+        source_schema=pa.schema([pa.field("User", pa.int64())]),
+        tokenizer_op=tokenizer_op,
+        map_groups_op=map_groups_op,
+        partition_contract=MapGroupsPartitionContract(
+            udf=_identity_partition,
+            batch_format="cudf",
+        ),
+        data_context=data_context,
+        ray_remote_args={
+            "num_gpus": 1,
+            "runtime_env": {"env_vars": {"AWS_REGION": "us-west-2"}},
+        },
+        gpu_memory_budget_bytes=8 * 1024**3,
+        worker_concurrency=1,
+    )
+
+    assert isinstance(op, ParquetRangeMapGroupsTaskPoolMapOperator)
+    assert op.isolate_workers is True
+    assert op._ray_remote_args["max_retries"] == 0
+    assert op._parquet_range_plan_metrics["source_kind"] == "s3"
+    assert op._parquet_range_plan_metrics["execution_backend"] == "task_pool"
+    assert op._parquet_range_plan_metrics["task_workers_isolated"] is True
+    assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is False
+
+
+def test_builder_rejects_invalid_s3_isolated_task_pool_config(
+    restore_data_context,
+):
+    layout = _builder_layout(num_partitions=1)
+    tokenizer_op, map_groups_op = _builder_udf_ops(num_partitions=1)
+    data_context = DataContext.get_current()
+    data_context.set_config(
+        "parquet_range_map_groups_s3_isolated_task_pool_enabled", "true"
+    )
+
+    with pytest.raises(
+        ValueError, match="isolated_task_pool_enabled must be a boolean"
+    ):
+        build_parquet_range_map_groups_operator(
+            layout=layout,
+            footer_planning_time_s=0.1,
+            projection=("User",),
+            partition_key="User",
+            group_keys=("User",),
+            source_schema=pa.schema([pa.field("User", pa.int64())]),
+            tokenizer_op=tokenizer_op,
+            map_groups_op=map_groups_op,
+            partition_contract=MapGroupsPartitionContract(
+                udf=_identity_partition,
+                batch_format="cudf",
+            ),
+            data_context=data_context,
+            ray_remote_args={"num_gpus": 1},
+            gpu_memory_budget_bytes=8 * 1024**3,
+            worker_concurrency=1,
+        )
 
 
 def test_builder_bounds_ordinary_actor_pool_and_reuses_workers():

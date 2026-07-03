@@ -991,6 +991,7 @@ def _select_execution_backend(
     num_ranges: int,
     worker_concurrency: Optional[int],
     requires_dedicated_workers: bool = False,
+    allow_isolated_task_workers: bool = False,
 ) -> Tuple[str, int, bool]:
     """Choose the physical worker pool without changing UDF semantics.
 
@@ -1007,7 +1008,7 @@ def _select_execution_backend(
     )
     if (
         has_partition_contract
-        and not requires_dedicated_workers
+        and (not requires_dedicated_workers or allow_isolated_task_workers)
         and num_ranges <= resolved_concurrency
     ):
         return "task_pool", resolved_concurrency, False
@@ -1116,6 +1117,9 @@ def build_parquet_range_map_groups_operator(
     s3_kvikio_task_size_bytes = data_context.get_config(
         "parquet_range_map_groups_s3_kvikio_task_size_bytes", 4 * 1024**2
     )
+    s3_isolated_task_pool_enabled = data_context.get_config(
+        "parquet_range_map_groups_s3_isolated_task_pool_enabled", False
+    )
     for config_name, config_value in (
         ("parquet_range_map_groups_s3_row_groups_per_read", s3_row_groups_per_read),
         ("parquet_range_map_groups_s3_kvikio_num_threads", s3_kvikio_num_threads),
@@ -1130,6 +1134,10 @@ def build_parquet_range_map_groups_operator(
             or config_value <= 0
         ):
             raise ValueError(f"{config_name} must be a positive integer")
+    if not isinstance(s3_isolated_task_pool_enabled, bool):
+        raise ValueError(
+            "parquet_range_map_groups_s3_isolated_task_pool_enabled must be a boolean"
+        )
 
     works = _make_work(
         layout,
@@ -1150,11 +1158,16 @@ def build_parquet_range_map_groups_operator(
             num_ranges=len(works),
             worker_concurrency=worker_concurrency,
             # KvikIO configuration and temporary IAM credentials are
-            # process-local. Keep them inside dedicated fused actors rather
-            # than returning a modified generic task worker to Ray's pool.
+            # process-local. The opt-in task backend uses TaskPoolMapOperator's
+            # unique runtime environment so a modified worker can never return
+            # to Ray's generic task pool.
             requires_dedicated_workers=source_kind == "s3",
+            allow_isolated_task_workers=(
+                source_kind == "s3" and s3_isolated_task_pool_enabled
+            ),
         )
     )
+    isolated_task_workers = execution_backend == "task_pool" and source_kind == "s3"
 
     def input_data_factory(_: int) -> List[RefBundle]:
         bundles = []
@@ -1375,6 +1388,9 @@ def build_parquet_range_map_groups_operator(
         "s3_kvikio_task_size_bytes": (
             s3_kvikio_task_size_bytes if source_kind == "s3" else 0
         ),
+        "s3_isolated_task_pool_enabled": (
+            s3_isolated_task_pool_enabled if source_kind == "s3" else False
+        ),
         "rmm_pool_initial_bytes": rmm_pool_initial_bytes,
         "rmm_pool_reserve_bytes": rmm_pool_reserve_bytes,
         "group_execution_mode": (
@@ -1382,6 +1398,7 @@ def build_parquet_range_map_groups_operator(
         ),
         "group_partition_fallback_reason": partition_contract_fallback_reason,
         "execution_backend": execution_backend,
+        "task_workers_isolated": isolated_task_workers,
         "worker_concurrency": resolved_worker_concurrency,
         "actor_reuse_enabled": actor_reuse_enabled,
         "max_ranges_per_worker": (
@@ -1418,6 +1435,7 @@ def build_parquet_range_map_groups_operator(
             supports_fusion=False,
             ray_remote_args=task_args,
             plan_metrics=plan_metrics,
+            isolate_workers=isolated_task_workers,
         )
 
     compute = ActorPoolStrategy(

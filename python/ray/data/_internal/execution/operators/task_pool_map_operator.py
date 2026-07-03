@@ -135,7 +135,11 @@ class TaskPoolMapOperator(MapOperator):
         ray_remote_args = copy.deepcopy(ray_remote_args)
 
         runtime_env = ray_remote_args.get("runtime_env", {})
-        env_vars = ray_remote_args.get("env_vars", {})
+        # ``env_vars`` is part of ``runtime_env``, not a top-level remote
+        # option. Preserve the caller's environment while adding the worker
+        # isolation token; credentials and other runtime configuration must
+        # not disappear merely because an operator requests isolation.
+        env_vars = runtime_env.get("env_vars", {})
         env_vars["__RAY_DATA_OPERATOR_ID"] = self.id
         runtime_env["env_vars"] = env_vars
 
