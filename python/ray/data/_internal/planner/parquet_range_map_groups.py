@@ -33,7 +33,6 @@ from ray.data._internal.datasource.parquet_range_v1 import (
 )
 from ray.data._internal.execution.interfaces import (
     BlockEntry,
-    ExecutionOptions,
     PhysicalOperator,
     RefBundle,
 )
@@ -940,25 +939,15 @@ class _ParquetRangeMapGroupsMetricsMixin:
 class ParquetRangeMapGroupsActorPoolMapOperator(
     _ParquetRangeMapGroupsMetricsMixin, ActorPoolMapOperator
 ):
-    """Fixed GPU actors for per-group execution or reusable partition workers."""
+    """Fixed GPU actors for per-group execution or reusable partition workers.
 
-    def __init__(
-        self,
-        *args: Any,
-        actor_start_timeout_s: float,
-        **kwargs: Any,
-    ) -> None:
-        self._actor_start_timeout_s = actor_start_timeout_s
-        super().__init__(*args, **kwargs)
-
-    def start(self, options: ExecutionOptions) -> None:
-        super().start(options)
-        # All actors must be live before the first range is dispatched. With one
-        # in-flight task per actor, concurrent ranges use distinct actors/GPUs;
-        # an oversubscribed plan later reuses each initialized actor serially.
-        pending = self._actor_pool.get_pending_actor_refs()
-        if pending:
-            ray.get(pending, timeout=self._actor_start_timeout_s)
+    Actor startup intentionally follows ``ActorPoolMapOperator``'s progressive
+    protocol: each actor becomes schedulable as soon as its initialization
+    completes, without waiting for every actor in the fixed pool. Pending actors
+    are never selected, and ``max_tasks_in_flight_per_actor=1`` below keeps range
+    reuse serial. Deployments that require an all-minimum-actors startup barrier
+    can opt into the standard ``DataContext.wait_for_min_actors_s`` behavior.
+    """
 
 
 class ParquetRangeMapGroupsTaskPoolMapOperator(
@@ -1349,18 +1338,6 @@ def build_parquet_range_map_groups_operator(
         init_fn=init_fn,
     )
     actor_args = dict(ray_remote_args)
-    actor_start_timeout_s = data_context.get_config(
-        "parquet_range_map_groups_actor_start_timeout_s", 300.0
-    )
-    if (
-        isinstance(actor_start_timeout_s, bool)
-        or not isinstance(actor_start_timeout_s, (int, float))
-        or not math.isfinite(float(actor_start_timeout_s))
-        or float(actor_start_timeout_s) <= 0
-    ):
-        raise ValueError(
-            "parquet_range_map_groups_actor_start_timeout_s must be finite and positive"
-        )
 
     metrics = layout.metrics
     plan_metrics = {
@@ -1455,5 +1432,4 @@ def build_parquet_range_map_groups_operator(
         supports_fusion=False,
         ray_remote_args=actor_args,
         plan_metrics=plan_metrics,
-        actor_start_timeout_s=float(actor_start_timeout_s),
     )

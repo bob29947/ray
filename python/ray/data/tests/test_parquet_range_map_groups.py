@@ -9,15 +9,19 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
+import ray
 import ray.cloudpickle as ray_pickle
-from ray.data.context import DataContext
+from ray.data._internal.compute import ActorPoolStrategy
 from ray.data._internal.datasource.parquet_range import (
     ParquetRowGroupFragment,
     ParquetRowGroupMetadata,
     plan_parquet_row_groups,
 )
 from ray.data._internal.datasource.parquet_range_s3 import S3SourceIdentity
+from ray.data._internal.execution.interfaces import ExecutionOptions
 from ray.data._internal.execution.interfaces.task_context import TaskContext
+from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.planner.map_groups_partition_protocol import (
     MapGroupsPartitionContract,
     MapGroupsPartitionContext,
@@ -48,6 +52,11 @@ from ray.data._internal.planner.parquet_range_map_groups import (
     _work_descriptor_metadata,
     build_parquet_range_map_groups_operator,
     validate_cudf_projection_schema,
+)
+from ray.data.context import DataContext
+from ray.data.tests.util import (
+    create_map_transformer_from_block_fn,
+    run_one_op_task,
 )
 
 
@@ -399,6 +408,74 @@ def test_builder_uses_fixed_actor_pool_for_oversubscribed_partition_ranges():
     assert op._parquet_range_plan_metrics["worker_concurrency"] == 2
     assert op._parquet_range_plan_metrics["actor_reuse_enabled"] is True
     assert op._parquet_range_plan_metrics["max_ranges_per_worker"] == 2
+
+
+def test_range_actor_pool_starts_progressively_and_reuses_ready_actor_serially(
+    shutdown_only,
+    restore_data_context,
+):
+    # Provision fewer CPUs than the fixed pool size. One actor can become ready,
+    # while the second remains pending for the lifetime of the first actor. The
+    # range backend must start useful work instead of waiting on the whole pool.
+    ray.init(num_cpus=1)
+    data_context = DataContext.get_current()
+    data_context.wait_for_min_actors_s = 0
+    input_op = InputDataBuffer(
+        data_context,
+        make_ref_bundles([[partition_id] for partition_id in range(3)]),
+    )
+
+    def emit_worker_identity(blocks, task_context):
+        for block in blocks:
+            yield pd.DataFrame(
+                {
+                    "input_id": [int(block.iloc[0]["id"])],
+                    "task_index": [task_context.task_idx],
+                    "worker_pid": [os.getpid()],
+                }
+            )
+
+    op = ParquetRangeMapGroupsActorPoolMapOperator(
+        create_map_transformer_from_block_fn(emit_worker_identity),
+        input_op,
+        data_context,
+        ActorPoolStrategy(size=2, max_tasks_in_flight_per_actor=1),
+        name="ProgressiveParquetRangeMapGroups",
+        supports_fusion=False,
+        ray_remote_args={
+            "num_cpus": 1,
+            "max_restarts": 0,
+            "max_task_retries": 0,
+        },
+        plan_metrics={},
+    )
+
+    op.start(ExecutionOptions())
+    # Process only the first ready actor's metadata task. The other actor cannot
+    # acquire a CPU and therefore remains pending.
+    run_one_op_task(op)
+    assert op._actor_pool.num_running_actors() == 1
+    assert op._actor_pool.num_pending_actors() == 1
+
+    outputs = []
+    for partition_id in range(3):
+        assert op.can_add_input()
+        op.add_input(input_op.get_next(), 0)
+        # The ready actor is capped at one in-flight range. A subsequent range
+        # cannot be admitted until this one completes.
+        assert not op.can_add_input()
+        run_one_op_task(op)
+        assert op._actor_pool.num_pending_actors() == 1
+        assert op.has_next()
+        output_bundle = op.get_next()
+        output_block = ray.get(output_bundle.block_refs[0])
+        outputs.append(output_block.iloc[0].to_dict())
+
+    op.all_inputs_done()
+    assert [output["input_id"] for output in outputs] == [0, 1, 2]
+    assert [output["task_index"] for output in outputs] == [0, 1, 2]
+    # Oversubscribed work reuses the initialized actor, but only serially.
+    assert len({output["worker_pid"] for output in outputs}) == 1
 
 
 def test_builder_uses_dedicated_actor_pool_for_native_s3():
