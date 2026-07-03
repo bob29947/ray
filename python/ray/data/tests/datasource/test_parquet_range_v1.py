@@ -284,6 +284,10 @@ def test_extracts_native_s3_fragments_without_relisting(tmp_path, monkeypatch):
     ("resolved_path", "expected_uri"),
     [
         ("bucket/a%20b.parquet", "s3://bucket/a%2520b.parquet"),
+        (
+            "bucket/folder/literal%20and space.parquet",
+            "s3://bucket/folder/literal%2520and%20space.parquet",
+        ),
         ("bucket/a#b?.parquet", "s3://bucket/a%23b%3F.parquet"),
         ("bucket/folder/a b.parquet", "s3://bucket/folder/a%20b.parquet"),
     ],
@@ -292,6 +296,72 @@ def test_resolved_s3_fragment_path_is_encoded_exactly_once(
     resolved_path, expected_uri
 ):
     assert parquet_range_v1_module._as_s3_uri(resolved_path) == expected_uri
+
+
+@pytest.mark.parametrize(
+    ("resolved_path", "expected_uri"),
+    [
+        ("bucket/folder/a%20b.parquet", "s3://bucket/folder/a%2520b.parquet"),
+        ("bucket/folder/a b.parquet", "s3://bucket/folder/a%20b.parquet"),
+    ],
+)
+def test_native_s3_extraction_preserves_decoded_fragment_key(
+    tmp_path, monkeypatch, resolved_path, expected_uri
+):
+    path = tmp_path / "data.parquet"
+    _write_parquet(path, [0, 1])
+    local_fragment = next(
+        pds.dataset(str(path), format="parquet").get_fragments()
+    )
+    remote_fragment = SimpleNamespace(
+        path=resolved_path,
+        metadata=local_fragment.metadata,
+        row_groups=local_fragment.row_groups,
+    )
+    datasource = SimpleNamespace(
+        _pq_fragments=[
+            SimpleNamespace(original=remote_fragment, file_size=path.stat().st_size)
+        ],
+        _pq_paths=[resolved_path],
+        _filesystem=pa_fs.S3FileSystem(anonymous=True),
+        _parquet_range_source_access="native_s3_default",
+        _partition_columns=[],
+        _include_paths=False,
+        _include_row_hash=False,
+    )
+
+    class FakeS3FileSystem:
+        observed_paths = []
+
+        def invalidate_cache(self, source_path):
+            self.observed_paths.append(source_path)
+
+        def info(self, source_path):
+            self.observed_paths.append(source_path)
+            return {
+                "Size": path.stat().st_size,
+                "ETag": '"abc123"',
+                "LastModified": "2026-07-02T00:00:00+00:00",
+            }
+
+    filesystem = FakeS3FileSystem()
+    monkeypatch.setattr(
+        parquet_range_v1_module,
+        "_create_ambient_s3_filesystem",
+        lambda: filesystem,
+    )
+
+    result = try_extract_v1_parquet_row_group_metadata(
+        datasource,
+        key="User",
+        projection=["User"],
+    )
+
+    assert result.extracted
+    assert {entry.path for entry in result.row_groups} == {expected_uri}
+    # Identity lookup consumes the decoded filesystem key.  In particular,
+    # the literal three characters "%20" remain distinct from a space.
+    assert filesystem.observed_paths == [resolved_path] * 4
 
 
 def test_native_s3_footer_mutation_fails_closed(tmp_path, monkeypatch):

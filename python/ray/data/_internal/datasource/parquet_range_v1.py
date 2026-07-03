@@ -26,7 +26,6 @@ from ray.data._internal.datasource.parquet_range_s3 import (
     S3SourceIdentityError,
     _create_ambient_s3_filesystem,
     capture_s3_source_identity,
-    parse_s3_uri,
 )
 
 
@@ -257,13 +256,18 @@ def _as_s3_uri(path: Any) -> str:
             "A resolved S3 fragment path must be a protocol-free bucket/key.",
             reason_code="invalid_source_path",
         )
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        raise S3SourceIdentityError(
+            "A resolved S3 fragment path must be a protocol-free bucket/key.",
+            reason_code="invalid_source_path",
+        )
     try:
-        # PyArrow fragment paths are already decoded.  Quote from their
-        # bucket/key components instead of reparsing the raw path, which would
-        # otherwise turn a literal "%20" in an object key into a space.
-        location = S3ObjectLocation(bucket=bucket.lower(), key=key)
-        return parse_s3_uri(location.uri).uri
-    except S3SourceIdentityError as exc:
+        # PyArrow fragment paths are filesystem paths, not URIs: their keys
+        # have already been decoded.  Encode directly from those decoded
+        # components.  Running the fragment path through a URI parser would
+        # interpret a literal "%20" in an object key as a space a second time.
+        return S3ObjectLocation(bucket=bucket.lower(), key=key).uri
+    except UnicodeEncodeError as exc:
         raise S3SourceIdentityError(
             "A resolved S3 fragment path must be a protocol-free bucket/key.",
             reason_code="invalid_source_path",
