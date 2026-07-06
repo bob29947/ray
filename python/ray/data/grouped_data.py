@@ -1,25 +1,110 @@
+import math
 from collections.abc import Iterator as IteratorABC
-from functools import partial
+from dataclasses import dataclass
+from numbers import Real
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from ray.data._internal.compute import ComputeStrategy
 from ray.data._internal.logical.interfaces import LogicalPlan
-from ray.data._internal.logical.operators import Aggregate
+from ray.data._internal.logical.operators import Aggregate, MapGroups
+from ray.data._internal.util import (
+    get_compute_strategy,
+    merge_resources_to_ray_remote_args,
+)
 from ray.data.aggregate import AggregateFn, Count, Max, Mean, Min, Std, Sum
 from ray.data.block import (
     Block,
     BlockAccessor,
-    CallableClass,
     DataBatch,
     UserDefinedFunction,
 )
 from ray.data.context import ShuffleStrategy
 from ray.data.dataset import EXPRESSION_API_GROUP, Dataset
 from ray.data.expressions import DownloadExpr, Expr, StarExpr
-from ray.util.annotations import PublicAPI
+from ray.util.annotations import DeveloperAPI, PublicAPI
 
 CDS_API_GROUP = "Computations or Descriptive Stats"
 FA_API_GROUP = "Function Application"
+
+
+def _validate_positive_finite_number(name: str, value: Real) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a positive, finite number, got {value!r}")
+
+
+@DeveloperAPI(stability="alpha")
+@dataclass(frozen=True)
+class MapGroupsPartitionContext:
+    """Information about the groups contained in one optimized input range."""
+
+    group_keys: Tuple[str, ...]
+    input_group_boundaries: Tuple[int, ...]
+
+    def __post_init__(self):
+        if not self.group_keys or any(
+            not isinstance(key, str) or not key for key in self.group_keys
+        ):
+            raise ValueError("group_keys must contain one or more non-empty strings")
+        boundaries = self.input_group_boundaries
+        if not boundaries or boundaries[0] != 0:
+            raise ValueError("input_group_boundaries must start at 0")
+        if any(
+            isinstance(boundary, bool) or not isinstance(boundary, int)
+            for boundary in boundaries
+        ):
+            raise ValueError("input_group_boundaries must contain integers")
+        if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
+            raise ValueError("input_group_boundaries must be strictly increasing")
+
+    @property
+    def num_groups(self) -> int:
+        """Number of complete groups in this input range."""
+        return len(self.input_group_boundaries) - 1
+
+
+@DeveloperAPI(stability="alpha")
+@dataclass(frozen=True)
+class ParquetCudfShuffleElisionConfig:
+    """Opt in to Parquet-aware cuDF ``map_groups`` shuffle elision.
+
+    Supplying this config asserts that the immediately upstream tokenizer is
+    synchronous, deterministic, retry-safe, independent of batch boundaries, and
+    preserves row order, row count, and the leading group key. ``partition_fn``
+    must produce the same result as invoking the ordinary ``map_groups`` function
+    once for each group described by :class:`MapGroupsPartitionContext`.
+
+    This experimental optimization may fall back to ordinary ``map_groups`` during
+    planning. Errors after optimized execution begins are propagated.
+    """
+
+    partition_fn: Callable[..., Union[DataBatch, Iterator[DataBatch]]]
+    shuffle_bytes_per_input_row: float
+    peak_gpu_bytes_per_input_row: float
+    gpu_memory_bytes: int
+
+    def __post_init__(self):
+        if not callable(self.partition_fn):
+            raise TypeError("partition_fn must be callable")
+        _validate_positive_finite_number(
+            "shuffle_bytes_per_input_row", self.shuffle_bytes_per_input_row
+        )
+        _validate_positive_finite_number(
+            "peak_gpu_bytes_per_input_row", self.peak_gpu_bytes_per_input_row
+        )
+        if (
+            isinstance(self.gpu_memory_bytes, bool)
+            or not isinstance(self.gpu_memory_bytes, int)
+            or self.gpu_memory_bytes <= 0
+        ):
+            raise ValueError(
+                "gpu_memory_bytes must be a positive integer, "
+                f"got {self.gpu_memory_bytes!r}"
+            )
 
 
 class GroupedData:
@@ -45,9 +130,7 @@ class GroupedData:
         self._num_partitions: Optional[int] = num_partitions
 
     def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}(dataset={self._dataset}, " f"key={self._key!r})"
-        )
+        return f"{self.__class__.__name__}(dataset={self._dataset}, key={self._key!r})"
 
     @PublicAPI(api_group=FA_API_GROUP)
     def aggregate(self, *aggs: AggregateFn) -> Dataset:
@@ -108,6 +191,7 @@ class GroupedData:
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
+        parquet_cudf_shuffle_elision: Optional[ParquetCudfShuffleElisionConfig] = None,
         **ray_remote_args,
     ) -> "Dataset":
         """Apply the given function to each group of records of this dataset.
@@ -199,6 +283,9 @@ class GroupedData:
                 to initializing the worker. Args returned from this dict will always
                 override the args in ``ray_remote_args``. Note: this is an advanced,
                 experimental feature.
+            parquet_cudf_shuffle_elision: An explicit opt-in for the experimental
+                Parquet/cuDF shuffle-elision planner. If the input or execution
+                contract isn't supported, Ray falls back to ordinary ``map_groups``.
             **ray_remote_args: Additional resource requirements to request from
                 Ray (e.g., num_gpus=1 to request GPUs for the map tasks). See
                 :func:`ray.remote` for details.
@@ -213,16 +300,26 @@ class GroupedData:
                 Use this method for common aggregation use cases.
         """
 
-        # Prior to applying map operation we have to shuffle the data based on provided
-        # key and (optionally) number of partitions
-        #
-        #   - In case key is none, we repartition into a single block
-        #   - In case when hash-shuffle strategy is employed -- perform `repartition_and_sort`
-        #   - Otherwise we perform "global" sort of the dataset (to co-locate rows with the
-        #     same key values)
+        if self._key is not None and not isinstance(self._key, (str, list)):
+            raise ValueError(
+                f"Group-by keys are expected to either be a single column (str) "
+                f"or a list of columns (got '{self._key}')"
+            )
+
+        resolved_compute = get_compute_strategy(
+            fn,
+            fn_constructor_args=fn_constructor_args,
+            compute=compute,
+            concurrency=concurrency,
+        )
+        ray_remote_args = merge_resources_to_ray_remote_args(
+            num_cpus, num_gpus, memory, ray_remote_args
+        )
+
+        shuffle_strategy = self._dataset.context.shuffle_strategy
         if self._key is None:
-            shuffled_ds = self._dataset.repartition(1)
-        elif self._dataset.context.shuffle_strategy in (
+            num_partitions = 1
+        elif shuffle_strategy in (
             ShuffleStrategy.HASH_SHUFFLE,
             ShuffleStrategy.GPU_SHUFFLE,
         ):
@@ -230,83 +327,36 @@ class GroupedData:
                 self._num_partitions
                 or self._dataset.context.default_hash_shuffle_parallelism
             )
-            shuffled_ds = self._dataset.repartition(
-                num_partitions,
-                keys=self._key,
-                # Blocks must be sorted after repartitioning, such that group
-                # of rows sharing the same key values are co-located
-                sort=True,
-            )
         else:
-            shuffled_ds = self._dataset.sort(self._key)
+            num_partitions = None
 
-        # The batch is the entire block, because we have batch_size=None for
-        # map_batches() below.
-
-        if self._key is None:
-            keys = []
-        elif isinstance(self._key, str):
-            keys = [self._key]
-        elif isinstance(self._key, List):
-            keys = self._key
-        else:
-            raise ValueError(
-                f"Group-by keys are expected to either be a single column (str) "
-                f"or a list of columns (got '{self._key}')"
+        if parquet_cudf_shuffle_elision is not None and not isinstance(
+            parquet_cudf_shuffle_elision, ParquetCudfShuffleElisionConfig
+        ):
+            raise TypeError(
+                "parquet_cudf_shuffle_elision must be a ParquetCudfShuffleElisionConfig"
             )
 
-        # NOTE: It's crucial to make sure that UDF isn't capturing `GroupedData`
-        #       object in its closure to ensure its serializability
-        #
-        # See https://github.com/ray-project/ray/issues/54280 for more details
-        if isinstance(fn, CallableClass):
-
-            class wrapped_fn:
-                def __init__(self, *args, **kwargs):
-                    self.fn = fn(*args, **kwargs)
-
-                def __call__(self, batch, *args, **kwargs):
-                    yield from _apply_udf_to_groups(
-                        self.fn, batch, keys, batch_format, *args, **kwargs
-                    )
-
-        else:
-
-            def wrapped_fn(batch, *args, **kwargs):
-                yield from _apply_udf_to_groups(
-                    fn, batch, keys, batch_format, *args, **kwargs
-                )
-
-        # Change the name of the wrapped function so that users see the name of their
-        # function rather than `wrapped_fn` in the progress bar.
-        if isinstance(fn, partial):
-            wrapped_fn.__name__ = fn.func.__name__
-        else:
-            wrapped_fn.__name__ = fn.__name__
-
-        # NOTE: We set batch_size=None here, so that every batch contains the entire block,
-        #       guaranteeing that groups are contained in full (ie not being split)
-        return shuffled_ds._map_batches_without_batch_size_validation(
-            wrapped_fn,
-            batch_size=None,
-            compute=compute,
-            # NOTE: We specify `batch_format` as none to avoid converting
-            #       back-n-forth between batch and block formats (instead we convert
-            #       once per group inside the method applying the UDF itself)
-            batch_format=None,
+        op = MapGroups(
+            key=self._key,
+            num_partitions=num_partitions,
+            num_partitions_explicit=self._num_partitions is not None,
+            shuffle_strategy=shuffle_strategy,
+            fn=fn,
+            batch_format=batch_format,
             zero_copy_batch=zero_copy_batch,
             fn_args=fn_args,
             fn_kwargs=fn_kwargs,
             fn_constructor_args=fn_constructor_args,
             fn_constructor_kwargs=fn_constructor_kwargs,
-            num_cpus=num_cpus,
-            num_gpus=num_gpus,
-            memory=memory,
-            concurrency=concurrency,
-            udf_modifying_row_count=True,
+            compute=resolved_compute,
             ray_remote_args_fn=ray_remote_args_fn,
-            **ray_remote_args,
+            ray_remote_args=ray_remote_args,
+            parquet_cudf_shuffle_elision=parquet_cudf_shuffle_elision,
+            input_dependencies=[self._dataset._logical_plan.dag],
         )
+        logical_plan = LogicalPlan(op, self._dataset.context)
+        return Dataset._from_parent(self._dataset, logical_plan)
 
     @PublicAPI(api_group=EXPRESSION_API_GROUP, stability="alpha")
     def with_column(
