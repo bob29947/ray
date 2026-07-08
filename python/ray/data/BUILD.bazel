@@ -336,9 +336,9 @@ py_test(
 )
 
 py_test(
-    name = "test_parquet_cudf_shuffle_elision_gpu",
+    name = "test_parquet_cudf_map_group_partitions_gpu",
     size = "medium",
-    srcs = ["tests/test_parquet_cudf_shuffle_elision_gpu.py"],
+    srcs = ["tests/test_parquet_cudf_map_group_partitions_gpu.py"],
     tags = [
         "cudf",
         "exclusive",
@@ -351,9 +351,9 @@ py_test(
 )
 
 py_test(
-    name = "test_map_groups_logical",
+    name = "test_map_group_partitions_logical",
     size = "small",
-    srcs = ["tests/unit/test_map_groups_logical.py"],
+    srcs = ["tests/unit/test_map_group_partitions_logical.py"],
     tags = [
         "exclusive",
         "team:data",
@@ -365,9 +365,9 @@ py_test(
 )
 
 py_test(
-    name = "test_parquet_cudf_shuffle_elision",
+    name = "test_parquet_cudf_map_group_partitions",
     size = "small",
-    srcs = ["tests/unit/test_parquet_cudf_shuffle_elision.py"],
+    srcs = ["tests/unit/test_parquet_cudf_map_group_partitions.py"],
     tags = [
         "exclusive",
         "team:data",

@@ -98,7 +98,7 @@ class _ParquetCudfDirectReadSpec:
 
 @dataclass(frozen=True)
 class _ParquetCudfDirectReadResult:
-    """Either an immutable direct-read specification or a stable rejection."""
+    """An immutable direct-read specification or incompatibility reason."""
 
     spec: Optional[_ParquetCudfDirectReadSpec] = None
     reason: Optional[str] = None
@@ -978,11 +978,12 @@ class ParquetDatasource(Datasource):
     def _get_parquet_cudf_direct_read_spec(
         self,
     ) -> _ParquetCudfDirectReadResult:
-        """Describe this read for the opt-in cuDF shuffle-elision planner.
+        """Describe this read for explicit cuDF ``map_group_partitions``.
 
         Keeping this check on the datasource prevents the planner from depending
-        on the datasource's mutable implementation details. A rejection is normal:
-        the caller must retain the ordinary Parquet read and hash shuffle.
+        on the datasource's mutable implementation details. An incompatibility
+        reason becomes a user-facing planning error because this API has no
+        fallback implementation.
         """
 
         import pyarrow.fs as pafs
@@ -995,14 +996,24 @@ class ParquetDatasource(Datasource):
             return _ParquetCudfDirectReadResult(reason="partition_columns")
 
         projection_map = self._projection_map
-        if (
-            not isinstance(projection_map, dict)
-            or not projection_map
-            or any(
+        if projection_map is None:
+            projection = tuple(self._file_schema.names)
+            if (
+                not projection
+                or len(projection) != len(set(projection))
+                or any(not isinstance(name, str) or not name for name in projection)
+            ):
+                return _ParquetCudfDirectReadResult(reason="projection")
+        elif (
+            isinstance(projection_map, dict)
+            and projection_map
+            and not any(
                 not isinstance(key, str) or not key or key != value
                 for key, value in projection_map.items()
             )
         ):
+            projection = tuple(projection_map)
+        else:
             return _ParquetCudfDirectReadResult(reason="projection")
 
         filesystem = self._filesystem
@@ -1043,7 +1054,7 @@ class ParquetDatasource(Datasource):
                 source_kind=source_kind,
                 paths=paths,
                 listed_file_sizes=tuple(int(size) for size in listed_sizes),
-                projection=tuple(projection_map),
+                projection=projection,
                 file_schema=self._file_schema,
                 region=region,
             )

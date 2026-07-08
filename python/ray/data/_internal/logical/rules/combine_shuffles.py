@@ -6,12 +6,10 @@ from ray.data._internal.logical.interfaces import (
 )
 from ray.data._internal.logical.operators import (
     Aggregate,
-    MapGroups,
     Repartition,
     Sort,
     StreamingRepartition,
 )
-from ray.data.context import ShuffleStrategy
 
 __all__ = [
     "CombineShuffles",
@@ -79,17 +77,6 @@ class CombineShuffles(Rule):
                 keys=op.keys,
                 sort=op.sort,
             )
-        elif isinstance(op, MapGroups):
-            lowers_to_repartition = op.key is None or op.shuffle_strategy in (
-                ShuffleStrategy.HASH_SHUFFLE,
-                ShuffleStrategy.GPU_SHUFFLE,
-            )
-            if lowers_to_repartition and isinstance(
-                input_op, (Repartition, StreamingRepartition)
-            ):
-                return op._with_new_input_dependencies([input_op.input_dependencies[0]])
-            if not lowers_to_repartition and isinstance(input_op, Sort):
-                return op._with_new_input_dependencies([input_op.input_dependencies[0]])
         elif isinstance(input_op, Sort) and isinstance(op, Sort):
             return Sort(
                 sort_key=op.sort_key,

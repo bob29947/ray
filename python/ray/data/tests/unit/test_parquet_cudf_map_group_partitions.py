@@ -9,17 +9,19 @@ import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import pytest
 
-from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
+from ray.data._internal.compute import ActorPoolStrategy
 from ray.data._internal.datasource.parquet_datasource import (
     ParquetDatasource,
     _ParquetCudfDirectReadSpec,
     _parquet_cudf_direct_paths_are_ambient,
 )
-from ray.data._internal.object_extensions.arrow import ArrowPythonObjectType
-from ray.data._internal.logical.operators import MapBatches, MapGroups, Read
-from ray.data._internal.planner import parquet_cudf_shuffle_elision as optimizer
-from ray.data.context import DataContext, ShuffleStrategy
-from ray.data.grouped_data import ParquetCudfShuffleElisionConfig
+from ray.data._internal.logical.operators import (
+    MapBatches,
+    MapGroupPartitions,
+    Read,
+)
+from ray.data._internal.planner import parquet_cudf_map_group_partitions as optimizer
+from ray.data.context import DataContext
 
 MIB = 1024**2
 GIB = 1024**3
@@ -30,12 +32,17 @@ class Tokenizer:
         return batch
 
 
-def group_fn(batch):
-    return batch
-
-
 def partition_fn(batch, context):
     return batch
+
+
+@pytest.fixture(autouse=True)
+def cluster_with_four_gpus(monkeypatch):
+    monkeypatch.setattr(
+        "ray.data._internal.execution.operators.hash_shuffle"
+        "._get_total_cluster_resources",
+        lambda: SimpleNamespace(gpu=4),
+    )
 
 
 def _row(
@@ -60,14 +67,11 @@ def _row(
     )
 
 
-def _plan(rows, *, partitions=1, shuffle_bytes=MIB, peak_bytes=1, gpu=100 * GIB):
+def _plan(rows, *, ranges=1, workers=1):
     return optimizer._plan_ranges(
         tuple(rows),
-        num_partitions=partitions,
-        num_workers=1,
-        shuffle_bytes_per_row=shuffle_bytes,
-        peak_gpu_bytes_per_row=peak_bytes,
-        gpu_memory_bytes=gpu,
+        target_ranges=ranges,
+        num_workers=workers,
     )
 
 
@@ -108,49 +112,59 @@ def test_datasource_owns_direct_read_eligibility():
     assert result.spec.projection == ("User", "Card")
     assert result.spec.listed_file_sizes == (123,)
 
+    datasource._projection_map = None
+    result = datasource._get_parquet_cudf_direct_read_spec()
+    assert result.reason is None
+    assert result.spec.projection == ("User", "Card")
+
+    datasource._projection_map = {"renamed": "User"}
+    assert datasource._get_parquet_cudf_direct_read_spec().reason == "projection"
+
+    datasource._projection_map = {"User": "User", "Card": "Card"}
     datasource._predicate_expr = object()
     assert datasource._get_parquet_cudf_direct_read_spec().reason == "predicate"
 
 
-def test_range_planner_uses_first_safe_p_2p_4p_count():
+def test_range_planner_uses_exact_target_and_stable_file_order():
     rows = [_row("z", 0, 128, 1, 1), _row("a", 0, 128, 0, 0)]
-    plan = _plan(rows, peak_bytes=12 * MIB, gpu=4 * GIB)
+    plan = _plan(rows, ranges=2)
     assert [(item.lower, item.upper) for item in plan.work] == [(0, 0), (1, 1)]
     assert [item.files[0].path for item in plan.work] == ["a", "z"]
-    assert plan.gpu_budget == 2 * GIB
+    assert plan.amplification == (1.0, 1.0, 1.0)
 
 
-def test_range_planner_applies_inclusive_cost_thresholds():
-    plan = _plan([_row("a", 0, 256, 0, 0)])
-    assert plan.net_savings == 256 * MIB
-    with pytest.raises(optimizer._PlanningRejected, match="range_thresholds"):
-        _plan([_row("a", 0, 256, 0, 0)], shuffle_bytes=MIB - 1)
+def test_range_planner_warns_instead_of_rejecting_costly_data(caplog):
+    caplog.set_level("WARNING", logger=optimizer.__name__)
+    optimizer.logger.addHandler(caplog.handler)
+    try:
+        overlapping = [
+            _row("a", 0, 100, 0, 0),
+            _row("b", 0, 100, 0, 1),
+            _row("c", 0, 100, 1, 1),
+        ]
+        plan = _plan(overlapping, ranges=2)
+        assert max(plan.amplification) == pytest.approx(4 / 3)
+        assert "read amplification" in caplog.text
 
-    balanced = [_row("a", 0, 192, 0, 0), _row("b", 0, 64, 1, 1)]
-    assert _plan(balanced, partitions=2).skew == 1.5
-    with pytest.raises(optimizer._PlanningRejected, match="range_thresholds"):
-        _plan(
-            [_row("a", 0, 193, 0, 0), _row("b", 0, 63, 1, 1)],
-            partitions=2,
-        )
+        caplog.clear()
+        skewed = [_row("a", 0, 193, 0, 0), _row("b", 0, 63, 1, 1)]
+        plan = _plan(skewed, ranges=2)
+        assert plan.skew > 1.5
+        assert "range skew" in caplog.text
+    finally:
+        optimizer.logger.removeHandler(caplog.handler)
 
 
-def test_range_planner_accounts_for_duplicate_reads_and_memory():
-    overlapping = [
-        _row("a", 0, 128, 0, 0, compressed=300 * MIB),
-        _row("b", 0, 128, 0, 1, compressed=300 * MIB),
-        _row("c", 0, 128, 1, 1, compressed=300 * MIB),
-    ]
-    with pytest.raises(optimizer._PlanningRejected, match="range_thresholds"):
-        _plan(overlapping, partitions=2, shuffle_bytes=2 * MIB)
-
-    assert _plan([_row("a", 0, 256, 0, 0)], peak_bytes=8 * MIB, gpu=4 * GIB)
-    with pytest.raises(optimizer._PlanningRejected, match="range_thresholds"):
-        _plan(
-            [_row("a", 0, 256, 0, 0)],
-            peak_bytes=8 * MIB + 1,
-            gpu=4 * GIB,
-        )
+def test_range_planner_caps_domain_and_warns_about_underutilization(caplog):
+    caplog.set_level("WARNING", logger=optimizer.__name__)
+    optimizer.logger.addHandler(caplog.handler)
+    try:
+        plan = _plan([_row("a", 0, 256, 7, 7)], ranges=8, workers=4)
+        assert [(item.lower, item.upper) for item in plan.work] == [(7, 7)]
+        assert "capped ranges" in caplog.text
+        assert "underutilize GPUs" in caplog.text
+    finally:
+        optimizer.logger.removeHandler(caplog.handler)
 
 
 def test_footer_planning_uses_only_metadata_and_detects_changes(tmp_path, monkeypatch):
@@ -185,11 +199,16 @@ def test_footer_planning_uses_only_metadata_and_detects_changes(tmp_path, monkey
         return optimizer._SourceIdentity(identity.size, "changed")
 
     monkeypatch.setattr(optimizer, "_source_identity", changing_identity)
-    with pytest.raises(optimizer._PlanningRejected, match="source_changed"):
+    with pytest.raises(optimizer._PlanningError, match="source changed"):
         optimizer._read_footer_summary(spec, "User")
 
 
-def _candidate_fixture(*, explicit=True):
+def _candidate_fixture(
+    *,
+    num_partitions=2,
+    compute=None,
+    resources=None,
+):
     datasource = ParquetDatasource.__new__(ParquetDatasource)
     datasource._parquet_cudf_direct_options_compatible = True
     datasource._predicate_expr = None
@@ -206,92 +225,144 @@ def _candidate_fixture(*, explicit=True):
         datasource_or_legacy_reader=datasource,
         parallelism=1,
     )
-    resources = {"num_cpus": 1.0, "num_gpus": 1.0}
+    resources = resources or {"num_cpus": 1.0, "num_gpus": 1.0}
     tokenized = MapBatches(
         Tokenizer,
         input_dependencies=[read],
         batch_size=1024,
         batch_format="cudf",
-        zero_copy_batch=True,
-        can_modify_num_rows=False,
-        compute=ActorPoolStrategy(size=2, max_tasks_in_flight_per_actor=1),
+        can_modify_num_rows=True,
+        compute=compute or ActorPoolStrategy(size=2),
         ray_remote_args=resources,
     )
-    config = ParquetCudfShuffleElisionConfig(
-        partition_fn=partition_fn,
-        shuffle_bytes_per_input_row=MIB,
-        peak_gpu_bytes_per_input_row=1,
-        gpu_memory_bytes=32 * GIB,
-    )
-    grouped = MapGroups(
+    grouped = MapGroupPartitions(
         key=["User", "Card"],
-        num_partitions=2,
-        num_partitions_explicit=explicit,
-        shuffle_strategy=ShuffleStrategy.HASH_SHUFFLE,
-        fn=group_fn,
-        batch_format="cudf",
-        zero_copy_batch=True,
-        compute=TaskPoolStrategy(size=2),
-        ray_remote_args=resources,
-        parquet_cudf_shuffle_elision=config,
+        num_partitions=num_partitions,
+        fn=partition_fn,
         input_dependencies=[tokenized],
     )
     return grouped
 
 
-def test_selector_accepts_only_the_explicit_exact_pipeline():
+def test_selector_accepts_exact_pipeline_and_explicit_range_count():
     candidate = optimizer._select_candidate(
         _candidate_fixture(), DataContext.get_current().copy()
     )
     assert candidate.group_keys == ("User", "Card")
-    assert candidate.num_partitions == candidate.num_workers == 2
+    assert candidate.target_ranges == candidate.num_workers == 2
+    assert candidate.compute.max_tasks_in_flight_per_actor == 1
 
-    with pytest.raises(optimizer._PlanningRejected, match="partitions"):
+
+def test_selector_derives_two_ranges_per_bounded_pool_worker():
+    candidate = optimizer._select_candidate(
+        _candidate_fixture(
+            num_partitions=None,
+            compute=ActorPoolStrategy(min_size=1, max_size=3),
+        ),
+        DataContext.get_current().copy(),
+    )
+    assert candidate.num_workers == 3
+    assert candidate.target_ranges == 6
+    assert candidate.compute.min_size == 1
+    assert candidate.compute.max_size == 3
+
+
+def test_selector_allows_bounded_max_above_total_gpus(monkeypatch):
+    monkeypatch.setattr(
+        "ray.data._internal.execution.operators.hash_shuffle"
+        "._get_total_cluster_resources",
+        lambda: SimpleNamespace(gpu=2),
+    )
+    candidate = optimizer._select_candidate(
+        _candidate_fixture(
+            num_partitions=None,
+            compute=ActorPoolStrategy(min_size=1, max_size=8),
+        ),
+        DataContext.get_current().copy(),
+    )
+    assert candidate.num_workers == 8
+    assert candidate.target_ranges == 16
+    assert candidate.compute.max_size == 8
+
+
+def test_selector_caps_default_pool_at_detected_gpus():
+    candidate = optimizer._select_candidate(
+        _candidate_fixture(num_partitions=None, compute=ActorPoolStrategy()),
+        DataContext.get_current().copy(),
+    )
+    assert candidate.num_workers == 4
+    assert candidate.target_ranges == 8
+    assert candidate.compute.max_size == 4
+
+
+@pytest.mark.parametrize(
+    ("total_gpus", "compute", "minimum"),
+    [
+        (0, ActorPoolStrategy(), 1),
+        (1, ActorPoolStrategy(size=2), 2),
+    ],
+)
+def test_selector_requires_actor_pool_minimum_to_fit_cluster(
+    monkeypatch, total_gpus, compute, minimum
+):
+    monkeypatch.setattr(
+        "ray.data._internal.execution.operators.hash_shuffle"
+        "._get_total_cluster_resources",
+        lambda: SimpleNamespace(gpu=total_gpus),
+    )
+    with pytest.raises(
+        optimizer._PlanningError,
+        match=rf"at least {minimum} total Ray GPU.*detected {total_gpus}",
+    ):
         optimizer._select_candidate(
-            _candidate_fixture(explicit=False), DataContext.get_current().copy()
+            _candidate_fixture(compute=compute), DataContext.get_current().copy()
         )
 
-    no_backpressure = _candidate_fixture()
-    object.__setattr__(
-        no_backpressure.input_dependencies[0],
-        "compute",
-        ActorPoolStrategy(size=2),
-    )
-    with pytest.raises(optimizer._PlanningRejected, match="tokenizer_pool"):
-        optimizer._select_candidate(no_backpressure, DataContext.get_current().copy())
+
+def test_selector_requires_one_gpu():
+    with pytest.raises(optimizer._PlanningError, match="exactly num_gpus=1"):
+        optimizer._select_candidate(
+            _candidate_fixture(resources={"num_gpus": 0.5}),
+            DataContext.get_current().copy(),
+        )
 
 
-def test_selector_rejects_nondefault_error_policy():
+def test_selector_rejects_checkpointing():
     context = DataContext.get_current().copy()
-    context.retried_map_errors = True
-    with pytest.raises(optimizer._PlanningRejected, match="context_retried_map_errors"):
+    context._checkpoint_config = object()
+    with pytest.raises(optimizer._PlanningError, match="checkpointing"):
         optimizer._select_candidate(_candidate_fixture(), context)
 
 
-def test_selector_rejects_extension_type_projection():
+def test_selector_rejects_errored_blocks_policy():
+    context = DataContext.get_current().copy()
+    context.max_errored_blocks = 1
+    with pytest.raises(optimizer._PlanningError, match="max_errored_blocks=0"):
+        optimizer._select_candidate(_candidate_fixture(), context)
+
+
+def test_selector_does_not_allowlist_payload_column_types():
     grouped = _candidate_fixture()
     datasource = grouped.input_dependencies[0].input_dependencies[0].datasource
     datasource._file_schema = pa.schema(
-        [("User", pa.int64()), ("Card", ArrowPythonObjectType())]
+        [("User", pa.int64()), ("Card", pa.list_(pa.int8()))]
     )
 
-    with pytest.raises(optimizer._PlanningRejected, match="projection_type"):
-        optimizer._select_candidate(grouped, DataContext.get_current().copy())
+    candidate = optimizer._select_candidate(grouped, DataContext.get_current().copy())
+    assert candidate.group_keys == ("User", "Card")
 
 
-def test_configured_fallback_reason_is_visible(caplog):
-    caplog.set_level("INFO", logger=optimizer.__name__)
-    optimizer.logger.addHandler(caplog.handler)
-    try:
-        assert (
-            optimizer.try_plan_parquet_cudf_shuffle_elision(
-                _candidate_fixture(explicit=False), DataContext.get_current().copy()
-            )
-            is None
+def test_public_planner_raises_instead_of_falling_back():
+    grouped = _candidate_fixture()
+    object.__setattr__(
+        grouped,
+        "input_dependencies",
+        grouped.input_dependencies[0].input_dependencies,
+    )
+    with pytest.raises(ValueError, match="must immediately follow map_batches"):
+        optimizer.plan_parquet_cudf_map_group_partitions(
+            grouped, DataContext.get_current().copy()
         )
-    finally:
-        optimizer.logger.removeHandler(caplog.handler)
-    assert "fallback: reason=partitions probe_bytes=0" in caplog.text
 
 
 def test_rebatching_is_linear_and_exact():
@@ -310,10 +381,10 @@ def test_rebatching_is_linear_and_exact():
     assert FakeCudf.concat_calls <= len(batches)
 
 
-@pytest.mark.parametrize("violation", ["rows", "key"])
+@pytest.mark.parametrize("violation", ["missing_key", "range"])
 def test_runtime_validates_tokenizer_contract(violation):
-    worker = optimizer._ParquetCudfShuffleElisionWorker.__new__(
-        optimizer._ParquetCudfShuffleElisionWorker
+    worker = optimizer._ParquetCudfMapGroupPartitionsWorker.__new__(
+        optimizer._ParquetCudfMapGroupPartitionsWorker
     )
 
     class FakeCudf:
@@ -324,23 +395,24 @@ def test_runtime_validates_tokenizer_contract(violation):
     worker.source_kind = "local"
     worker.cudf = FakeCudf
     worker.range_key = "User"
+    worker.group_keys = ("User", "Card")
     worker.tokenizer_batch_size = 2
     worker.tokenizer_args = ()
     worker.tokenizer_kwargs = {}
     worker._read_frames = lambda work: iter((frame,))
-    if violation == "rows":
-        worker.tokenizer = lambda batch: batch.iloc[:1]
+    if violation == "missing_key":
+        worker.tokenizer = lambda batch: batch.drop(columns=["User"])
     else:
-        worker.tokenizer = lambda batch: batch.assign(User=[2, 1])
+        worker.tokenizer = lambda batch: batch.assign(User=[3, 1])
 
     batch = {"work": [pickle.dumps(optimizer._RangeWork(0, 2, ()))]}
-    with pytest.raises(ValueError, match="row/key preservation"):
+    with pytest.raises(ValueError, match="group key|outside its assigned range"):
         list(worker(batch))
 
 
 def test_s3_chunk_read_retries_matching_io_errors(monkeypatch):
-    worker = optimizer._ParquetCudfShuffleElisionWorker.__new__(
-        optimizer._ParquetCudfShuffleElisionWorker
+    worker = optimizer._ParquetCudfMapGroupPartitionsWorker.__new__(
+        optimizer._ParquetCudfMapGroupPartitionsWorker
     )
     attempts = 0
     identity_checks = 0
@@ -382,8 +454,8 @@ def test_s3_chunk_read_retries_matching_io_errors(monkeypatch):
 
 
 def test_s3_chunk_read_exhausts_matching_io_errors(monkeypatch):
-    worker = optimizer._ParquetCudfShuffleElisionWorker.__new__(
-        optimizer._ParquetCudfShuffleElisionWorker
+    worker = optimizer._ParquetCudfMapGroupPartitionsWorker.__new__(
+        optimizer._ParquetCudfMapGroupPartitionsWorker
     )
     attempts = 0
 
@@ -424,9 +496,9 @@ def test_partition_result_accepts_non_generator_iterator():
     ]
 
 
-def test_partition_function_runs_once_with_sorted_composite_groups(monkeypatch):
-    worker = optimizer._ParquetCudfShuffleElisionWorker.__new__(
-        optimizer._ParquetCudfShuffleElisionWorker
+def test_partition_function_runs_once_after_row_count_changing_tokenizer(monkeypatch):
+    worker = optimizer._ParquetCudfMapGroupPartitionsWorker.__new__(
+        optimizer._ParquetCudfMapGroupPartitionsWorker
     )
 
     class FakeCudf:
@@ -462,12 +534,10 @@ def test_partition_function_runs_once_with_sorted_composite_groups(monkeypatch):
     worker.range_key = "User"
     worker.group_keys = ("User", "Card")
     worker.tokenizer_batch_size = 10
-    worker.tokenizer = lambda batch: batch
+    worker.tokenizer = lambda batch: batch.iloc[[0, 2]]
     worker.tokenizer_args = ()
     worker.tokenizer_kwargs = {}
     worker.partition_fn = partition
-    worker.group_args = ()
-    worker.group_kwargs = {}
     worker.target_bytes = MIB
     worker._read_frames = lambda work: iter((frame,))
 
@@ -476,16 +546,21 @@ def test_partition_function_runs_once_with_sorted_composite_groups(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0][["User", "Card"]].values.tolist() == [
         [1, 1],
-        [1, 2],
         [2, 0],
     ]
-    assert calls[0][1].input_group_boundaries == (0, 1, 2, 3)
-    assert result[0]["value"].tolist() == [11, 12, 20]
+    assert calls[0][1].input_group_boundaries == (0, 1, 2)
+    assert result[0]["value"].tolist() == [11, 20]
 
 
 def test_output_splitting():
     parts = list(optimizer._split_output({"x": pa.array(range(100))}, 160))
     assert sum(len(part["x"]) for part in parts) == 100
+
+
+def test_rmm_pool_uses_live_free_memory():
+    assert optimizer._live_rmm_pool_maximum(10 * GIB) == 7 * GIB
+    assert optimizer._live_rmm_pool_maximum(3 * GIB) == 1 * GIB
+    assert optimizer._live_rmm_pool_maximum(2 * GIB) == 0
 
 
 @pytest.mark.parametrize(
@@ -530,8 +605,8 @@ def test_s3_worker_recreates_client_after_refresh(monkeypatch):
             return Client()
 
     old_client = Client()
-    worker = optimizer._ParquetCudfShuffleElisionWorker.__new__(
-        optimizer._ParquetCudfShuffleElisionWorker
+    worker = optimizer._ParquetCudfMapGroupPartitionsWorker.__new__(
+        optimizer._ParquetCudfMapGroupPartitionsWorker
     )
     worker.source_kind = "s3"
     worker.region = "us-west-2"

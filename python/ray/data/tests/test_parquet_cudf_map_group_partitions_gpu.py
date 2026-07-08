@@ -5,18 +5,10 @@ import pyarrow.parquet as pq
 import pytest
 
 import ray
-from ray.data import (
-    ActorPoolStrategy,
-    ParquetCudfShuffleElisionConfig,
-    TaskPoolStrategy,
-)
-from ray.data.context import DataContext, ShuffleStrategy
 from ray.data.tests.conftest import *  # noqa: F403
 
 cudf = pytest.importorskip("cudf")
 cupy = pytest.importorskip("cupy")
-
-GIB = 1024**3
 
 
 @pytest.fixture
@@ -33,7 +25,7 @@ def ray_with_one_gpu(shutdown_only):  # noqa: F811
 
 
 @pytest.mark.gpu
-def test_selected_path_matches_map_groups_without_shuffle(
+def test_minimal_default_path_matches_expected_rows_without_shuffle(
     ray_with_one_gpu,
     restore_data_context,
     tmp_path,  # noqa: F811
@@ -45,16 +37,12 @@ def test_selected_path_matches_map_groups_without_shuffle(
         def __call__(self, batch):
             return batch.assign(tokenizer_instance=self.instance_id)
 
-    def identity_group(batch):
-        return batch
-
     def identity_partition(batch, context):
         assert context.group_keys == ("User", "Card")
         assert context.input_group_boundaries[0] == 0
         assert context.input_group_boundaries[-1] == len(batch)
         return batch
 
-    DataContext.get_current().shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
     path = tmp_path / "input.parquet"
     pq.write_table(
         pa.table(
@@ -68,32 +56,14 @@ def test_selected_path_matches_map_groups_without_shuffle(
         row_group_size=2,
     )
 
-    tokenized = ray.data.read_parquet(
-        str(path), columns=["User", "Card", "value"]
-    ).map_batches(
+    tokenized = ray.data.read_parquet(str(path)).map_batches(
         IdentityTokenizer,
         batch_size=2,
         batch_format="cudf",
-        zero_copy_batch=True,
-        compute=ActorPoolStrategy(size=1, max_tasks_in_flight_per_actor=1),
-        num_cpus=1,
         num_gpus=1,
-        udf_modifying_row_count=False,
     )
-    config = ParquetCudfShuffleElisionConfig(
-        partition_fn=identity_partition,
-        shuffle_bytes_per_input_row=GIB,
-        peak_gpu_bytes_per_input_row=1,
-        gpu_memory_bytes=32 * GIB,
-    )
-    output = tokenized.groupby(["User", "Card"], num_partitions=2).map_groups(
-        identity_group,
-        batch_format="cudf",
-        zero_copy_batch=True,
-        compute=TaskPoolStrategy(size=1),
-        num_cpus=1,
-        num_gpus=1,
-        parquet_cudf_shuffle_elision=config,
+    output = tokenized.groupby(["User", "Card"]).map_group_partitions(
+        identity_partition,
     )
 
     rows = output.take_all()
@@ -106,6 +76,6 @@ def test_selected_path_matches_map_groups_without_shuffle(
         {"User": 1, "Card": 2, "value": 40},
     ]
     stats = output.stats()
-    assert "ParquetCudfShuffleElision" in stats
+    assert "ParquetCudfMapGroupPartitions" in stats
     assert "ranges=2" in stats
     assert "Repartition" not in stats

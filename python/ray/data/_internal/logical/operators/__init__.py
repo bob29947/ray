@@ -19,7 +19,9 @@ from ray.data._internal.logical.operators.from_operators import (
 )
 from ray.data._internal.logical.operators.input_data_operator import InputData
 from ray.data._internal.logical.operators.join_operator import Join, JoinSide, JoinType
-from ray.data._internal.logical.operators.map_groups_operator import MapGroups
+from ray.data._internal.logical.operators.map_group_partitions_operator import (
+    MapGroupPartitions,
+)
 from ray.data._internal.logical.operators.map_operator import (
     CSE_TEMP_COLUMN_PREFIX,
     AbstractMap,
@@ -75,7 +77,7 @@ __all__ = [
     "Limit",
     "ListFiles",
     "MapBatches",
-    "MapGroups",
+    "MapGroupPartitions",
     "MapRows",
     "Mix",
     "MixStoppingCondition",

@@ -1,8 +1,8 @@
-"""Opt-in footer-planned Parquet/cuDF shuffle elision.
+"""Footer-planned Parquet/cuDF execution for ``map_group_partitions``.
 
-This module intentionally recognizes one narrow pipeline. If every contract is
-not explicit and verifiable, planning returns ``None`` and ``map_groups`` keeps
-its ordinary hash-shuffle implementation.
+The explicit API has no fallback implementation. This module recognizes one
+narrow logical pipeline and raises a clear planning error when that contract is
+not satisfied.
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ import pickle
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 if TYPE_CHECKING:
     from ray.data._internal.execution.interfaces import PhysicalOperator
-    from ray.data._internal.logical.operators import MapGroups
+    from ray.data._internal.logical.operators import MapGroupPartitions
     from ray.data.context import DataContext
 
 logger = logging.getLogger(__name__)
@@ -30,19 +30,34 @@ logger = logging.getLogger(__name__)
 _GIB = 1024**3
 _MAX_AMPLIFICATION = 1.25
 _MAX_SKEW = 1.5
-_MIN_NET_SAVINGS_PER_GPU = 256 * 1024**2
 _ROW_GROUPS_PER_READ = 32
 _KVIKIO_THREADS = 32
 _KVIKIO_TASK_SIZE = 16 * 1024**2
 
 
-class _PlanningRejected(Exception):
-    """A normal reason to retain the stock Ray Data plan."""
+class _PlanningError(ValueError):
+    """The explicit fast-path contract cannot be planned safely."""
+
+
+_REASON_MESSAGES = {
+    "source_unavailable": "a Parquet source file is unavailable",
+    "source_identity": "a stable Parquet source identity is unavailable",
+    "source_changed": "a Parquet source changed while its footer was read",
+    "listed_size_changed": "a Parquet source changed after dataset construction",
+    "missing_column": "a projected column is missing from a Parquet file",
+    "nested_range_key": "the leading group key must be a top-level Parquet column",
+    "key_statistics": (
+        "the leading group key needs non-null integer min/max row-group statistics"
+    ),
+    "size_statistics": "projected Parquet columns need row-group size statistics",
+    "empty_source": "the Parquet input has no nonempty row groups",
+    "s3_path": "an S3 source path is invalid",
+}
 
 
 def _require(condition: bool, reason: str) -> None:
     if not condition:
-        raise _PlanningRejected(reason)
+        raise _PlanningError(_REASON_MESSAGES.get(reason, reason))
 
 
 @dataclass(frozen=True)
@@ -87,21 +102,19 @@ class _FooterSummary:
 @dataclass(frozen=True)
 class _RangePlan:
     work: tuple[_RangeWork, ...]
-    gpu_budget: int
     amplification: tuple[float, float, float]
     skew: float
-    peak_bytes: int
-    net_savings: float
 
 
 @dataclass(frozen=True)
 class _Candidate:
     read_spec: Any
     tokenizer_op: Any
-    config: Any
+    partition_fn: Any
     group_keys: tuple[str, ...]
-    num_partitions: int
+    target_ranges: int
     num_workers: int
+    compute: Any
     resources: dict[str, Any]
     target_max_block_size: int
     retried_io_errors: tuple[str, ...]
@@ -119,182 +132,201 @@ def _is_synchronous(callable_: Any) -> bool:
     )
 
 
-def _is_plain_argument(value: Any) -> bool:
-    if value is None or isinstance(value, (str, bytes, int, float, bool)):
-        return True
-    if isinstance(value, (tuple, list)):
-        return all(_is_plain_argument(item) for item in value)
-    if isinstance(value, dict):
-        return all(
-            isinstance(key, str) and _is_plain_argument(item)
-            for key, item in value.items()
-        )
-    return False
+def _actor_pool_plan(compute: Any, requested_partitions: Any) -> tuple[Any, int, int]:
+    """Return a safe physical pool, estimated workers, and target ranges."""
 
-
-def _fixed_actor_pool_size(compute: Any) -> Optional[int]:
     from ray.data._internal.compute import ActorPoolStrategy
 
-    if not isinstance(compute, ActorPoolStrategy):
-        return None
-    size = compute.min_size
-    fixed = (
-        isinstance(size, numbers.Integral)
-        and not isinstance(size, bool)
-        and size > 0
-        and size == compute.max_size
-        and size == compute.initial_size
-        and compute.max_tasks_in_flight_per_actor == 1
-        and not compute.enable_true_multi_threading
+    _require(
+        isinstance(compute, ActorPoolStrategy),
+        "the upstream map_batches must use ActorPoolStrategy",
     )
-    return int(size) if fixed else None
+    for name in ("min_size", "initial_size"):
+        value = getattr(compute, name)
+        _require(
+            isinstance(value, numbers.Integral)
+            and not isinstance(value, bool)
+            and value > 0,
+            f"ActorPoolStrategy.{name} must be a positive integer",
+        )
+
+    from ray.data._internal.execution.operators.hash_shuffle import (
+        _get_total_cluster_resources,
+    )
+
+    total_gpus = int(_get_total_cluster_resources().gpu)
+    _require(
+        total_gpus >= int(compute.min_size),
+        "ActorPoolStrategy requires at least "
+        f"{int(compute.min_size)} total Ray GPU(s), but detected {total_gpus}",
+    )
+
+    finite_max = compute.max_size != float("inf")
+    if finite_max:
+        _require(
+            isinstance(compute.max_size, numbers.Integral)
+            and not isinstance(compute.max_size, bool)
+            and compute.max_size > 0,
+            "ActorPoolStrategy.max_size must be a positive integer",
+        )
+        workers = int(compute.max_size)
+        physical_compute = ActorPoolStrategy(
+            min_size=int(compute.min_size),
+            max_size=workers,
+            initial_size=int(compute.initial_size),
+            max_tasks_in_flight_per_actor=1,
+        )
+    else:
+        workers = total_gpus
+        physical_compute = ActorPoolStrategy(
+            min_size=min(int(compute.min_size), workers),
+            max_size=workers,
+            initial_size=min(int(compute.initial_size), workers),
+            max_tasks_in_flight_per_actor=1,
+        )
+
+    if requested_partitions is not None:
+        _require(
+            isinstance(requested_partitions, numbers.Integral)
+            and not isinstance(requested_partitions, bool)
+            and requested_partitions > 0,
+            "groupby num_partitions must be a positive integer when provided",
+        )
+        target_ranges = int(requested_partitions)
+    else:
+        target_ranges = 2 * workers
+    return physical_compute, workers, target_ranges
 
 
-def _fixed_task_pool_size(compute: Any) -> Optional[int]:
-    from ray.data._internal.compute import TaskPoolStrategy
-
-    size = compute.size if isinstance(compute, TaskPoolStrategy) else None
-    if isinstance(size, numbers.Integral) and not isinstance(size, bool) and size > 0:
-        return int(size)
-    return None
-
-
-def _select_candidate(op: "MapGroups", data_context: "DataContext") -> _Candidate:
+def _select_candidate(
+    op: "MapGroupPartitions", data_context: "DataContext"
+) -> _Candidate:
     import pyarrow as pa
 
     from ray.data._internal.datasource.parquet_datasource import ParquetDatasource
     from ray.data._internal.logical.operators import MapBatches, Read
-    from ray.data.context import ShuffleStrategy
 
-    config = op.parquet_cudf_shuffle_elision
-    _require(config is not None, "not_configured")
-    _require(op.shuffle_strategy == ShuffleStrategy.HASH_SHUFFLE, "not_hash_shuffle")
-    for option in (
-        "checkpoint_config",
-        "retried_map_errors",
-        "actor_task_retry_on_errors",
-        "actor_init_retry_on_errors",
-    ):
-        _require(not getattr(data_context, option, None), f"context_{option}")
-    _require(data_context.max_errored_blocks == 0, "context_max_errored_blocks")
+    _require(
+        data_context.checkpoint_config is None,
+        "map_group_partitions is incompatible with checkpointing",
+    )
+    _require(
+        data_context.max_errored_blocks == 0,
+        "map_group_partitions requires DataContext.max_errored_blocks=0",
+    )
 
     group_keys = (op.key,) if isinstance(op.key, str) else tuple(op.key or ())
     _require(
         bool(group_keys)
         and len(group_keys) == len(set(group_keys))
         and all(isinstance(key, str) and key for key in group_keys),
-        "group_keys",
+        "map_group_partitions requires one or more unique string group keys",
     )
     _require(
-        op.num_partitions_explicit
-        and isinstance(op.num_partitions, numbers.Integral)
-        and not isinstance(op.num_partitions, bool)
-        and op.num_partitions > 0,
-        "partitions",
+        not inspect.isclass(op.fn) and _is_synchronous(op.fn),
+        "map_group_partitions requires a synchronous function",
     )
 
-    _require(len(op.input_dependencies) == 1, "tokenizer_shape")
+    _require(
+        len(op.input_dependencies) == 1,
+        "map_group_partitions must immediately follow one map_batches",
+    )
     tokenizer_op = op.input_dependencies[0]
-    _require(type(tokenizer_op) is MapBatches, "tokenizer_shape")
-    _require(len(tokenizer_op.input_dependencies) == 1, "read_shape")
+    _require(
+        type(tokenizer_op) is MapBatches,
+        "map_group_partitions must immediately follow map_batches",
+    )
+    _require(
+        len(tokenizer_op.input_dependencies) == 1,
+        "the upstream map_batches must immediately follow read_parquet",
+    )
     read_op = tokenizer_op.input_dependencies[0]
-    _require(type(read_op) is Read, "read_shape")
+    _require(
+        type(read_op) is Read,
+        "the upstream map_batches must immediately follow read_parquet",
+    )
     datasource = read_op.datasource
     _require(
         type(datasource) is ParquetDatasource
         and read_op.datasource_or_legacy_reader is datasource,
-        "datasource",
+        "map_group_partitions only supports ray.data.read_parquet inputs",
     )
 
     read_result = datasource._get_parquet_cudf_direct_read_spec()
-    _require(read_result.spec is not None, f"read_{read_result.reason}")
+    _require(
+        read_result.spec is not None,
+        "read_parquet options are unsupported for direct cuDF execution "
+        f"({read_result.reason})",
+    )
     read_spec = read_result.spec
-    _require(all(key in read_spec.projection for key in group_keys), "group_projection")
-    _require(group_keys[0] in read_spec.file_schema.names, "range_key")
+    _require(
+        all(key in read_spec.projection for key in group_keys),
+        "every group key must be projected by read_parquet",
+    )
+    _require(
+        group_keys[0] in read_spec.file_schema.names,
+        "the leading group key must be a source Parquet column",
+    )
     _require(
         pa.types.is_integer(read_spec.file_schema.field(group_keys[0]).type),
-        "range_key_type",
+        "the leading group key must have an integer Parquet type",
     )
-    for field in read_spec.file_schema:
-        if field.name not in read_spec.projection:
-            continue
-        unsupported = (
-            pa.types.is_nested(field.type)
-            or pa.types.is_decimal(field.type)
-            or pa.types.is_dictionary(field.type)
-            or (pa.types.is_timestamp(field.type) and field.type.tz is not None)
-            or isinstance(field.type, pa.ExtensionType)
-        )
-        _require(not unsupported, "projection_type")
-
-    _require(read_op.per_block_limit is None, "read_limit")
+    _require(
+        read_op.per_block_limit is None,
+        "a limited read_parquet input is unsupported",
+    )
     allowed_read_args = {"scheduling_strategy", "label_selector"}
-    _require(set(read_op.ray_remote_args) <= allowed_read_args, "read_resources")
+    _require(
+        set(read_op.ray_remote_args) <= allowed_read_args,
+        "read_parquet has unsupported task resource options",
+    )
 
     tokenizer_options_ok = (
         inspect.isclass(tokenizer_op.fn)
         and _is_synchronous(tokenizer_op.fn)
         and tokenizer_op.batch_format == "cudf"
-        and tokenizer_op.zero_copy_batch
-        and not tokenizer_op.can_modify_num_rows
         and isinstance(tokenizer_op.batch_size, numbers.Integral)
         and not isinstance(tokenizer_op.batch_size, bool)
         and tokenizer_op.batch_size > 0
         and tokenizer_op.per_block_limit is None
         and tokenizer_op.ray_remote_args_fn is None
     )
-    _require(tokenizer_options_ok, "tokenizer_options")
     _require(
-        all(
-            _is_plain_argument(value)
-            for value in (
-                tokenizer_op.fn_args,
-                tokenizer_op.fn_kwargs,
-                tokenizer_op.fn_constructor_args,
-                tokenizer_op.fn_constructor_kwargs,
-                op.fn_args,
-                op.fn_kwargs,
-            )
-        ),
-        "udf_arguments",
+        tokenizer_options_ok,
+        "the upstream tokenizer must be a synchronous callable class with "
+        "batch_format='cudf', a positive integer batch_size, and no dynamic "
+        "remote-argument function or per-block limit",
     )
-    workers = _fixed_actor_pool_size(tokenizer_op.compute)
-    _require(workers is not None and workers <= op.num_partitions, "tokenizer_pool")
-
-    group_options_ok = (
-        _is_synchronous(op.fn)
-        and op.batch_format == "cudf"
-        and op.zero_copy_batch
-        and op.fn_constructor_args is None
-        and op.fn_constructor_kwargs is None
-        and op.ray_remote_args_fn is None
-        and not inspect.isclass(config.partition_fn)
-        and _is_synchronous(config.partition_fn)
+    compute, workers, target_ranges = _actor_pool_plan(
+        tokenizer_op.compute, op.num_partitions
     )
-    _require(group_options_ok, "group_options")
-    _require(_fixed_task_pool_size(op.compute) == workers, "group_pool")
 
-    tokenizer_resources = dict(tokenizer_op.ray_remote_args)
-    group_resources = dict(op.ray_remote_args)
-    _require(tokenizer_resources == group_resources, "worker_resources")
+    resources = dict(tokenizer_op.ray_remote_args)
     retry_options = {
         "max_restarts",
         "max_task_retries",
         "max_retries",
         "retry_exceptions",
     }
-    _require(not retry_options.intersection(group_resources), "worker_retries")
-    _require(float(group_resources.get("num_gpus", 0)) == 1.0, "one_gpu")
-    _require(group_resources.get("max_concurrency", 1) in (None, 1), "concurrency")
+    _require(
+        not retry_options.intersection(resources),
+        "custom map_batches retry options are unsupported",
+    )
+    num_gpus = resources.get("num_gpus")
+    _require(
+        isinstance(num_gpus, numbers.Real)
+        and not isinstance(num_gpus, bool)
+        and float(num_gpus) == 1.0,
+        "the upstream map_batches must request exactly num_gpus=1",
+    )
 
-    resources = dict(group_resources)
     for option in ("scheduling_strategy", "label_selector"):
         if option not in read_op.ray_remote_args:
             continue
         _require(
             option not in resources
             or resources[option] == read_op.ray_remote_args[option],
-            f"read_{option}_conflict",
+            f"read_parquet and map_batches specify conflicting {option}",
         )
         resources[option] = read_op.ray_remote_args[option]
 
@@ -303,27 +335,28 @@ def _select_candidate(op: "MapGroups", data_context: "DataContext") -> _Candidat
         isinstance(target_bytes, numbers.Integral)
         and not isinstance(target_bytes, bool)
         and target_bytes > 0,
-        "target_block_size",
+        "DataContext.target_max_block_size must be a positive integer",
     )
     retried_io_errors = tuple(data_context.retried_io_errors)
     _require(
         all(isinstance(pattern, str) for pattern in retried_io_errors),
-        "context_retried_io_errors",
+        "DataContext.retried_io_errors must contain strings",
     )
     if read_spec.source_kind == "s3":
         _require(
             not os.environ.get("AWS_ENDPOINT_URL")
             and not os.environ.get("AWS_ENDPOINT_URL_S3"),
-            "s3_endpoint_override",
+            "custom S3 endpoint overrides are unsupported",
         )
 
     return _Candidate(
         read_spec=read_spec,
         tokenizer_op=tokenizer_op,
-        config=config,
+        partition_fn=op.fn,
         group_keys=group_keys,
-        num_partitions=int(op.num_partitions),
+        target_ranges=target_ranges,
         num_workers=workers,
+        compute=compute,
         resources=resources,
         target_max_block_size=int(target_bytes),
         retried_io_errors=retried_io_errors,
@@ -333,7 +366,7 @@ def _select_candidate(op: "MapGroups", data_context: "DataContext") -> _Candidat
 def _split_s3_path(path: str) -> tuple[str, str]:
     bucket, separator, key = path.partition("/")
     if not separator or not bucket or not key:
-        raise _PlanningRejected("s3_path")
+        raise _PlanningError(_REASON_MESSAGES["s3_path"])
     return bucket, key
 
 
@@ -473,85 +506,91 @@ def _read_footer_summary(read_spec: Any, range_key: str) -> _FooterSummary:
 def _plan_ranges(
     rows: tuple[_RowGroup, ...],
     *,
-    num_partitions: int,
+    target_ranges: int,
     num_workers: int,
-    shuffle_bytes_per_row: float,
-    peak_gpu_bytes_per_row: float,
-    gpu_memory_bytes: int,
 ) -> _RangePlan:
+    """Create one fixed range plan and warn when estimates look expensive."""
+
+    _require(target_ranges > 0, "the range target must be positive")
     total_rows = sum(row.num_rows for row in rows)
     total_compressed = sum(row.compressed_bytes for row in rows)
     total_uncompressed = sum(row.uncompressed_bytes for row in rows)
-    budget = min(int(gpu_memory_bytes * 0.70), gpu_memory_bytes - 2 * _GIB)
-    _require(budget > 0, "gpu_budget")
 
     domain_lower = min(row.lower for row in rows)
     domain_upper = max(row.upper for row in rows)
     domain_size = domain_upper - domain_lower + 1
-    for count in (num_partitions, num_partitions * 2, num_partitions * 4):
-        if count > domain_size:
+    count = min(target_ranges, domain_size)
+    if count < target_ranges:
+        logger.warning(
+            "ParquetCudfMapGroupPartitions capped ranges from %d to key-domain "
+            "size %d; execution may underutilize GPUs",
+            target_ranges,
+            count,
+        )
+
+    ranges: list[tuple[int, int, tuple[_RowGroup, ...]]] = []
+    loads: list[tuple[int, int, int]] = []
+    for index in range(count):
+        lower = domain_lower + domain_size * index // count
+        upper = domain_lower + domain_size * (index + 1) // count - 1
+        selected = tuple(
+            row for row in rows if row.upper >= lower and row.lower <= upper
+        )
+        if not selected:
             continue
-        ranges: list[tuple[int, int, tuple[_RowGroup, ...]]] = []
-        loads: list[tuple[int, int, int]] = []
-        for index in range(count):
-            lower = domain_lower + domain_size * index // count
-            upper = domain_lower + domain_size * (index + 1) // count - 1
-            selected = tuple(
-                row for row in rows if row.upper >= lower and row.lower <= upper
-            )
-            load = (
+        ranges.append((lower, upper, selected))
+        loads.append(
+            (
                 sum(row.num_rows for row in selected),
                 sum(row.compressed_bytes for row in selected),
                 sum(row.uncompressed_bytes for row in selected),
             )
-            ranges.append((lower, upper, selected))
-            loads.append(load)
-        if any(load[0] == 0 for load in loads):
-            continue
+        )
 
-        duplicated_totals = tuple(sum(load[i] for load in loads) for i in range(3))
-        source_totals = (total_rows, total_compressed, total_uncompressed)
-        amplification = tuple(duplicated_totals[i] / source_totals[i] for i in range(3))
-        skew = max(
-            max(load[i] for load in loads) / (duplicated_totals[i] / count)
-            for i in range(3)
-        )
-        peak_bytes = max(
-            max(int(load[0] * peak_gpu_bytes_per_row), load[2]) for load in loads
-        )
-        duplicated_read_bytes = duplicated_totals[1] - total_compressed
-        net_savings = total_rows * shuffle_bytes_per_row - duplicated_read_bytes
-        thresholds_ok = (
-            all(value <= _MAX_AMPLIFICATION for value in amplification)
-            and skew <= _MAX_SKEW
-            and peak_bytes <= budget
-            and net_savings >= num_workers * _MIN_NET_SAVINGS_PER_GPU
-        )
-        if not thresholds_ok:
-            continue
+    _require(bool(ranges), "footer statistics produced no executable ranges")
+    duplicated_totals = tuple(sum(load[i] for load in loads) for i in range(3))
+    source_totals = (total_rows, total_compressed, total_uncompressed)
+    amplification = tuple(duplicated_totals[i] / source_totals[i] for i in range(3))
+    skew = max(
+        max(load[i] for load in loads) / (duplicated_totals[i] / len(loads))
+        for i in range(3)
+    )
 
-        work: list[_RangeWork] = []
-        for lower, upper, selected in ranges:
-            files: dict[tuple[str, _SourceIdentity], list[int]] = {}
-            for row in selected:
-                files.setdefault((row.path, row.identity), []).append(row.row_group)
-            file_work = tuple(
-                _FileWork(path, identity, tuple(sorted(row_groups)))
-                for (path, identity), row_groups in sorted(
-                    files.items(), key=lambda item: item[0][0]
-                )
+    work: list[_RangeWork] = []
+    for lower, upper, selected in ranges:
+        files: dict[tuple[str, _SourceIdentity], list[int]] = {}
+        for row in selected:
+            files.setdefault((row.path, row.identity), []).append(row.row_group)
+        file_work = tuple(
+            _FileWork(path, identity, tuple(sorted(row_groups)))
+            for (path, identity), row_groups in sorted(
+                files.items(), key=lambda item: item[0][0]
             )
-            work.append(_RangeWork(lower, upper, file_work))
-        return _RangePlan(
-            work=tuple(work),
-            gpu_budget=budget,
-            amplification=amplification,
-            skew=skew,
-            peak_bytes=peak_bytes,
-            net_savings=net_savings,
         )
+        work.append(_RangeWork(lower, upper, file_work))
 
-    raise _PlanningRejected("range_thresholds")
+    if max(amplification) > _MAX_AMPLIFICATION:
+        logger.warning(
+            "ParquetCudfMapGroupPartitions estimated read amplification is %.3fx "
+            "(recommended <= %.2fx); execution may be slow",
+            max(amplification),
+            _MAX_AMPLIFICATION,
+        )
+    if skew > _MAX_SKEW:
+        logger.warning(
+            "ParquetCudfMapGroupPartitions estimated range skew is %.3fx "
+            "(recommended <= %.2fx); execution may be slow",
+            skew,
+            _MAX_SKEW,
+        )
+    if len(work) < num_workers:
+        logger.warning(
+            "ParquetCudfMapGroupPartitions planned %d nonempty ranges for %d "
+            "workers; execution may underutilize GPUs",
+            len(work),
+            num_workers,
+        )
+    return _RangePlan(tuple(work), amplification, skew)
 
 
 def _refresh_aws_credentials(
@@ -711,7 +750,12 @@ def _one_or_generator(value: Any) -> Iterator[Any]:
     return value if isinstance(value, collections.abc.Iterator) else iter((value,))
 
 
-class _ParquetCudfShuffleElisionWorker:
+def _live_rmm_pool_maximum(free_memory: int) -> int:
+    maximum = min(int(free_memory * 0.70), int(free_memory) - 2 * _GIB)
+    return max(0, maximum // 256 * 256)
+
+
+class _ParquetCudfMapGroupPartitionsWorker:
     """Reusable actor that reads, tokenizes, and applies one range partition."""
 
     def __init__(self, *, spec: dict[str, Any]):
@@ -730,10 +774,12 @@ class _ParquetCudfShuffleElisionWorker:
         import rmm
 
         free_memory, _ = rmm.mr.available_device_memory()
-        maximum = min(self.gpu_budget, max(0, int(free_memory) - 2 * _GIB))
-        maximum = maximum // 256 * 256
+        maximum = _live_rmm_pool_maximum(free_memory)
         if maximum <= 0:
-            raise RuntimeError("Insufficient live GPU memory for shuffle elision")
+            raise RuntimeError(
+                "Parquet/cuDF map_group_partitions requires more than 2 GiB of "
+                "free GPU memory"
+            )
         self._rmm_upstream = rmm.mr.get_current_device_resource()
         self._rmm_pool = rmm.mr.PoolMemoryResource(
             self._rmm_upstream,
@@ -762,8 +808,6 @@ class _ParquetCudfShuffleElisionWorker:
         )
         self.tokenizer_args = tuple(self.tokenizer_args or ())
         self.tokenizer_kwargs = dict(self.tokenizer_kwargs or {})
-        self.group_args = tuple(self.group_args or ())
-        self.group_kwargs = dict(self.group_kwargs or {})
 
     def _identity(self, path: str) -> _SourceIdentity:
         if self.source_kind == "local":
@@ -856,33 +900,34 @@ class _ParquetCudfShuffleElisionWorker:
         for raw in _rebatched_frames(
             self._read_frames(work), self.tokenizer_batch_size, self.cudf
         ):
-            input_key = raw[self.range_key].reset_index(drop=True).copy(deep=True)
             result = self.tokenizer(raw, *self.tokenizer_args, **self.tokenizer_kwargs)
             outputs = list(_one_or_generator(result))
-            if not outputs or any(
-                not isinstance(output, self.cudf.DataFrame) for output in outputs
-            ):
+            if any(not isinstance(output, self.cudf.DataFrame) for output in outputs):
                 raise TypeError("The tokenizer must return cuDF DataFrames")
+            if not outputs:
+                del raw, result, outputs
+                continue
             output = (
                 outputs[0]
                 if len(outputs) == 1
                 else self.cudf.concat(outputs, ignore_index=True)
             ).reset_index(drop=True)
-            key_preserved = (
-                len(output) == len(raw)
-                and self.range_key in output
-                and bool(
-                    (input_key == output[self.range_key].reset_index(drop=True))
-                    .fillna(False)
-                    .all()
-                )
+            if not len(output):
+                del raw, result, outputs, output
+                continue
+            if any(key not in output for key in self.group_keys):
+                raise ValueError("The tokenizer removed a group key")
+            range_values = output[self.range_key]
+            range_owned = not bool(range_values.isnull().any()) and bool(
+                ((range_values >= work.lower) & (range_values <= work.upper)).all()
             )
-            if not key_preserved:
+            if not range_owned:
                 raise ValueError(
-                    "The tokenizer violated its row/key preservation contract"
+                    "The tokenizer produced a leading group key outside its "
+                    "assigned range"
                 )
             tokenized_frames.append(output)
-            del raw, input_key, result, outputs, output
+            del raw, result, outputs, output
 
         if not tokenized_frames:
             return
@@ -900,15 +945,13 @@ class _ParquetCudfShuffleElisionWorker:
             )
         boundaries = _group_boundaries(frame, self.group_keys, self.cupy)
 
-        from ray.data.grouped_data import MapGroupsPartitionContext
+        from ray.data.grouped_data import MapGroupPartitionsContext
 
-        context = MapGroupsPartitionContext(
+        context = MapGroupPartitionsContext(
             group_keys=self.group_keys,
             input_group_boundaries=boundaries,
         )
-        result = self.partition_fn(
-            frame, context, *self.group_args, **self.group_kwargs
-        )
+        result = self.partition_fn(frame, context)
         for output in _one_or_generator(result):
             yield from _split_output(output, self.target_bytes)
 
@@ -934,13 +977,11 @@ def _descriptor_bundles(work: tuple[_RangeWork, ...]) -> list[Any]:
 
 
 def _build_physical_operator(
-    op: "MapGroups",
     data_context: "DataContext",
     candidate: _Candidate,
     footer: _FooterSummary,
     plan: _RangePlan,
 ) -> "PhysicalOperator":
-    from ray.data._internal.compute import ActorPoolStrategy
     from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
     from ray.data._internal.execution.operators.map_operator import MapOperator
     from ray.data._internal.execution.operators.map_transformer import (
@@ -966,18 +1007,13 @@ def _build_physical_operator(
         "tokenizer_constructor_args": tokenizer_op.fn_constructor_args,
         "tokenizer_constructor_kwargs": tokenizer_op.fn_constructor_kwargs,
         "tokenizer_batch_size": int(tokenizer_op.batch_size),
-        "partition_fn": candidate.config.partition_fn,
-        "group_args": op.fn_args,
-        "group_kwargs": op.fn_kwargs,
+        "partition_fn": candidate.partition_fn,
         "target_bytes": candidate.target_max_block_size,
-        "gpu_budget": plan.gpu_budget,
         "retried_io_errors": candidate.retried_io_errors,
     }
-    compute = ActorPoolStrategy(
-        size=candidate.num_workers, max_tasks_in_flight_per_actor=1
-    )
+    compute = candidate.compute
     worker_fn, init_fn = _get_udf(
-        _ParquetCudfShuffleElisionWorker,
+        _ParquetCudfMapGroupPartitionsWorker,
         (),
         {},
         (),
@@ -1002,19 +1038,15 @@ def _build_physical_operator(
     resources = dict(candidate.resources)
     resources.update(max_restarts=0, max_task_retries=0)
     name = (
-        "ParquetCudfShuffleElision["
+        "ParquetCudfMapGroupPartitions["
         f"backend={candidate.read_spec.source_kind},ranges={len(plan.work)},"
         f"amplification={max(plan.amplification):.3f},skew={plan.skew:.3f}]"
     )
     logger.info(
-        "Selected %s: footer_bytes=%d footer_time_s=%.3f peak_bytes=%d "
-        "gpu_budget=%d net_savings_bytes=%d actors=%d probe_bytes=0",
+        "Selected %s: footer_bytes=%d footer_time_s=%.3f actors=%d " "probe_bytes=0",
         name,
         footer.footer_bytes,
         footer.elapsed_s,
-        plan.peak_bytes,
-        plan.gpu_budget,
-        int(plan.net_savings),
         candidate.num_workers,
     )
     return MapOperator.create(
@@ -1028,31 +1060,22 @@ def _build_physical_operator(
     )
 
 
-def try_plan_parquet_cudf_shuffle_elision(
-    op: "MapGroups", data_context: "DataContext"
-) -> Optional["PhysicalOperator"]:
-    """Return the selected physical operator, or ``None`` for stock lowering."""
+def plan_parquet_cudf_map_group_partitions(
+    op: "MapGroupPartitions", data_context: "DataContext"
+) -> "PhysicalOperator":
+    """Plan the explicit fast path or raise when its contract is unsupported."""
 
     try:
         candidate = _select_candidate(op, data_context)
         footer = _read_footer_summary(candidate.read_spec, candidate.group_keys[0])
         plan = _plan_ranges(
             footer.row_groups,
-            num_partitions=candidate.num_partitions,
+            target_ranges=candidate.target_ranges,
             num_workers=candidate.num_workers,
-            shuffle_bytes_per_row=float(candidate.config.shuffle_bytes_per_input_row),
-            peak_gpu_bytes_per_row=float(candidate.config.peak_gpu_bytes_per_input_row),
-            gpu_memory_bytes=int(candidate.config.gpu_memory_bytes),
         )
-        return _build_physical_operator(op, data_context, candidate, footer, plan)
-    except _PlanningRejected as error:
-        logger.info(
-            "ParquetCudfShuffleElision fallback: reason=%s probe_bytes=0", error
-        )
-        return None
-    except Exception:
-        logger.warning(
-            "ParquetCudfShuffleElision planning failed; using the stock plan",
-            exc_info=True,
-        )
-        return None
+        return _build_physical_operator(data_context, candidate, footer, plan)
+    except _PlanningError as error:
+        raise ValueError(
+            "Parquet/cuDF map_group_partitions cannot execute this pipeline: "
+            f"{error}"
+        ) from None

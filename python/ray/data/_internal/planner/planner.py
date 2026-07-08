@@ -35,7 +35,7 @@ from ray.data._internal.logical.operators import (
     Join,
     Limit,
     ListFiles,
-    MapGroups,
+    MapGroupPartitions,
     Mix,
     Project,
     Read,
@@ -54,7 +54,9 @@ from ray.data._internal.planner.checkpoint import (
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
 from ray.data._internal.planner.plan_download_op import plan_download_op
 from ray.data._internal.planner.plan_list_files_op import plan_list_files_op
-from ray.data._internal.planner.plan_map_groups_op import plan_map_groups_op
+from ray.data._internal.planner.plan_map_group_partitions_op import (
+    plan_map_group_partitions_op,
+)
 from ray.data._internal.planner.plan_read_files_op import plan_read_files_op
 from ray.data._internal.planner.plan_read_op import plan_read_op
 from ray.data._internal.planner.plan_udf_map_op import (
@@ -193,7 +195,7 @@ class Planner:
         Join: plan_join_op,
         StreamingSplit: plan_streaming_split_op,
         Download: plan_download_op,
-        MapGroups: plan_map_groups_op,
+        MapGroupPartitions: plan_map_group_partitions_op,
     }
     # Operators that support checkpoint filtering. Subclasses can override.
     _CHECKPOINT_FILTER_OPS = (Read, ReadFiles)
@@ -264,7 +266,7 @@ class Planner:
 
     def _plan_recursively(
         self, logical_op: LogicalOperator, data_context: DataContext
-    ) -> Tuple[PhysicalOperator, Dict[PhysicalOperator, LogicalOperator]]:
+    ) -> Tuple[PhysicalOperator, Dict[LogicalOperator, PhysicalOperator]]:
         """Plan a logical operator and its input dependencies recursively.
 
         Args:
@@ -293,22 +295,19 @@ class Planner:
         # At this point, all physical operators without logical operators set
         # must have been created by the current logical operator.
         queue = [physical_op]
-        visited = set()
         while queue:
             curr_physical_op = queue.pop()
-            if curr_physical_op in visited or curr_physical_op in op_map:
-                continue
-            visited.add(curr_physical_op)
-
+            # Once we find an operator with a logical operator set, we can stop.
             if curr_physical_op._logical_operators:
-                mapped_logical_op = curr_physical_op._logical_operators[-1]
-            else:
-                curr_physical_op.set_logical_operators(logical_op)
-                mapped_logical_op = logical_op
+                break
 
-            # Add this operator to the op_map so the optimizer can find it.
-            op_map[curr_physical_op] = mapped_logical_op
+            curr_physical_op.set_logical_operators(logical_op)
+            # Add this operator to the op_map so optimizer can find it
+            op_map[curr_physical_op] = logical_op
             queue.extend(curr_physical_op.input_dependencies)
+
+        # Also add the final operator (in case the loop didn't catch it)
+        op_map[physical_op] = logical_op
         return physical_op, op_map
 
     def _create_checkpoint_callback(
