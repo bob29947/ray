@@ -2,6 +2,7 @@ import math
 import time
 from dataclasses import replace
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,10 @@ from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.execution.operators.union_operator import UnionOperator
 from ray.data._internal.execution.resource_manager import (
+    GPUActorAdmissionState,
+    ReservationOpResourceAllocator,
     ResourceManager,
+    _GPUActorAdmissionController,
     create_resource_allocator,
 )
 from ray.data._internal.execution.streaming_executor_state import (
@@ -92,6 +96,242 @@ def mock_join_op(left_input_op, right_input_op):
 
     op.start = MagicMock(side_effect=lambda *_: None)
     return op
+
+
+def _mock_gpu_admission_op(*, inputs=(), completed=False, actors=0, gpu=1):
+    op = MagicMock()
+    op.input_dependencies = list(inputs)
+    op.uses_gpu_actor_admission_control = MagicMock(return_value=True)
+    op.has_execution_finished = MagicMock(return_value=completed)
+    op.internal_input_queue_num_blocks = MagicMock(return_value=0)
+    op.num_active_tasks = MagicMock(return_value=0)
+    op.get_actor_info = MagicMock(
+        return_value=SimpleNamespace(running=actors, restarting=0, pending=0)
+    )
+    op.gpu_actor_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=1, gpu=gpu)
+    )
+    return op
+
+
+def test_gpu_actor_admission_topological_frontier():
+    upstream = _mock_gpu_admission_op()
+    completed_cpu_middle = MagicMock(
+        spec=PhysicalOperator, input_dependencies=[upstream]
+    )
+    downstream = _mock_gpu_admission_op(inputs=[completed_cpu_middle])
+    last = _mock_gpu_admission_op(inputs=[downstream])
+    states = {
+        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        last: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    resource_manager = MagicMock(
+        get_global_limits=MagicMock(return_value=ExecutionResources(cpu=8, gpu=1))
+    )
+
+    controller = _GPUActorAdmissionController(states, resource_manager)
+    controller.update_states()
+
+    # Downstream demand protects its unfinished GPU ancestor. With one GPU, the
+    # ancestor is admitted, the first non-fitting claimant is the frontier, and
+    # later claimants cannot leapfrog it.
+    assert controller.get_state(upstream) is GPUActorAdmissionState.ADMITTED
+    assert controller.get_state(downstream) is GPUActorAdmissionState.FRONTIER
+    assert controller.get_state(last) is GPUActorAdmissionState.BLOCKED
+
+    # Once the ancestor is complete, the downstream stages advance without
+    # waiting for every non-GPU intermediate to remain unfinished.
+    upstream.has_execution_finished.return_value = True
+    controller.update_states()
+    assert controller.get_state(upstream) is GPUActorAdmissionState.DORMANT
+    assert controller.get_state(downstream) is GPUActorAdmissionState.ADMITTED
+    assert controller.get_state(last) is GPUActorAdmissionState.FRONTIER
+
+
+def test_gpu_actor_admission_recompute_is_side_effect_free():
+    op = _mock_gpu_admission_op()
+    op.internal_input_queue_num_blocks.return_value = 1
+    op.has_completed.side_effect = AssertionError("must not call has_completed")
+    op.has_next.side_effect = AssertionError("must not call has_next")
+    states = {op: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0))}
+    resource_manager = MagicMock(
+        get_global_limits=MagicMock(return_value=ExecutionResources(cpu=8, gpu=1))
+    )
+    controller = _GPUActorAdmissionController(states, resource_manager)
+
+    # Demand held in the operator's internal queue is sufficient to claim a GPU,
+    # without probing completion methods that may submit the queued task.
+    controller.update_states()
+    assert controller.get_state(op) is GPUActorAdmissionState.ADMITTED
+    op._set_gpu_actor_admission_scheduling_enabled.assert_called_with(True)
+    op.has_completed.assert_not_called()
+    op.has_next.assert_not_called()
+
+    # Execution completion releases the actor even if output remains buffered.
+    op.has_execution_finished.return_value = True
+    op.has_next.return_value = True
+    controller.update_states()
+    assert controller.get_state(op) is GPUActorAdmissionState.DORMANT
+    op._set_gpu_actor_admission_scheduling_enabled.assert_called_with(False)
+
+
+def test_gpu_actor_admission_streams_when_all_claims_fit():
+    upstream = _mock_gpu_admission_op()
+    downstream = _mock_gpu_admission_op(inputs=[upstream])
+    states = {
+        upstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    resource_manager = MagicMock(
+        get_global_limits=MagicMock(return_value=ExecutionResources(cpu=8, gpu=2))
+    )
+
+    controller = _GPUActorAdmissionController(states, resource_manager)
+    controller.update_states()
+
+    assert controller.get_state(upstream) is GPUActorAdmissionState.ADMITTED
+    assert controller.get_state(downstream) is GPUActorAdmissionState.ADMITTED
+
+
+def test_gpu_actor_admission_fan_in_does_not_leapfrog():
+    left = _mock_gpu_admission_op(gpu=0.5)
+    right = _mock_gpu_admission_op(gpu=1)
+    fan_in = MagicMock(spec=PhysicalOperator, input_dependencies=[left, right])
+    downstream = _mock_gpu_admission_op(inputs=[fan_in], gpu=0.5)
+    states = {
+        left: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        right: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=0)),
+        downstream: MagicMock(total_enqueued_input_blocks=MagicMock(return_value=1)),
+    }
+    resource_manager = MagicMock(
+        get_global_limits=MagicMock(return_value=ExecutionResources(cpu=8, gpu=1))
+    )
+
+    controller = _GPUActorAdmissionController(states, resource_manager)
+    controller.update_states()
+
+    assert controller.get_state(left) is GPUActorAdmissionState.ADMITTED
+    assert controller.get_state(right) is GPUActorAdmissionState.FRONTIER
+    assert controller.get_state(downstream) is GPUActorAdmissionState.BLOCKED
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        GPUActorAdmissionState.DORMANT,
+        GPUActorAdmissionState.FRONTIER,
+        GPUActorAdmissionState.BLOCKED,
+    ],
+)
+def test_gpu_actor_non_admitted_state_blocks_task_submission(state):
+    resource_manager = MagicMock()
+    resource_manager._topology = {}
+    resource_manager.get_gpu_actor_admission_state.return_value = state
+    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
+
+    assert not allocator.can_submit_new_task(MagicMock())
+
+
+def test_gpu_actor_admitted_floors_precede_default_sharing():
+    def make_op(*, gpu: bool):
+        op = MagicMock()
+        op.throttling_disabled.return_value = False
+        op.has_execution_finished.return_value = False
+        minimum = ExecutionResources(cpu=1, gpu=1 if gpu else 0)
+        maximum = (
+            ExecutionResources(cpu=4, gpu=4, object_store_memory=float("inf"))
+            if gpu
+            else ExecutionResources.inf()
+        )
+        op.min_max_resource_requirements.return_value = (minimum, maximum)
+        op.min_scheduling_resources.return_value = minimum
+        if gpu:
+            op.gpu_actor_resource_usage.return_value = minimum
+        return op
+
+    upstream_gpu = make_op(gpu=True)
+    cpu_middle = make_op(gpu=False)
+    downstream_gpu = make_op(gpu=True)
+    resource_manager = MagicMock()
+    resource_manager._topology = {
+        upstream_gpu: MagicMock(),
+        cpu_middle: MagicMock(),
+        downstream_gpu: MagicMock(),
+    }
+    resource_manager.is_gpu_actor_admission_allocation_eligible.return_value = True
+    resource_manager.get_gpu_actor_admission_state.side_effect = lambda op: (
+        GPUActorAdmissionState.ADMITTED
+        if op in (upstream_gpu, downstream_gpu)
+        else None
+    )
+    resource_manager.get_mem_op_internal.return_value = 0
+    resource_manager.get_mem_op_outputs.return_value = 0
+    resource_manager.get_op_usage.return_value = ExecutionResources.zero()
+    resource_manager._is_blocking_materializing_op.return_value = False
+    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
+
+    allocator.update_budgets(
+        limits=ExecutionResources(cpu=8, gpu=2, object_store_memory=1_000)
+    )
+
+    assert allocator.get_allocation(upstream_gpu).gpu >= 1
+    assert allocator.get_allocation(downstream_gpu).gpu >= 1
+    assert allocator.get_allocation(cpu_middle).gpu == 0
+
+
+def test_gpu_actor_allocation_target_shrinks_for_new_claimant():
+    def make_gpu_op():
+        op = MagicMock()
+        op.throttling_disabled.return_value = False
+        op.has_execution_finished.return_value = False
+        minimum = ExecutionResources(gpu=1)
+        maximum = ExecutionResources(
+            cpu=float("inf"),
+            gpu=4,
+            memory=float("inf"),
+            object_store_memory=float("inf"),
+        )
+        op.min_max_resource_requirements.return_value = (minimum, maximum)
+        op.min_scheduling_resources.return_value = minimum
+        op.gpu_actor_resource_usage.return_value = minimum
+        return op
+
+    upstream = make_gpu_op()
+    downstream = make_gpu_op()
+    admission_states = {
+        upstream: GPUActorAdmissionState.ADMITTED,
+        downstream: GPUActorAdmissionState.DORMANT,
+    }
+    usages = {
+        # The upstream pool has already grown to consume the whole GPU budget.
+        upstream: ExecutionResources(gpu=2),
+        downstream: ExecutionResources.zero(),
+    }
+    resource_manager = MagicMock()
+    resource_manager._topology = {upstream: MagicMock(), downstream: MagicMock()}
+    resource_manager.get_gpu_actor_admission_state.side_effect = admission_states.get
+    resource_manager.is_gpu_actor_admission_allocation_eligible.side_effect = (
+        lambda op: admission_states[op] is GPUActorAdmissionState.ADMITTED
+    )
+    resource_manager.get_mem_op_internal.return_value = 0
+    resource_manager.get_mem_op_outputs.return_value = 0
+    resource_manager.get_op_usage.side_effect = usages.get
+    resource_manager._is_blocking_materializing_op.return_value = False
+    allocator = ReservationOpResourceAllocator(resource_manager, 0.5)
+    limits = ExecutionResources(gpu=2, object_store_memory=1_000)
+
+    allocator.update_budgets(limits=limits)
+    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(2)
+
+    # A newly demanded downstream pool receives its protected one-actor floor.
+    # The upstream's current usage remains 2, but its independent target falls
+    # to 1 so the autoscaler can reclaim an idle actor.
+    admission_states[downstream] = GPUActorAdmissionState.ADMITTED
+    allocator.update_budgets(limits=limits)
+    assert allocator.get_allocation(upstream).gpu == pytest.approx(2)
+    assert allocator.get_allocation_target(upstream).gpu == pytest.approx(1)
+    assert allocator.get_allocation_target(downstream).gpu == pytest.approx(1)
 
 
 def mock_all_to_all_op(input_op, name="MockShuffle"):
@@ -1017,6 +1257,38 @@ class TestOutputBackpressureGuard:
         topo[o3].total_enqueued_input_blocks = MagicMock(return_value=5)
         guard._idle_detector.detect_idle = MagicMock(return_value=False)
         assert guard.should_unblock(o2) is False
+
+    def test_unblock_for_admission_managed_actor_without_runnable_actor(
+        self, restore_data_context
+    ):
+        o1 = InputDataBuffer(DataContext.get_current(), [])
+        o2 = mock_map_op(o1)
+        o3 = mock_map_op(o2)
+        topo = build_streaming_topology(o3, ExecutionOptions(), noop_counter())
+        resource_manager = ResourceManager(
+            topo,
+            ExecutionOptions(),
+            MagicMock(),
+            DataContext.get_current(),
+            BlockRefCounter(add_object_out_of_scope_callback=lambda *_: True),
+        )
+        guard = OutputBackpressureGuard(topo, resource_manager)
+        o3.num_active_tasks = MagicMock(return_value=0)
+        o3.can_add_input = MagicMock(return_value=False)
+        topo[o3].total_enqueued_input_blocks = MagicMock(return_value=5)
+        resource_manager.op_resource_allocator.can_submit_new_task = MagicMock(
+            return_value=True
+        )
+        guard._idle_detector.detect_idle = MagicMock(return_value=False)
+
+        # Legacy operators keep the historical budget-only behavior.
+        assert guard.should_unblock(o2) is False
+
+        # A managed pool with no runnable actor cannot consume the queued block,
+        # even if it has an allocation. Drain upstream output so active GPU work
+        # can finish and hand the resource to the frontier.
+        o3.uses_gpu_actor_admission_control = MagicMock(return_value=True)
+        assert guard.should_unblock(o2) is True
 
     def test_unblock_when_resource_allocator_disabled(self, restore_data_context):
         """When the op resource allocator is disabled, the guard treats

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 import warnings
@@ -170,6 +171,11 @@ class ActorPoolMapOperator(MapOperator):
         )
 
         self._min_rows_per_bundle = min_rows_per_bundle
+        # Preserve whether dynamic actor options came from the user. Physical
+        # optimizer rules may later wrap ``_ray_remote_args_fn`` to add Ray's
+        # own memory estimate; that internal wrapper does not make otherwise
+        # static CPU/GPU declarations ineligible for admission control.
+        self._has_user_provided_ray_remote_args_fn = ray_remote_args_fn is not None
         self._ray_remote_args_fn = ray_remote_args_fn
         self._ray_remote_args = self._apply_default_remote_args(
             self._ray_remote_args, self.data_context
@@ -187,6 +193,19 @@ class ActorPoolMapOperator(MapOperator):
         self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
 
         self._actor_pool = self._create_actor_pool(compute_strategy)
+        # Re-evaluated during start() in case the DataContext changes after
+        # planning. When enabled, ResourceManager owns this static-resource GPU pool's
+        # admission and the regular actor autoscaler must leave its size alone.
+        self._gpu_actor_admission_control_enabled = (
+            self._should_use_gpu_actor_admission_control()
+        )
+        # Managed pools start non-runnable. ResourceManager flips this only for
+        # ADMITTED state, including internal queue-draining paths that bypass the
+        # executor's normal operator-selection gate.
+        self._gpu_actor_admission_scheduling_enabled = (
+            not self._gpu_actor_admission_control_enabled
+        )
+        self._gpu_actor_admission_target_actor_count: Optional[int] = None
         # A queue of bundles awaiting dispatch to actors.
         self._bundle_queue = create_bundle_queue()
         # Cached actor class.
@@ -276,11 +295,19 @@ class ActorPoolMapOperator(MapOperator):
         super().start(options, block_ref_counter)
 
         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
-        self._actor_pool.scale(
-            ActorPoolScalingRequest(
-                delta=self._actor_pool.initial_size(), reason="scaling to initial size"
-            )
+        self._gpu_actor_admission_control_enabled = (
+            self._should_use_gpu_actor_admission_control()
         )
+        self._gpu_actor_admission_scheduling_enabled = (
+            not self._gpu_actor_admission_control_enabled
+        )
+        if not self._gpu_actor_admission_control_enabled:
+            self._actor_pool.scale(
+                ActorPoolScalingRequest(
+                    delta=self._actor_pool.initial_size(),
+                    reason="scaling to initial size",
+                )
+            )
 
         # If `wait_for_min_actors_s` is specified and is positive, then
         # Actor Pool will block until min number of actors is provisioned.
@@ -304,6 +331,57 @@ class ActorPoolMapOperator(MapOperator):
                     "enough resources for the requested actor pool."
                 )
 
+    def _should_use_gpu_actor_admission_control(self) -> bool:
+        """Whether ResourceManager should own admission for this actor pool."""
+        per_actor = self._actor_pool.per_actor_resource_usage()
+        return (
+            getattr(self.data_context, "_enable_gpu_actor_admission_control", True)
+            and self.data_context.op_resource_reservation_enabled
+            and self.data_context.wait_for_min_actors_s <= 0
+            # Dynamic actor options can change the resources of every actor, so
+            # the allocator cannot safely decide whether another actor fits.
+            and not self._has_user_provided_ray_remote_args_fn
+            and per_actor.gpu > 0
+        )
+
+    def uses_gpu_actor_admission_control(self) -> bool:
+        """Return whether ResourceManager owns this pool's actor lifecycle."""
+        return self._gpu_actor_admission_control_enabled
+
+    def gpu_actor_resource_usage(self) -> ExecutionResources:
+        """Return the declared resources for one admission-controlled actor."""
+        assert self.uses_gpu_actor_admission_control()
+        return self._actor_pool.per_actor_resource_usage()
+
+    def _set_gpu_actor_admission_scheduling_enabled(self, enabled: bool) -> None:
+        """Allow internal task dispatch only while this managed pool is admitted."""
+        self._gpu_actor_admission_scheduling_enabled = (
+            enabled or not self.uses_gpu_actor_admission_control()
+        )
+
+    def _set_gpu_actor_admission_allocation_target(
+        self, target: Optional[ExecutionResources]
+    ) -> None:
+        """Set the maximum actor count allowed by the usage-independent target."""
+        if target is None or not self.uses_gpu_actor_admission_control():
+            self._gpu_actor_admission_target_actor_count = None
+            return
+
+        per_actor = self._actor_pool.per_actor_resource_usage()
+        divisions = target.floordiv(per_actor)
+        target_actor_count = min(divisions.cpu, divisions.gpu, divisions.memory)
+        assert not math.isinf(target_actor_count), (target, per_actor)
+        # ADMITTED pools have a pre-reserved one-actor floor.
+        self._gpu_actor_admission_target_actor_count = max(
+            1, min(int(target_actor_count), self._actor_pool.max_size())
+        )
+
+    def _gpu_actor_admission_allows_scheduling(self) -> bool:
+        if not self._gpu_actor_admission_scheduling_enabled:
+            return False
+        target = self._gpu_actor_admission_target_actor_count
+        return target is None or self._actor_pool.current_size() <= target
+
     def can_add_input(self) -> bool:
         """NOTE: PLEASE READ CAREFULLY
 
@@ -315,7 +393,10 @@ class ActorPoolMapOperator(MapOperator):
             should be able to launch a task.
 
         """
-        return self._actor_pool.can_schedule_task()
+        return (
+            self._gpu_actor_admission_allows_scheduling()
+            and self._actor_pool.can_schedule_task()
+        )
 
     def _start_actor(
         self, labels: Dict[str, str], logical_actor_id: LogicalActorId
@@ -390,6 +471,9 @@ class ActorPoolMapOperator(MapOperator):
 
     def _try_schedule_tasks_internal(self) -> int:
         """Try to dispatch tasks from the internal queue. Returns the # of tasks submitted"""
+
+        if not self._gpu_actor_admission_allows_scheduling():
+            return 0
 
         num_submitted_tasks = 0
         while self._bundle_queue.has_next():
@@ -517,6 +601,10 @@ class ActorPoolMapOperator(MapOperator):
         self,
     ) -> Tuple[ExecutionResources, ExecutionResources]:
         min_actors = self._actor_pool.min_size()
+        # Admission-controlled pools can make progress with one actor even when
+        # the cluster cannot place the configured minimum pool size at once.
+        if self.uses_gpu_actor_admission_control():
+            min_actors = 1
         max_actors = self._actor_pool.max_size()
         assert min_actors is not None, min_actors
 

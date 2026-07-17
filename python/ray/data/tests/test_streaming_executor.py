@@ -42,7 +42,10 @@ from ray.data._internal.execution.operators.map_transformer import (
     MapTransformer,
 )
 from ray.data._internal.execution.ranker import DefaultRanker
-from ray.data._internal.execution.resource_manager import ResourceManager
+from ray.data._internal.execution.resource_manager import (
+    GPUActorAdmissionState,
+    ResourceManager,
+)
 from ray.data._internal.execution.streaming_executor import (
     StreamingExecutor,
     _debug_dump_topology,
@@ -370,6 +373,21 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
             # To ensure liveness back-pressure limits will be ignored
             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
+
+    # Admission is a hard constraint: the idle-pipeline liveness fallback must
+    # not dispatch new input to a frontier pool and let it leapfrog upstream.
+    resource_manager.get_gpu_actor_admission_state.side_effect = (
+        lambda op: GPUActorAdmissionState.FRONTIER if op is o2 else None
+    )
+    assert (
+        get_eligible_operators(
+            topo,
+            [],
+            ensure_liveness=True,
+            resource_manager=resource_manager,
+        )
+        == []
+    )
 
 
 def test_backpressure_policy_tracking(ray_start_regular_shared):

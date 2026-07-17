@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from freezegun import freeze_time
 
@@ -37,6 +38,7 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.execution.interfaces.ref_bundle import BlockEntry, RefBundle
 from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.execution.operators.actor_pool_map_operator import (
+    ActorPoolMapOperator,
     _ActorPool,
     _MapWorker,
 )
@@ -50,6 +52,8 @@ from ray.data._internal.execution.streaming_executor_state import (
     build_streaming_topology,
     update_operator_states,
 )
+from ray.data._internal.logical.optimizers import get_execution_plan
+from ray.data._internal.stats import Timer
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data.block import Block, BlockAccessor, BlockMetadata
 from ray.data.context import (
@@ -79,6 +83,29 @@ class PoolWorker:
 
     def __ray_shutdown__(self):
         pass
+
+
+def _replace_id_column(batch: pa.Table, values) -> pa.Table:
+    return pa.Table.from_arrays([values], names=["id"])
+
+
+class _AdmissionGPUStageOne:
+    def __call__(self, batch: pa.Table) -> pa.Table:
+        return _replace_id_column(batch, pc.add(batch["id"], 1))
+
+
+class _AdmissionGPUStageTwo:
+    def __call__(self, batch: pa.Table) -> pa.Table:
+        return _replace_id_column(batch, pc.add(batch["id"], 2))
+
+
+class _AdmissionGPUStageThree:
+    def __call__(self, batch: pa.Table) -> pa.Table:
+        return _replace_id_column(batch, pc.add(batch["id"], 3))
+
+
+def _admission_cpu_stage(batch: pa.Table) -> pa.Table:
+    return _replace_id_column(batch, pc.multiply(batch["id"], 2))
 
 
 def _make_bundle_queue(n_or_bundles) -> HashLinkedQueue:
@@ -979,6 +1006,235 @@ def test_setting_initial_size_for_actor_pool():
     ray.shutdown()
 
 
+@pytest.mark.parametrize(
+    "remote_args,remote_args_fn,reservation,wait_s,rollback,expected",
+    [
+        ({"num_gpus": 1}, None, True, 0, True, True),
+        ({"num_gpus": 1}, None, True, -1, True, True),
+        ({"num_cpus": 1}, None, True, 0, True, False),
+        ({"num_gpus": 1}, lambda: {"num_gpus": 1}, True, 0, True, False),
+        ({"num_gpus": 1}, None, False, 0, True, False),
+        ({"num_gpus": 1}, None, True, 1, True, False),
+        ({"num_gpus": 1}, None, True, 0, False, False),
+    ],
+)
+def test_gpu_actor_admission_control_eligibility(
+    remote_args,
+    remote_args_fn,
+    reservation,
+    wait_s,
+    rollback,
+    expected,
+):
+    data_context = DataContext()
+    data_context.op_resource_reservation_enabled = reservation
+    data_context.wait_for_min_actors_s = wait_s
+    data_context._enable_gpu_actor_admission_control = rollback
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        # Verify autoscaling pools are covered, not only fixed-size pools.
+        compute_strategy=ActorPoolStrategy(min_size=1, max_size=4),
+        ray_remote_args=remote_args,
+        ray_remote_args_fn=remote_args_fn,
+    )
+
+    assert op.uses_gpu_actor_admission_control() is expected
+
+
+def test_gpu_actor_admission_control_defers_actor_start(
+    ray_start_regular, restore_data_context
+):
+    data_context = DataContext.get_current()
+    data_context.op_resource_reservation_enabled = True
+    data_context.wait_for_min_actors_s = 0
+    data_context._enable_gpu_actor_admission_control = True
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(size=2),
+        ray_remote_args={"num_gpus": 1},
+    )
+
+    op.start(ExecutionOptions(), noop_counter())
+
+    assert op.uses_gpu_actor_admission_control()
+    assert op._actor_pool.current_size() == 0
+    op.shutdown(Timer())
+
+
+def test_gpu_actor_admission_target_gates_internal_dispatch():
+    data_context = DataContext()
+    op = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=InputDataBuffer(data_context, input_data=[]),
+        data_context=data_context,
+        compute_strategy=ActorPoolStrategy(size=2),
+        ray_remote_args={"num_gpus": 1},
+    )
+    op._gpu_actor_admission_control_enabled = True
+    op._set_gpu_actor_admission_scheduling_enabled(True)
+    op._gpu_actor_admission_target_actor_count = 1
+    op._actor_pool.current_size = MagicMock(return_value=2)
+    op._actor_pool.can_schedule_task = MagicMock(return_value=True)
+    op._actor_pool.select_actors = MagicMock()
+    op._bundle_queue = MagicMock()
+    op._bundle_queue.has_next.return_value = True
+
+    # Even if an excess actor just became idle, it cannot take queued work before
+    # the autoscaler reclaims it for another GPU claimant.
+    assert not op.can_add_input()
+    assert op._try_schedule_tasks_internal() == 0
+    op._actor_pool.select_actors.assert_not_called()
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("num_gpu_stages", [2, 3])
+def test_gpu_actor_admission_handoff_one_logical_gpu(
+    shutdown_only, restore_data_context, monkeypatch, num_gpu_stages
+):
+    ray.init(num_cpus=2, num_gpus=1, include_dashboard=False)
+    data_context = DataContext.get_current()
+    data_context.op_resource_reservation_enabled = True
+    data_context.wait_for_min_actors_s = 0
+    data_context._enable_gpu_actor_admission_control = True
+
+    managed_at_execution_start = []
+    original_start = ActorPoolMapOperator.start
+
+    def record_admission_at_start(self, *args, **kwargs):
+        result = original_start(self, *args, **kwargs)
+        if self._ray_remote_args.get("num_gpus", 0) > 0:
+            managed_at_execution_start.append(self.uses_gpu_actor_admission_control())
+        return result
+
+    monkeypatch.setattr(ActorPoolMapOperator, "start", record_admission_at_start)
+
+    ds = ray.data.range(8, override_num_blocks=4).map_batches(
+        _AdmissionGPUStageOne,
+        batch_size=2,
+        batch_format="pyarrow",
+        compute=ActorPoolStrategy(size=2),
+        num_cpus=0,
+        num_gpus=1,
+        scheduling_strategy="SPREAD",
+    )
+    # Keep a CPU operator between two GPU regions. Its different compute and
+    # resource declaration also prevents it from fusing into either actor pool.
+    ds = ds.map_batches(
+        _admission_cpu_stage,
+        batch_size=2,
+        batch_format="pyarrow",
+        num_cpus=1,
+    )
+    ds = ds.map_batches(
+        _AdmissionGPUStageTwo,
+        batch_size=2,
+        batch_format="pyarrow",
+        compute=ActorPoolStrategy(size=2),
+        num_cpus=0,
+        num_gpus=1,
+        scheduling_strategy="DEFAULT",
+    )
+    if num_gpu_stages == 3:
+        # Differing scheduling strategies keep the adjacent GPU pools physically
+        # separate so the test exercises admission and handoff, not operator
+        # coalescing.
+        ds = ds.map_batches(
+            _AdmissionGPUStageThree,
+            batch_size=2,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=2),
+            num_cpus=0,
+            num_gpus=1,
+            scheduling_strategy="SPREAD",
+        )
+
+    physical_plan, _ = get_execution_plan(ds._logical_plan)
+    stack = [physical_plan.dag]
+    actor_ops = []
+    while stack:
+        op = stack.pop()
+        if isinstance(op, ActorPoolMapOperator):
+            actor_ops.append(op)
+        stack.extend(op.input_dependencies)
+
+    # Each fixed pool asks for two actors, but the executor can make progress
+    # with one actor at a time and hand the sole logical GPU across all stages.
+    assert len(actor_ops) == num_gpu_stages, physical_plan.dag.dag_str
+    assert all(op.uses_gpu_actor_admission_control() for op in actor_ops)
+    assert all(op._actor_pool.initial_size() == 2 for op in actor_ops)
+
+    expected_offset = 4 if num_gpu_stages == 2 else 7
+    assert sorted(row["id"] for row in ds.take_all()) == [
+        2 * i + expected_offset for i in range(8)
+    ]
+    # The physical memory-sizing optimizer installs an internal remote-args
+    # wrapper. It must not make a stock callable-class GPU map look like a
+    # user-supplied dynamic-resource operator at execution time.
+    assert managed_at_execution_start == [True] * num_gpu_stages
+
+
+@pytest.mark.timeout(180)
+def test_gpu_actor_admission_handoff_spills_arrow_blocks(
+    shutdown_only, restore_data_context, tmp_path
+):
+    ray.init(
+        num_cpus=2,
+        num_gpus=1,
+        object_store_memory=100e6,
+        object_spilling_directory=str(tmp_path),
+        include_dashboard=False,
+    )
+    data_context = DataContext.get_current()
+    data_context.op_resource_reservation_enabled = True
+    data_context.wait_for_min_actors_s = 0
+    data_context._enable_gpu_actor_admission_control = True
+    data_context.enable_get_object_locations_for_metrics = True
+
+    # 25.6M int64 values are about 205 MB, intentionally larger than the
+    # 100 MB object store. Both fixed pools ask for two one-GPU actors, while
+    # the cluster exposes only one logical GPU.
+    num_rows = 1000 * 80 * 80 * 4
+    ds = (
+        ray.data.range(num_rows, override_num_blocks=8)
+        .map_batches(
+            _AdmissionGPUStageOne,
+            batch_size=num_rows // 8,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=2),
+            num_cpus=0,
+            num_gpus=1,
+            scheduling_strategy="SPREAD",
+        )
+        .map_batches(
+            _AdmissionGPUStageTwo,
+            batch_size=num_rows // 8,
+            batch_format="pyarrow",
+            compute=ActorPoolStrategy(size=2),
+            num_cpus=0,
+            num_gpus=1,
+            scheduling_strategy="DEFAULT",
+        )
+    )
+
+    physical_plan, _ = get_execution_plan(ds._logical_plan)
+    stack = [physical_plan.dag]
+    actor_ops = []
+    while stack:
+        op = stack.pop()
+        if isinstance(op, ActorPoolMapOperator):
+            actor_ops.append(op)
+        stack.extend(op.input_dependencies)
+    assert len(actor_ops) == 2, physical_plan.dag.dag_str
+
+    materialized = ds.materialize()
+    assert materialized.count() == num_rows
+    assert materialized.get_stats_summary().global_bytes_spilled > 0
+
+
 def _create_bundle_with_single_row(row):
     block = pa.Table.from_pylist([row])
     block_ref = ray.put(block)
@@ -1125,10 +1381,21 @@ def test_actor_pool_input_queue_draining(
         op._bundle_queue.num_bundles() == 1
     ), "Bundle should remain in queue since actor was busy"
 
+    # Model an admission-managed pool being demoted while its active task
+    # drains. The final partial bundle is already in the operator's internal
+    # queue and must not bypass the executor gate when the actor becomes idle.
+    op._gpu_actor_admission_control_enabled = True
+    op._set_gpu_actor_admission_scheduling_enabled(False)
+
     # Now complete the running task to free up the actor
     run_op_tasks_sync(op, only_existing=True)
 
-    # Now has_next() should dispatch the remaining bundle
+    op.has_next()
+    assert op._bundle_queue.num_bundles() == 1
+    assert op.num_active_tasks() == 0
+
+    # Readmission makes the internal final bundle runnable again.
+    op._set_gpu_actor_admission_scheduling_enabled(True)
     assert op.has_next()
 
     # The queue should be drained (task dispatched)

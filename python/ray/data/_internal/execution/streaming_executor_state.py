@@ -36,6 +36,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.ranker import Ranker
 from ray.data._internal.execution.resource_manager import (
+    GPUActorAdmissionState,
     ResourceManager,
     terminal_operator_from_topology,
 )
@@ -198,6 +199,15 @@ class OutputBackpressureGuard:
         in that case there is no budget-based throttling to wait on, so the
         liveness check shouldn't claim downstream is blocked on resources.
         """
+        # An allocation alone is not schedulability. In particular, a managed GPU
+        # pool can have queued input while admission intentionally leaves it with
+        # no runnable actor. Let upstream streaming generators drain so their
+        # actors can finish and hand resources to the admission frontier.
+        if (
+            getattr(op, "uses_gpu_actor_admission_control", lambda: False)()
+            and not op.can_add_input()
+        ):
+            return False
         if not self._resource_manager.op_resource_allocator_enabled():
             return True
         return self._resource_manager.op_resource_allocator.can_submit_new_task(op)
@@ -776,6 +786,7 @@ def get_eligible_operators(
     backpressure_policies: List[BackpressurePolicy],
     *,
     ensure_liveness: bool,
+    resource_manager: Optional[ResourceManager] = None,
 ) -> List[PhysicalOperator]:
     """This method returns all operators that are eligible for execution in the current state
     of the pipeline.
@@ -796,6 +807,24 @@ def get_eligible_operators(
     eligible_ops: List[PhysicalOperator] = []
 
     for op, state in topology.items():
+        admission_state = (
+            resource_manager.get_gpu_actor_admission_state(op)
+            if resource_manager is not None
+            else None
+        )
+        if (
+            isinstance(admission_state, GPUActorAdmissionState)
+            and admission_state is not GPUActorAdmissionState.ADMITTED
+        ):
+            # This is a hard lifecycle constraint, not ordinary resource
+            # backpressure. In particular, the liveness fallback must never let
+            # a FRONTIER/BLOCKED/DORMANT pool leapfrog and accept new input.
+            state._scheduling_status = OpSchedulingStatus(
+                runnable=False, under_resource_limits=False
+            )
+            op.notify_in_task_submission_backpressure(True, "GPUActorAdmissionControl")
+            continue
+
         # Operator is considered being in task-submission back-pressure if any
         # back-pressure policy is violated. Track the first triggered policy.
         triggered_policy = None
@@ -867,6 +896,7 @@ def select_operator_to_run(
         topology,
         backpressure_policies,
         ensure_liveness=ensure_liveness,
+        resource_manager=resource_manager,
     )
 
     if not eligible_ops:

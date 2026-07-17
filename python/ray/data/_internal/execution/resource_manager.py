@@ -1,3 +1,4 @@
+import enum
 import logging
 import math
 import time
@@ -36,6 +37,19 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Importable capability marker for extensions that require Ray-managed GPU actor
+# admission. Increment this only when the internal contract changes incompatibly.
+GPU_ACTOR_ADMISSION_CONTROL_VERSION = 1
+
+
+class GPUActorAdmissionState(enum.Enum):
+    """Executor-owned lifecycle state for a static-resource GPU actor pool."""
+
+    DORMANT = "dormant"
+    ADMITTED = "admitted"
+    FRONTIER = "frontier"
+    BLOCKED = "blocked"
 
 
 LOG_DEBUG_TELEMETRY_FOR_RESOURCE_MANAGER_OVERRIDE: Optional[bool] = env_bool(
@@ -147,6 +161,9 @@ class ResourceManager:
         self._op_resource_allocator: Optional[
             "OpResourceAllocator"
         ] = create_resource_allocator(self, data_context)
+        self._gpu_actor_admission_controller = _GPUActorAdmissionController(
+            topology, self
+        )
 
         self._object_store_memory_limit_fraction = (
             data_context.override_object_store_memory_limit_fraction
@@ -247,17 +264,24 @@ class ResourceManager:
         )
 
         if self._op_resource_allocator is not None:
-            self._update_allocated_budgets()
+            available_limits = self._get_available_limits_for_allocation()
+            self._gpu_actor_admission_controller.update_states(available_limits)
+            self._update_allocated_budgets(available_limits)
+            self._gpu_actor_admission_controller.update_scheduling_targets()
 
-    def _update_allocated_budgets(self):
+    def _get_available_limits_for_allocation(self) -> ExecutionResources:
         completed_ops_usage = self._get_completed_ops_usage()
-
-        available_limits = (
+        return (
             self.get_global_limits()
             .subtract(completed_ops_usage)
             .max(ExecutionResources.zero())
         )
 
+    def _update_allocated_budgets(
+        self, available_limits: Optional[ExecutionResources] = None
+    ):
+        if available_limits is None:
+            available_limits = self._get_available_limits_for_allocation()
         self._op_resource_allocator.update_budgets(limits=available_limits)
 
     def get_global_usage(self) -> ExecutionResources:
@@ -410,6 +434,18 @@ class ResourceManager:
         """Return whether OpResourceAllocator is enabled."""
         return self._op_resource_allocator is not None
 
+    def get_gpu_actor_admission_state(
+        self, op: PhysicalOperator
+    ) -> Optional[GPUActorAdmissionState]:
+        """Return the managed admission state, or ``None`` for legacy operators."""
+        return self._gpu_actor_admission_controller.get_state(op)
+
+    def is_gpu_actor_admission_allocation_eligible(self, op: PhysicalOperator) -> bool:
+        """Whether an operator may receive a reservation allocation now."""
+        controller = self._gpu_actor_admission_controller
+        state = controller.get_state(op)
+        return state is None or state is GPUActorAdmissionState.ADMITTED
+
     @property
     def op_resource_allocator(self) -> "OpResourceAllocator":
         """Return the OpResourceAllocator."""
@@ -429,6 +465,14 @@ class ResourceManager:
         if self._op_resource_allocator is None:
             return None
         return self._op_resource_allocator.get_allocation(op)
+
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        """Return the usage-independent allocation target for an operator."""
+        if self._op_resource_allocator is None:
+            return None
+        return self._op_resource_allocator.get_allocation_target(op)
 
     def is_op_eligible(self, op: PhysicalOperator) -> bool:
         """Whether the op is eligible for memory reservation."""
@@ -537,6 +581,106 @@ class ResourceManager:
         )
 
 
+class _GPUActorAdmissionController:
+    """Classify static-resource GPU pools against one-actor resource claims.
+
+    The controller deliberately keeps policy in the executor, where both the
+    topology and resource limits are visible. The actor autoscaler consumes the
+    resulting state; this class never mutates an actor pool directly.
+    """
+
+    def __init__(self, topology: "Topology", resource_manager: ResourceManager):
+        self._topology = topology
+        self._resource_manager = resource_manager
+        self._ops = [
+            op
+            for op in topology
+            if getattr(op, "uses_gpu_actor_admission_control", lambda: False)()
+        ]
+        self._op_set = set(self._ops)
+        self._states: Dict[PhysicalOperator, GPUActorAdmissionState] = {
+            op: GPUActorAdmissionState.DORMANT for op in self._ops
+        }
+
+    def get_state(self, op: PhysicalOperator) -> Optional[GPUActorAdmissionState]:
+        return self._states.get(op)
+
+    def update_states(self, limits: Optional[ExecutionResources] = None) -> None:
+        """Recompute admitted, frontier, blocked, and dormant pools."""
+        if not self._ops:
+            return
+
+        # ``has_completed()`` may call ``has_next()`` and opportunistically submit
+        # work from an actor operator's internal queue. Admission classification
+        # must be side-effect-free, so use the lifecycle flag instead.
+        unfinished = {op for op in self._ops if not op.has_execution_finished()}
+        claimants = set()
+        for op in self._ops:
+            if op not in unfinished:
+                continue
+            state = self._topology[op]
+            actor_info = op.get_actor_info()
+            has_actor = (
+                actor_info.running + actor_info.restarting + actor_info.pending > 0
+            )
+            if (
+                state.total_enqueued_input_blocks() > 0
+                or op.internal_input_queue_num_blocks() > 0
+                or op.num_active_tasks() > 0
+                or has_actor
+            ):
+                claimants.add(op)
+
+        # A downstream demand must not leapfrog any unfinished GPU ancestor,
+        # including through completed non-GPU intermediates.
+        stack = [dep for op in claimants for dep in op.input_dependencies]
+        visited = set()
+        while stack:
+            ancestor = stack.pop()
+            if ancestor in visited:
+                continue
+            visited.add(ancestor)
+            if ancestor in self._op_set and ancestor in unfinished:
+                claimants.add(ancestor)
+            stack.extend(ancestor.input_dependencies)
+
+        remaining = (
+            limits if limits is not None else self._resource_manager.get_global_limits()
+        )
+        frontier_found = False
+        for op in self._ops:
+            if op not in claimants:
+                self._states[op] = GPUActorAdmissionState.DORMANT
+                continue
+            if frontier_found:
+                self._states[op] = GPUActorAdmissionState.BLOCKED
+                continue
+
+            claim = op.gpu_actor_resource_usage()
+            if claim.satisfies_limit(remaining, ignore_object_store_memory=True):
+                self._states[op] = GPUActorAdmissionState.ADMITTED
+                remaining = remaining.subtract(claim).max(ExecutionResources.zero())
+            else:
+                self._states[op] = GPUActorAdmissionState.FRONTIER
+                frontier_found = True
+
+        for op in self._ops:
+            op._set_gpu_actor_admission_scheduling_enabled(
+                self._states[op] is GPUActorAdmissionState.ADMITTED
+            )
+
+    def update_scheduling_targets(self) -> None:
+        """Propagate usage-independent allocation caps into internal dispatch."""
+        for op in self._ops:
+            target = self._resource_manager.get_allocation_target(op)
+            admitted = self._states[op] is GPUActorAdmissionState.ADMITTED
+            op._set_gpu_actor_admission_allocation_target(target if admitted else None)
+            # An admitted op without an allocator target is not runnable yet.
+            op._set_gpu_actor_admission_scheduling_enabled(
+                admitted and target is not None
+            )
+
+
 def _get_first_pending_materializing_op(topology: "Topology") -> int:
     for idx, op in enumerate(topology):
         if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS) and not op.has_completed():
@@ -599,6 +743,13 @@ class OpResourceAllocator(ABC):
         allocation is unlimited."""
         ...
 
+    @abstractmethod
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        """Return reserved plus assigned shared resources, independent of usage."""
+        ...
+
     def _get_eligible_ops(self) -> List[PhysicalOperator]:
         """Returns a list of operators eligible for allocation.
 
@@ -614,6 +765,7 @@ class OpResourceAllocator(ABC):
             op
             for idx, op in enumerate(self._topology)
             if self._is_op_eligible(op)
+            and self._resource_manager.is_gpu_actor_admission_allocation_eligible(op)
             and (
                 first_pending_materializing_op_idx == -1
                 or idx <= first_pending_materializing_op_idx
@@ -677,6 +829,10 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         self._total_shared = ExecutionResources.zero()
         # Resource budgets for each operator, excluding `_reserved_for_op_outputs`.
         self._op_budgets: Dict[PhysicalOperator, ExecutionResources] = {}
+        # Allocation targets are reserved resources plus a conceptual assignment
+        # from the full shared pool. Unlike ``get_allocation()``, these do not grow
+        # to include resources that an operator is already overusing.
+        self._op_allocation_targets: Dict[PhysicalOperator, ExecutionResources] = {}
         # Remaining memory budget for generating new task outputs, per operator.
         self._output_budgets: Dict[PhysicalOperator, float] = {}
         # Whether each operator has reserved the minimum resources to run
@@ -701,10 +857,31 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
 
         remaining = limits.copy()
 
-        # Reserve `reservation_ratio * global_limits / num_ops` resources for each
-        # operator.
-        default_reserved = limits.scale(self._reservation_ratio / (len(eligible_ops)))
+        # Protect one complete actor bundle for every admitted GPU pool before
+        # default reservation or shared-resource distribution. Without this
+        # pre-pass, intervening CPU operators (or another operator's fractional
+        # default share) can consume part of the GPU budget and strand a later
+        # pool that the admission scan already determined should stream.
+        admission_floors: Dict[PhysicalOperator, ExecutionResources] = {}
+        for op in eligible_ops:
+            if (
+                self._resource_manager.get_gpu_actor_admission_state(op)
+                is GPUActorAdmissionState.ADMITTED
+            ):
+                floor = op.gpu_actor_resource_usage()
+                assert floor.satisfies_limit(
+                    remaining, ignore_object_store_memory=True
+                ), (op, floor, remaining)
+                admission_floors[op] = floor
+                remaining = remaining.subtract(floor).max(ExecutionResources.zero())
+
+        # Distribute the configured default reservation from resources remaining
+        # after protected admission floors.
+        default_reserved = remaining.scale(
+            self._reservation_ratio / (len(eligible_ops))
+        )
         for index, op in enumerate(eligible_ops):
+            admission_floor = admission_floors.get(op, ExecutionResources.zero())
             # Reserve at least half of the default reserved resources for the outputs.
             # This makes sure that we will have enough budget to pull blocks from the
             # op.
@@ -712,7 +889,9 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 0, 0, max(default_reserved.object_store_memory / 2, 1)
             )
 
-            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs)
+            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs).add(
+                admission_floor
+            )
 
             min_resource_usage, max_resource_usage = op.min_max_resource_requirements()
 
@@ -725,7 +904,10 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             # and reserved_for_outputs. Note, we only consider CPU and GPU, but not
             # object_store_memory, because object_store_memory can be oversubscribed,
             # but CPU/GPU cannot.
-            if reserved_for_tasks.add(reserved_for_outputs).satisfies_limit(
+            additional_task_reservation = reserved_for_tasks.subtract(
+                admission_floor
+            ).max(ExecutionResources.zero())
+            if additional_task_reservation.add(reserved_for_outputs).satisfies_limit(
                 remaining, ignore_object_store_memory=True
             ):
                 self._reserved_min_resources[op] = True
@@ -742,8 +924,8 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 # NOTE: we prioritize upstream operators for minimum resource reservation.
                 # ops. It's fine that downstream ops don't get the minimum reservation,
                 # because they can wait for upstream ops to finish and release resources.
-                reserved_for_tasks = ExecutionResources(
-                    0, 0, min_resource_usage.object_store_memory
+                reserved_for_tasks = admission_floor.copy(
+                    object_store_memory=min_resource_usage.object_store_memory
                 )
 
             # Log a warning if even the first operator cannot reserve the minimum
@@ -754,8 +936,13 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             self._op_reserved[op] = reserved_for_tasks
             self._reserved_for_op_outputs[op] = reserved_for_outputs.object_store_memory
 
-            op_total_reserved = reserved_for_tasks.add(reserved_for_outputs)
-            remaining = remaining.subtract(op_total_reserved)
+            additional_task_reservation = reserved_for_tasks.subtract(
+                admission_floor
+            ).max(ExecutionResources.zero())
+            op_additional_reserved = additional_task_reservation.add(
+                reserved_for_outputs
+            )
+            remaining = remaining.subtract(op_additional_reserved)
             remaining = remaining.max(ExecutionResources.zero())
 
         self._total_shared = remaining
@@ -779,6 +966,13 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
 
     def can_submit_new_task(self, op: PhysicalOperator) -> bool:
         """Return whether the given operator can submit a new task based on budget."""
+        admission_state = self._resource_manager.get_gpu_actor_admission_state(op)
+        if (
+            admission_state is not None
+            and admission_state is not GPUActorAdmissionState.ADMITTED
+        ):
+            return False
+
         budget = self.get_budget(op)
 
         if budget is None:
@@ -805,6 +999,11 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             return None
         return budget.add(self._resource_manager.get_op_usage(op))
 
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        return self._op_allocation_targets.get(op)
+
     def _get_total_reserved(self, op: PhysicalOperator) -> ExecutionResources:
         """Get total reserved resources for an operator, including outputs reservation."""
         op_reserved = self._op_reserved[op]
@@ -812,6 +1011,56 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         return op_reserved.copy(
             object_store_memory=op_reserved.object_store_memory + reserved_for_outputs
         )
+
+    def _update_allocation_targets(self, eligible_ops: List[PhysicalOperator]) -> None:
+        """Assign the full shared pool without letting current overuse justify itself."""
+        self._op_allocation_targets = {
+            op: self._get_total_reserved(op) for op in eligible_ops
+        }
+        remaining_shared = self._total_shared
+
+        for i, op in enumerate(reversed(eligible_ops)):
+            op_shared = remaining_shared.scale(1.0 / (len(eligible_ops) - i))
+            target = self._op_allocation_targets[op]
+
+            # Preserve the allocator's downstream borrowing rule, but calculate
+            # it from the target instead of the usage-dependent remaining budget.
+            to_borrow = (
+                op.min_scheduling_resources()
+                .subtract(target.add(op_shared))
+                .max(ExecutionResources.zero())
+            )
+            if not to_borrow.is_zero() and op_shared.add(to_borrow).satisfies_limit(
+                remaining_shared
+            ):
+                op_shared = op_shared.add(to_borrow)
+
+            _, max_resource_usage = op.min_max_resource_requirements()
+            if max_resource_usage != ExecutionResources.inf():
+                max_shared = max_resource_usage.subtract(target).max(
+                    ExecutionResources.zero()
+                )
+                op_shared = op_shared.min(max_shared)
+
+            remaining_shared = remaining_shared.subtract(op_shared)
+            assert remaining_shared.is_non_negative(), (
+                remaining_shared,
+                op,
+                op_shared,
+                to_borrow,
+            )
+            self._op_allocation_targets[op] = target.add(op_shared)
+
+        # Match the budget allocator's handling of resources left behind by
+        # capped operators.
+        if eligible_ops and not remaining_shared.is_zero():
+            for op in reversed(eligible_ops):
+                _, max_resource_usage = op.min_max_resource_requirements()
+                if max_resource_usage == ExecutionResources.inf():
+                    self._op_allocation_targets[op] = self._op_allocation_targets[
+                        op
+                    ].add(remaining_shared)
+                    break
 
     def max_task_output_bytes_to_read(self, op: PhysicalOperator) -> Optional[int]:
         if op not in self._op_budgets:
@@ -838,13 +1087,15 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         *,
         limits: ExecutionResources,
     ):
-        # Remaining resources to be distributed across operators
-        remaining_shared = self._update_reservation(limits)
+        self._update_reservation(limits)
 
         self._op_budgets.clear()
         eligible_ops = self._get_eligible_ops()
+        self._op_allocation_targets.clear()
         if len(eligible_ops) == 0:
             return
+
+        self._update_allocation_targets(eligible_ops)
 
         # Remaining of shared resources.
         remaining_shared = self._total_shared

@@ -253,6 +253,13 @@ DEFAULT_ENABLE_OP_RESOURCE_RESERVATION = env_bool(
     "RAY_DATA_ENABLE_OP_RESOURCE_RESERVATION", True
 )
 
+# Internal rollback switch for resource-aware admission of GPU actor pools with
+# statically declared resources. Keep this private until the policy has had enough
+# production exposure.
+_DEFAULT_ENABLE_GPU_ACTOR_ADMISSION_CONTROL = env_bool(
+    "RAY_DATA_ENABLE_GPU_ACTOR_ADMISSION_CONTROL", True
+)
+
 DEFAULT_OP_RESOURCE_RESERVATION_RATIO = float(
     os.environ.get("RAY_DATA_OP_RESERVATION_RATIO", "0.5")
 )
@@ -844,6 +851,9 @@ class DataContext:
     max_map_retries: int = DEFAULT_MAX_MAP_RETRIES
     op_resource_reservation_enabled: bool = DEFAULT_ENABLE_OP_RESOURCE_RESERVATION
     op_resource_reservation_ratio: float = DEFAULT_OP_RESOURCE_RESERVATION_RATIO
+    _enable_gpu_actor_admission_control: bool = (
+        _DEFAULT_ENABLE_GPU_ACTOR_ADMISSION_CONTROL
+    )
     max_errored_blocks: int = DEFAULT_MAX_ERRORED_BLOCKS
     log_internal_stack_trace_to_stdout: bool = (
         DEFAULT_LOG_INTERNAL_STACK_TRACE_TO_STDOUT
