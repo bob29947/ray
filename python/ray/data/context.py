@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ray.data._internal.issue_detection.issue_detector_configuration import (
         IssueDetectorsConfiguration,
     )
+    from ray.data._internal.logical.interfaces import Rule
     from ray.data._internal.tensor_extensions.arrow import FixedShapeTensorFormat
 
 logger = logging.getLogger(__name__)
@@ -903,6 +904,13 @@ class DataContext:
     _checkpoint_config: Optional[CheckpointConfig] = None
 
     custom_execution_callback_classes: List[Type["ExecutionCallback"]] = field(
+        default_factory=list
+    )
+
+    # Physical optimizer extensions attached to plans created with this context.
+    # Keeping these classes on DataContext avoids process-global rule registration
+    # and propagates the extension to remote Dataset planners.
+    custom_physical_optimizer_rule_classes: List[Type["Rule"]] = field(
         default_factory=list
     )
 

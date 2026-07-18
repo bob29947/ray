@@ -71,9 +71,32 @@ class LogicalOptimizer(Optimizer):
 class PhysicalOptimizer(Optimizer):
     """The optimizer for physical operators."""
 
+    def __init__(self):
+        self._custom_rule_classes = ()
+
     @property
     def rules(self) -> List[Rule]:
-        return [rule_cls() for rule_cls in get_physical_ruleset()]
+        ruleset = Ruleset()
+        seen = set()
+        for rule_cls in (*get_physical_ruleset(), *self._custom_rule_classes):
+            if not isinstance(rule_cls, type) or not issubclass(rule_cls, Rule):
+                raise TypeError(
+                    "custom_physical_optimizer_rule_classes must contain "
+                    f"Rule subclasses, got {rule_cls!r}"
+                )
+            if rule_cls in seen:
+                continue
+            ruleset.add(rule_cls)
+            seen.add(rule_cls)
+        return [rule_cls() for rule_cls in ruleset]
+
+    def optimize(self, plan: PhysicalPlan) -> PhysicalPlan:
+        """Optimize using the stock rules plus this plan's context-local rules."""
+
+        self._custom_rule_classes = tuple(
+            plan.context.custom_physical_optimizer_rule_classes
+        )
+        return super().optimize(plan)
 
 
 def get_execution_plan(
