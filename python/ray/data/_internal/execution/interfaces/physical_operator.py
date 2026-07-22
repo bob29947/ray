@@ -29,6 +29,10 @@ from ray.data._internal.execution.interfaces.execution_options import (
     ExecutionOptions,
     ExecutionResources,
 )
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 from ray.data._internal.execution.interfaces.op_runtime_metrics import OpRuntimeMetrics
 from ray.data._internal.logical.interfaces import LogicalOperator, Operator
 from ray.data._internal.output_buffer import OutputBlockSizeOption
@@ -991,6 +995,18 @@ class PhysicalOperator(Operator):
         utilize.
         """
         return ExecutionResources.zero(), ExecutionResources.inf()
+
+    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
+        """Return this persistent owner's aggregate resource floor, if any."""
+        return None
+
+    def apply_resource_admission_grant(
+        self, grant: ResourceAdmissionGrant
+    ) -> None:
+        pass
+
+    def can_release_resource_admission(self) -> bool:
+        return True
 
     def incremental_resource_usage(self) -> ExecutionResources:
         """Returns the incremental resources required for processing another input.

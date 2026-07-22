@@ -3,6 +3,7 @@ import logging
 import pickle
 import time
 import typing
+from enum import Enum
 from typing import (
     Any,
     Callable,
@@ -15,7 +16,6 @@ from typing import (
 )
 
 import ray
-import ray.exceptions
 from ray.actor import ActorHandle
 from ray.data import ExecutionOptions
 from ray.data._internal.execution.bundle_queue import ReorderingBundleQueue
@@ -31,6 +31,10 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     OpTask,
     estimate_total_num_of_blocks,
 )
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+)
 from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
@@ -38,6 +42,8 @@ from ray.data._internal.execution.operators.sub_progress import SubProgressBarMi
 from ray.data._internal.stats import OpRuntimeMetrics
 from ray.data.block import Block, BlockAccessor, BlockStats, to_stats
 from ray.data.context import DataContext
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 if typing.TYPE_CHECKING:
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
@@ -99,8 +105,8 @@ class GPUShuffleActor:
     # UCXX communicator setup
     # ------------------------------------------------------------------
 
-    def setup_root(self) -> tuple[int, bytes]:
-        """Initialize the root communicator and return ``(rank, root_address_bytes)``.
+    def setup_root(self) -> bytes:
+        """Initialize the root communicator and return its address.
 
         Only called on rank 0; the returned address is broadcast to all ranks
         via :meth:`setup_worker`.
@@ -110,7 +116,7 @@ class GPUShuffleActor:
         result = self._shuffler.setup_root()
         elapsed = time.perf_counter() - t0
         logger.info("UCXX setup_root completed in %.2fs (rank=%d).", elapsed, result[0])
-        return result
+        return result[1]
 
     def setup_worker(self, root_address: bytes) -> None:
         """Finish UCXX communicator setup and create the internal shuffler.
@@ -132,12 +138,8 @@ class GPUShuffleActor:
     # Insert / extract interface (called by GPUShuffleOperator)
     # ------------------------------------------------------------------
 
-    def insert_batch(self, block: Block) -> int:
-        """Hash-partition *block* and route shards to peers.
-
-        Returns the number of rows in the incoming block so the driver can
-        track throughput without serialising the data back.
-        """
+    def insert_batch(self, block: Block) -> None:
+        """Hash-partition *block* and route shards to peers."""
         import cudf
 
         table = BlockAccessor.for_block(block).to_arrow()
@@ -149,7 +151,6 @@ class GPUShuffleActor:
             # save arrow schema from first batch
             self._arrow_schema = table.schema
         self._shuffler.insert_chunk(table=df, column_names=self._columns)
-        return len(df)
 
     def finish_and_extract(self) -> Iterator:
         """Signal insertion is done, then yield one Arrow Table per output partition.
@@ -214,6 +215,14 @@ class GPUShuffleActor:
 # ---------------------------------------------------------------------------
 
 
+class GPURankPoolState(Enum):
+    INACTIVE = "inactive"
+    STARTING = "starting"
+    READY = "ready"
+    CLOSED = "closed"
+    FAILED = "failed"
+
+
 class GPURankPool:
     """Manages the lifecycle of ``GPUShuffleActor`` instances.
 
@@ -240,11 +249,20 @@ class GPURankPool:
         self._log_label = log_label
         self._label_selector = label_selector
         self._actors: List[ActorHandle] = []
-        self._shutdown: bool = False
+        self._placement_group = None
+        self._placement_group_ready_ref: Optional[ray.ObjectRef] = None
+        self._worker_setup_refs: List[ray.ObjectRef] = []
+        self._setup_start_time: Optional[float] = None
+        self._state = GPURankPoolState.INACTIVE
+        self._failure: Optional[BaseException] = None
 
     @property
-    def is_shutdown(self) -> bool:
-        return self._shutdown
+    def state(self) -> GPURankPoolState:
+        return self._state
+
+    @property
+    def owns_resources(self) -> bool:
+        return self._placement_group is not None or bool(self._actors)
 
     @property
     def nranks(self) -> int:
@@ -254,119 +272,173 @@ class GPURankPool:
     def actors(self) -> List[ActorHandle]:
         return self._actors
 
-    def start(self) -> None:
-        timeout = self._setup_timeout_s
-        t_start = time.perf_counter()
+    @property
+    def pending_setup_refs(self) -> Tuple[ray.ObjectRef, ...]:
+        return tuple(self._worker_setup_refs) or (
+            (self._placement_group_ready_ref,)
+            if self._placement_group_ready_ref is not None
+            else ()
+        )
 
+    def activate(self) -> None:
+        if self._state is not GPURankPoolState.INACTIVE:
+            return
         logger.info(
-            "%s: creating %d actor(s) (total_nparts=%d).",
+            "%s: reserving an atomic %d-rank placement group (total_nparts=%d).",
             self._log_label,
             self._nranks,
             self._total_nparts,
         )
-        actor_cls = self._actor_cls_factory()
-        actor_options: Dict[str, typing.Any] = {
-            "num_gpus": 1,
-            "scheduling_strategy": "SPREAD",
-        }
-        if self._label_selector:
-            actor_options["label_selector"] = self._label_selector
-        self._actors = [
-            actor_cls.options(**actor_options).remote(
-                nranks=self._nranks,
-                total_nparts=self._total_nparts,
-                **self._actor_kwargs,
-            )
-            for _ in range(self._nranks)
-        ]
-        t_actors = time.perf_counter()
-        logger.info(
-            "%s: %d actor(s) created in %.2fs.",
-            self._log_label,
-            self._nranks,
-            t_actors - t_start,
-        )
-
-        remaining = max(0, timeout - (time.perf_counter() - t_start))
-        logger.info("%s: calling setup_root on rank 0.", self._log_label)
         try:
-            _, root_address_bytes = ray.get(
-                self._actors[0].setup_root.remote(), timeout=remaining
-            )
-        except ray.exceptions.GetTimeoutError:
-            raise TimeoutError(
-                f"UCXX setup_root on {self._log_label} rank 0 did not complete "
-                f"within {timeout}s. Check GPU/network health."
-            )
-        t_root = time.perf_counter()
-        logger.info(
-            "%s: setup_root completed in %.2fs, "
-            "broadcasting root address (%d bytes) to %d worker(s).",
-            self._log_label,
-            t_root - t_actors,
-            len(root_address_bytes),
-            self._nranks,
-        )
+            placement_group_options: Dict[str, Any] = {
+                "bundles": [{"CPU": 1.0, "GPU": 1.0} for _ in range(self._nranks)],
+                "strategy": "SPREAD",
+            }
+            if self._label_selector:
+                placement_group_options["bundle_label_selector"] = [
+                    dict(self._label_selector) for _ in range(self._nranks)
+                ]
+            self._placement_group = placement_group(**placement_group_options)
+            self._placement_group_ready_ref = self._placement_group.ready()
+            self._state = GPURankPoolState.STARTING
+        except BaseException as exc:
+            self.fail(exc)
+            raise
 
-        remaining = max(0, timeout - (time.perf_counter() - t_start))
-        worker_refs = [
-            actor.setup_worker.remote(root_address_bytes) for actor in self._actors
+    def poll_ready(self) -> bool:
+        if self._state is GPURankPoolState.READY:
+            return True
+        if self._state is GPURankPoolState.FAILED:
+            assert self._failure is not None
+            raise self._failure
+        if self._state in (
+            GPURankPoolState.INACTIVE,
+            GPURankPoolState.CLOSED,
+        ):
+            return False
+
+        try:
+            if self._placement_group_ready_ref is not None:
+                ready, _ = ray.wait([self._placement_group_ready_ref], timeout=0)
+                if not ready:
+                    return False
+                ray.get(ready)
+                self._placement_group_ready_ref = None
+                self._setup_start_time = time.perf_counter()
+                self._start_rank_actors()
+            self._raise_if_setup_timed_out()
+            if self._worker_setup_refs:
+                ready, pending = ray.wait(
+                    self._worker_setup_refs,
+                    num_returns=len(self._worker_setup_refs),
+                    timeout=0,
+                )
+                if ready:
+                    ray.get(ready)
+                self._worker_setup_refs = list(pending)
+                if self._worker_setup_refs:
+                    return False
+
+            self._state = GPURankPoolState.READY
+            return True
+        except BaseException as exc:
+            self.fail(exc)
+            raise
+
+    def _start_rank_actors(self) -> None:
+        assert self._placement_group is not None
+        actor_cls = self._actor_cls_factory()
+        for rank in range(self._nranks):
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=self._placement_group,
+                placement_group_bundle_index=rank,
+                placement_group_capture_child_tasks=False,
+            )
+            self._actors.append(
+                actor_cls.options(
+                    num_cpus=1,
+                    num_gpus=1,
+                    scheduling_strategy=scheduling_strategy,
+                ).remote(
+                    nranks=self._nranks,
+                    total_nparts=self._total_nparts,
+                    **self._actor_kwargs,
+                )
+            )
+        root_address_ref = self._actors[0].setup_root.remote()
+        self._worker_setup_refs = [
+            actor.setup_worker.remote(root_address_ref) for actor in self._actors
         ]
-        self._wait_for_refs_with_timeout(worker_refs, remaining, "setup_worker")
-        t_done = time.perf_counter()
-        logger.info(
-            "%s: all %d worker(s) setup completed in %.2fs "
-            "(total UCXX init: %.2fs).",
-            self._log_label,
-            self._nranks,
-            t_done - t_root,
-            t_done - t_start,
-        )
+
+    def _raise_if_setup_timed_out(self) -> None:
+        assert self._setup_start_time is not None
+        if time.perf_counter() - self._setup_start_time >= self._setup_timeout_s:
+            raise TimeoutError(
+                f"{self._log_label} UCXX setup did not "
+                f"complete within {self._setup_timeout_s}s "
+                f"(state={self._state.value}). Check cluster capacity and "
+                "GPU/network health."
+            )
+
+    def fail(self, exc: BaseException) -> None:
+        """Fail the gang and atomically release every rank resource."""
+        if self._state in (GPURankPoolState.FAILED, GPURankPoolState.CLOSED):
+            return
+        self._cleanup_resources()
+        self._failure = exc
+        self._state = GPURankPoolState.FAILED
+
+    def _cleanup_resources(self) -> None:
+        if self._placement_group is not None:
+            try:
+                remove_placement_group(self._placement_group)
+            except Exception:
+                logger.debug(
+                    "%s: failed to remove placement group during cleanup.",
+                    self._log_label,
+                    exc_info=True,
+                )
+            else:
+                self._placement_group = None
+                self._actors.clear()
+
+        remaining_actors = []
+        for actor in self._actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                remaining_actors.append(actor)
+                logger.debug(
+                    "%s: failed to kill rank actor during cleanup.",
+                    self._log_label,
+                    exc_info=True,
+                )
+        self._actors = remaining_actors
+        self._placement_group_ready_ref = None
+        self._worker_setup_refs.clear()
+        self._setup_start_time = None
 
     def get_actor_for_block(self, block_idx: int) -> ActorHandle:
         """Round-robin distribution of input blocks across ranks."""
+        if self._state is not GPURankPoolState.READY:
+            raise RuntimeError(
+                f"{self._log_label} cannot accept input while {self._state.value}."
+            )
         return self._actors[block_idx % self._nranks]
 
-    def shutdown(self, force: bool = False) -> None:
-        if force:
-            for actor in self._actors:
-                ray.kill(actor)
-        self._actors.clear()
-        self._shutdown = True
+    def deactivate(self) -> None:
+        if not self.owns_resources:
+            return
+        self._cleanup_resources()
+        if not self._actors and not self.owns_resources:
+            self._state = GPURankPoolState.INACTIVE
 
-    def _wait_for_refs_with_timeout(
-        self,
-        refs: List[ray.ObjectRef],
-        timeout_s: float,
-        task_name: str,
-    ) -> None:
-        """Poll ``refs`` in a loop, raising on timeout or task failure."""
-        total = len(refs)
-        pending = list(refs)
-        t_start = time.perf_counter()
-
-        while pending:
-            elapsed = time.perf_counter() - t_start
-            if elapsed >= timeout_s:
-                pending_indices = [i for i, ref in enumerate(refs) if ref in pending]
-                raise TimeoutError(
-                    f"{task_name} did not complete on {len(pending)}/{total} "
-                    f"rank(s) within {timeout_s}s "
-                    f"(pending ranks: {pending_indices}). "
-                    f"Check GPU/network health."
-                )
-            ready, pending = ray.wait(
-                pending, num_returns=len(pending), timeout=min(0.1, timeout_s - elapsed)
-            )
-            if ready:
-                ray.get(ready)
-                logger.info(
-                    "%s: %d/%d rank(s) completed %s.",
-                    self._log_label,
-                    total - len(pending),
-                    total,
-                    task_name,
-                )
+    def shutdown(self) -> None:
+        if self._state is GPURankPoolState.CLOSED:
+            return
+        self._cleanup_resources()
+        if not self._actors and not self.owns_resources:
+            self._state = GPURankPoolState.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +479,9 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     Lifecycle::
 
-        start()                    # creates actors, blocks for UCXX setup
-        _add_input_inner(bundle)   # routes blocks to actors round-robin
+        start()                    # local initialization only
+        apply_resource_admission_grant() # asynchronously activates the rank gang
+        _add_input_inner(bundle)   # routes blocks once every rank is ready
         [inputs_done()]            # called by the executor
         has_next() / _get_next_inner()   # streams output bundles
 
@@ -469,9 +542,11 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             log_label="GPUShufflePool",
             label_selector=data_context.execution_options.label_selector,
         )
+        self._admission_grant: Optional[ResourceAdmissionGrant] = None
 
         self._next_block_idx: int = 0
         self._insert_tasks: Dict[int, MetadataOpTask] = {}
+        self._insert_refs: List[ray.ObjectRef] = []
         self._extraction_tasks: Dict[int, DataOpTask] = {}
         self._finalization_started: bool = False
         self._output_queue: ReorderingBundleQueue = ReorderingBundleQueue()
@@ -496,7 +571,54 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         block_ref_counter: "BlockRefCounter",
     ) -> None:
         super().start(options, block_ref_counter)
-        self._rank_pool.start()
+        if self._admission_grant is None:
+            self._admission_grant = ResourceAdmissionGrant(max_units=1, may_submit=True)
+        if self._admission_grant.max_units == 1:
+            self._rank_pool.activate()
+
+    def resource_admission_spec(self) -> Optional[ResourceAdmissionSpec]:
+        label_selector = self.data_context.execution_options.label_selector
+        if not self.data_context._enable_resource_admission_control or label_selector:
+            return None
+        return ResourceAdmissionSpec(
+            minimum_resources=ExecutionResources(
+                cpu=self._rank_pool.nranks, gpu=self._rank_pool.nranks
+            ),
+            unit_resources=None,
+            min_units=1,
+            max_units=1,
+        )
+
+    def _resource_admission_unsupported(self) -> bool:
+        return bool(self.data_context.execution_options.label_selector)
+
+    def apply_resource_admission_grant(self, grant: ResourceAdmissionGrant) -> None:
+        assert grant.max_units in (0, 1)
+        if grant.max_units == 0 and not self.can_release_resource_admission():
+            return
+        self._admission_grant = grant
+        if grant.max_units == 0:
+            self._rank_pool.deactivate()
+        elif self._started:
+            self._rank_pool.activate()
+
+    def can_release_resource_admission(self) -> bool:
+        return (
+            self._rank_pool.state
+            not in (GPURankPoolState.CLOSED, GPURankPoolState.FAILED)
+            and self._next_block_idx == 0
+            and not self._inputs_complete
+            and not self._finalization_started
+        ) or (
+            not self._rank_pool.owns_resources
+            and self._rank_pool.state
+            in (GPURankPoolState.CLOSED, GPURankPoolState.FAILED)
+        )
+
+    def can_add_input(self) -> bool:
+        if self._admission_grant is None or not self._admission_grant.may_submit:
+            return False
+        return self._rank_pool.poll_ready()
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
         self._shuffle_metrics.on_input_received(bundle)
@@ -507,6 +629,7 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             insert_ref = actor.insert_batch.remote(block_ref)
             task_idx = self._next_block_idx
             self._next_block_idx += 1
+            self._insert_refs.append(insert_ref)
 
             def _on_insert_done(idx: int = task_idx) -> None:
                 self._insert_tasks.pop(idx, None)
@@ -538,6 +661,16 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
         """Schedule extraction once all inserts have completed."""
         if self._finalization_started or not self._is_inserting_done():
             return
+        if not self._rank_pool.poll_ready():
+            return
+
+        try:
+            ray.get(self._insert_refs)
+        except BaseException as exc:
+            self._rank_pool.fail(exc)
+            raise
+        finally:
+            self._insert_refs.clear()
 
         self._finalization_started = True
         # Running count of partitions extracted, used for metrics only.
@@ -617,9 +750,13 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
             rank: int = -1,
         ) -> None:
             self._extraction_tasks.pop(rank, None)
+            if exc is not None:
+                self._rank_pool.fail(exc)
+                return
             if not self._extraction_tasks:
                 # release GPU actors so downstream operators can acquire those GPUs
-                self._rank_pool.shutdown()
+                if self._rank_pool.state is not GPURankPoolState.FAILED:
+                    self._rank_pool.shutdown()
 
         for rank_idx, actor in enumerate(self._rank_pool.actors):
             block_gen = actor.finish_and_extract.options(
@@ -658,7 +795,19 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def get_active_tasks(self) -> List[OpTask]:
-        return list(self._insert_tasks.values()) + list(self._extraction_tasks.values())
+        return (
+            [
+                MetadataOpTask(
+                    task_index=rank,
+                    object_ref=setup_ref,
+                    task_done_callback=self._rank_pool.poll_ready,
+                    task_resource_bundle=None,
+                )
+                for rank, setup_ref in enumerate(self._rank_pool.pending_setup_refs)
+            ]
+            + list(self._insert_tasks.values())
+            + list(self._extraction_tasks.values())
+        )
 
     def has_completed(self) -> bool:
         return (
@@ -672,9 +821,10 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
     # ------------------------------------------------------------------
 
     def _do_shutdown(self, force: bool = False) -> None:
-        self._rank_pool.shutdown(force=True)
+        self._rank_pool.shutdown()
         super()._do_shutdown(force)
         self._insert_tasks.clear()
+        self._insert_refs.clear()
         self._extraction_tasks.clear()
 
     # ------------------------------------------------------------------
@@ -683,17 +833,24 @@ class GPUShuffleOperator(PhysicalOperator, SubProgressBarMixin):
 
     def current_logical_usage(self) -> ExecutionResources:
         pool = self._rank_pool
-        if pool.is_shutdown:
+        if not pool.owns_resources:
             return ExecutionResources(gpu=0)
-        gpus = len(pool.actors) or pool.nranks
-        return ExecutionResources(gpu=gpus)
+        return ExecutionResources(cpu=pool.nranks, gpu=pool.nranks)
 
     @property
     def base_resource_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=self._rank_pool.nranks)
+        ranks = self._rank_pool.nranks
+        return ExecutionResources(cpu=ranks, gpu=ranks)
+
+    def min_max_resource_requirements(
+        self,
+    ) -> Tuple[ExecutionResources, ExecutionResources]:
+        gang = self.base_resource_usage
+        return gang, gang.copy(object_store_memory=float("inf"))
 
     def incremental_resource_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=1)
+        # Insert and extraction calls run on the already-accounted rank actors.
+        return ExecutionResources.zero()
 
     def get_actor_info(self) -> "ActorPoolInfo":
         from ray.data._internal.execution.interfaces.physical_operator import (

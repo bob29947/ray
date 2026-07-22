@@ -16,6 +16,11 @@ from ray.data._internal.execution.interfaces.physical_operator import (
     PhysicalOperator,
     ReportsExtraResourceUsage,
 )
+from ray.data._internal.execution.resource_admission import (
+    ResourceAdmissionGrant,
+    ResourceAdmissionSpec,
+    validate_resource_admission_spec,
+)
 from ray.data._internal.execution.operators.base_physical_operator import (
     AllToAllOperator,
 )
@@ -147,6 +152,9 @@ class ResourceManager:
         self._op_resource_allocator: Optional[
             "OpResourceAllocator"
         ] = create_resource_allocator(self, data_context)
+        self._resource_admission_controller = _ResourceAdmissionController(
+            topology, self
+        )
 
         self._object_store_memory_limit_fraction = (
             data_context.override_object_store_memory_limit_fraction
@@ -246,18 +254,31 @@ class ResourceManager:
             self._op_pending_usages.values()
         )
 
-        if self._op_resource_allocator is not None:
-            self._update_allocated_budgets()
+        if (
+            self._op_resource_allocator is not None
+            or self._resource_admission_controller._specs
+        ):
+            available_limits = self._get_available_limits_for_allocation()
+            self._resource_admission_controller.update_admission(available_limits)
+            if self._op_resource_allocator is not None:
+                self._update_allocated_budgets(available_limits)
+            self._resource_admission_controller.update_allocation_grants(
+                available_limits
+            )
 
-    def _update_allocated_budgets(self):
+    def _get_available_limits_for_allocation(self) -> ExecutionResources:
         completed_ops_usage = self._get_completed_ops_usage()
-
-        available_limits = (
+        return (
             self.get_global_limits()
             .subtract(completed_ops_usage)
             .max(ExecutionResources.zero())
         )
 
+    def _update_allocated_budgets(
+        self, available_limits: Optional[ExecutionResources] = None
+    ):
+        if available_limits is None:
+            available_limits = self._get_available_limits_for_allocation()
         self._op_resource_allocator.update_budgets(limits=available_limits)
 
     def get_global_usage(self) -> ExecutionResources:
@@ -410,6 +431,26 @@ class ResourceManager:
         """Return whether OpResourceAllocator is enabled."""
         return self._op_resource_allocator is not None
 
+    def get_resource_admission_grant(
+        self, op: PhysicalOperator
+    ) -> Optional[ResourceAdmissionGrant]:
+        """Return the latest executor-owned grant, or ``None`` if unmanaged."""
+        return self._resource_admission_controller.get_grant(op)
+
+    def get_resource_admission_spec(
+        self, op: PhysicalOperator
+    ) -> Optional[ResourceAdmissionSpec]:
+        return self._resource_admission_controller._specs.get(op)
+
+    def can_submit_new_task(self, op: PhysicalOperator) -> bool:
+        """Whether admission and the optional allocator permit new work."""
+        grant = self.get_resource_admission_grant(op)
+        if grant is not None and (not grant.may_submit or not op.can_add_input()):
+            return False
+        if self._op_resource_allocator is not None:
+            return self._op_resource_allocator.can_submit_new_task(op)
+        return True
+
     @property
     def op_resource_allocator(self) -> "OpResourceAllocator":
         """Return the OpResourceAllocator."""
@@ -429,6 +470,13 @@ class ResourceManager:
         if self._op_resource_allocator is None:
             return None
         return self._op_resource_allocator.get_allocation(op)
+
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        if self._op_resource_allocator is None:
+            return None
+        return self._op_resource_allocator.get_allocation_target(op)
 
     def is_op_eligible(self, op: PhysicalOperator) -> bool:
         """Whether the op is eligible for memory reservation."""
@@ -537,6 +585,213 @@ class ResourceManager:
         )
 
 
+class _ResourceAdmissionController:
+    def __init__(self, topology: "Topology", resource_manager: ResourceManager):
+        self._topology = topology
+        self._resource_manager = resource_manager
+        self._specs = {
+            op: spec for op in topology if (spec := op.resource_admission_spec())
+        }
+        self._grants: Dict[PhysicalOperator, ResourceAdmissionGrant] = {}
+        if self._specs and any(
+            getattr(op, "_resource_admission_unsupported", lambda: False)()
+            for op in topology
+        ):
+            logger.warning(
+                "GPU resource admission found an incompatible operator; using legacy "
+                "scheduling for the whole topology to avoid mixed ownership.",
+            )
+            self._specs.clear()
+        options = resource_manager._options
+        permitted = options.resource_limits.subtract(options.exclude_resources).max(
+            ExecutionResources.zero()
+        )
+        for op, spec in self._specs.items():
+            validate_resource_admission_spec(spec)
+            if not spec.minimum_resources.satisfies_limit(
+                permitted, ignore_object_store_memory=True
+            ):
+                raise ValueError(
+                    f"{op} requires an admission floor of {spec.minimum_resources}, "
+                    f"which exceeds the explicit effective execution resource limits "
+                    f"{permitted}."
+                )
+
+        for op in self._specs:
+            self._set_grant(op, 0, may_submit=False)
+
+    @staticmethod
+    def _is_admission_complete(op: PhysicalOperator, op_state: "OpState") -> bool:
+        return (
+            (op.has_execution_finished() or op._inputs_complete)
+            and op_state.total_enqueued_input_blocks() == 0
+            and op.num_active_tasks() == 0
+            and op.can_release_resource_admission()
+        )
+
+    def _unfinished_ancestors(self, roots, unfinished):
+        ancestors = set()
+        stack = [dep for op in roots for dep in op.input_dependencies]
+        while stack:
+            op = stack.pop()
+            if op in ancestors:
+                continue
+            ancestors.add(op)
+            stack.extend(op.input_dependencies)
+        return ancestors & self._specs.keys() & unfinished
+
+    def get_grant(self, op: PhysicalOperator) -> Optional[ResourceAdmissionGrant]:
+        return self._grants.get(op)
+
+    def _set_grant(
+        self, op: PhysicalOperator, max_units: int, *, may_submit: bool
+    ) -> None:
+        spec = self._specs[op]
+        if spec.max_units is not None:
+            max_units = min(max_units, spec.max_units)
+        grant = ResourceAdmissionGrant(
+            max_units=max(0, max_units), may_submit=may_submit
+        )
+        current_grant = self._grants.get(op)
+        if (
+            not grant.may_submit
+            and current_grant is not None
+            and current_grant.may_submit
+            and not op.can_release_resource_admission()
+        ):
+            return
+        if current_grant == grant:
+            return
+        self._grants[op] = grant
+        op.apply_resource_admission_grant(grant)
+
+    def update_admission(self, limits: Optional[ExecutionResources] = None) -> None:
+        if not self._specs:
+            return
+
+        unfinished = {
+            op
+            for op in self._specs
+            if not self._is_admission_complete(op, self._topology[op])
+        }
+        claimants = set()
+        for op in self._specs:
+            if op not in unfinished:
+                continue
+            op_state = self._topology[op]
+            if (
+                op_state.total_enqueued_input_blocks() > 0
+                or (
+                    len(op.input_dependencies) == 1
+                    and (dep := op.input_dependencies[0]) in self._specs
+                    and self._specs[dep].unit_resources is None
+                    and dep._inputs_complete
+                    and not dep.has_execution_finished()
+                )
+                or op.num_active_tasks() > 0
+                or not op.can_release_resource_admission()
+                or (not op.current_logical_usage().is_zero() and not op._inputs_complete)
+            ):
+                claimants.add(op)
+
+        claimants.update(self._unfinished_ancestors(claimants, unfinished))
+
+        current_capacity = remaining = (
+            limits if limits is not None else self._resource_manager.get_global_limits()
+        )
+        sticky_ops = {
+            op
+            for op in claimants
+            if self._grants[op].may_submit and not op.can_release_resource_admission()
+        }
+        protected_ops = sticky_ops | self._unfinished_ancestors(sticky_ops, unfinished)
+
+        for op in protected_ops:
+            remaining = remaining.subtract(self._specs[op].minimum_resources).max(
+                ExecutionResources.zero()
+            )
+
+        has_frontier = False
+        for op in self._specs:
+            spec = self._specs[op]
+            if op not in claimants:
+                self._set_grant(op, 0, may_submit=False)
+                continue
+            if op in protected_ops:
+                self._set_grant(op, spec.min_units, may_submit=True)
+                continue
+            if has_frontier:
+                self._set_grant(op, 0, may_submit=False)
+                continue
+
+            minimum_resources = spec.minimum_resources
+            fits_resources = minimum_resources.satisfies_limit(
+                remaining, ignore_object_store_memory=True
+            )
+            if fits_resources:
+                self._set_grant(op, spec.min_units, may_submit=True)
+                remaining = remaining.subtract(minimum_resources).max(
+                    ExecutionResources.zero()
+                )
+            else:
+                fixed_demand_already_exposed = (
+                    spec.unit_resources is None and self._grants[op].max_units > 0
+                )
+                expose_autoscaling_demand = (
+                    op.can_release_resource_admission() or spec.unit_resources is None
+                ) and (
+                    fixed_demand_already_exposed
+                    or not minimum_resources.satisfies_limit(
+                        current_capacity, ignore_object_store_memory=True
+                    )
+                )
+                self._set_grant(
+                    op,
+                    spec.min_units if expose_autoscaling_demand else 0,
+                    may_submit=False,
+                )
+                has_frontier = True
+
+    @staticmethod
+    def _max_units_for_target(
+        target: ExecutionResources, spec: ResourceAdmissionSpec
+    ) -> int:
+        if spec.unit_resources is None:
+            return 1
+        units = target.floordiv(spec.unit_resources)
+        max_units = int(min(units.cpu, units.gpu, units.memory))
+        return min(max_units, spec.max_units or max_units)
+
+    def update_allocation_grants(self, limits: Optional[ExecutionResources] = None):
+        remaining = None
+        if not self._resource_manager.op_resource_allocator_enabled():
+            limits = limits or self._resource_manager.get_global_limits()
+            floors = ExecutionResources.combine_sum(
+                self._specs[op].minimum_resources
+                for op, grant in self._grants.items()
+                if grant.may_submit
+            )
+            remaining = limits.subtract(floors).max(ExecutionResources.zero())
+
+        for op in self._specs:
+            spec = self._specs[op]
+            if not self._grants[op].may_submit:
+                continue
+            floor_units = spec.min_units
+            target = self._resource_manager.get_allocation_target(op)
+            if target is None and remaining is not None:
+                target = spec.minimum_resources.add(remaining)
+            target_units = (
+                floor_units
+                if target is None
+                else max(floor_units, self._max_units_for_target(target, spec))
+            )
+            if remaining is not None and spec.unit_resources is not None:
+                claimed = spec.unit_resources.scale(target_units - floor_units)
+                remaining = remaining.subtract(claimed).max(ExecutionResources.zero())
+            self._set_grant(op, target_units, may_submit=True)
+
+
 def _get_first_pending_materializing_op(topology: "Topology") -> int:
     for idx, op in enumerate(topology):
         if isinstance(op, _BLOCKING_MATERIALIZING_OPERATORS) and not op.has_completed():
@@ -599,6 +854,12 @@ class OpResourceAllocator(ABC):
         allocation is unlimited."""
         ...
 
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        """Return reserved plus assigned shared resources, independent of usage."""
+        return None
+
     def _get_eligible_ops(self) -> List[PhysicalOperator]:
         """Returns a list of operators eligible for allocation.
 
@@ -614,6 +875,11 @@ class OpResourceAllocator(ABC):
             op
             for idx, op in enumerate(self._topology)
             if self._is_op_eligible(op)
+            and (
+                (grant := self._resource_manager.get_resource_admission_grant(op))
+                is None
+                or grant.may_submit
+            )
             and (
                 first_pending_materializing_op_idx == -1
                 or idx <= first_pending_materializing_op_idx
@@ -677,6 +943,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         self._total_shared = ExecutionResources.zero()
         # Resource budgets for each operator, excluding `_reserved_for_op_outputs`.
         self._op_budgets: Dict[PhysicalOperator, ExecutionResources] = {}
+        self._allocation_targets: Dict[PhysicalOperator, ExecutionResources] = {}
         # Remaining memory budget for generating new task outputs, per operator.
         self._output_budgets: Dict[PhysicalOperator, float] = {}
         # Whether each operator has reserved the minimum resources to run
@@ -695,16 +962,31 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         self._op_reserved.clear()
         self._reserved_for_op_outputs.clear()
         self._reserved_min_resources.clear()
+        self._allocation_targets.clear()
 
         if len(eligible_ops) == 0:
             return
 
         remaining = limits.copy()
 
-        # Reserve `reservation_ratio * global_limits / num_ops` resources for each
-        # operator.
-        default_reserved = limits.scale(self._reservation_ratio / (len(eligible_ops)))
+        # Protect each admitted operator's complete progress floor before
+        # default reservation or shared-resource distribution.
+        admission_floors: Dict[PhysicalOperator, ExecutionResources] = {}
+        for op in eligible_ops:
+            spec = self._resource_manager.get_resource_admission_spec(op)
+            if spec is not None:
+                admission_floors[op] = spec.minimum_resources
+                remaining = remaining.subtract(spec.minimum_resources).max(
+                    ExecutionResources.zero()
+                )
+
+        # Distribute the configured default reservation from resources remaining
+        # after protected admission floors.
+        default_reserved = remaining.scale(
+            self._reservation_ratio / (len(eligible_ops))
+        )
         for index, op in enumerate(eligible_ops):
+            admission_floor = admission_floors.get(op, ExecutionResources.zero())
             # Reserve at least half of the default reserved resources for the outputs.
             # This makes sure that we will have enough budget to pull blocks from the
             # op.
@@ -712,7 +994,9 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 0, 0, max(default_reserved.object_store_memory / 2, 1)
             )
 
-            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs)
+            reserved_for_tasks = default_reserved.subtract(reserved_for_outputs).add(
+                admission_floor
+            )
 
             min_resource_usage, max_resource_usage = op.min_max_resource_requirements()
 
@@ -725,7 +1009,10 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             # and reserved_for_outputs. Note, we only consider CPU and GPU, but not
             # object_store_memory, because object_store_memory can be oversubscribed,
             # but CPU/GPU cannot.
-            if reserved_for_tasks.add(reserved_for_outputs).satisfies_limit(
+            additional_task_reservation = reserved_for_tasks.subtract(
+                admission_floor
+            ).max(ExecutionResources.zero())
+            if additional_task_reservation.add(reserved_for_outputs).satisfies_limit(
                 remaining, ignore_object_store_memory=True
             ):
                 self._reserved_min_resources[op] = True
@@ -742,8 +1029,8 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
                 # NOTE: we prioritize upstream operators for minimum resource reservation.
                 # ops. It's fine that downstream ops don't get the minimum reservation,
                 # because they can wait for upstream ops to finish and release resources.
-                reserved_for_tasks = ExecutionResources(
-                    0, 0, min_resource_usage.object_store_memory
+                reserved_for_tasks = admission_floor.copy(
+                    object_store_memory=min_resource_usage.object_store_memory
                 )
 
             # Log a warning if even the first operator cannot reserve the minimum
@@ -754,11 +1041,44 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             self._op_reserved[op] = reserved_for_tasks
             self._reserved_for_op_outputs[op] = reserved_for_outputs.object_store_memory
 
-            op_total_reserved = reserved_for_tasks.add(reserved_for_outputs)
-            remaining = remaining.subtract(op_total_reserved)
+            additional_task_reservation = reserved_for_tasks.subtract(
+                admission_floor
+            ).max(ExecutionResources.zero())
+            additional_op_reservation = additional_task_reservation.add(
+                reserved_for_outputs
+            )
+            remaining = remaining.subtract(additional_op_reservation)
             remaining = remaining.max(ExecutionResources.zero())
 
         self._total_shared = remaining
+        self._update_allocation_targets()
+
+    def _update_allocation_targets(self) -> None:
+        reserved = {op: self._get_total_reserved(op) for op in self._op_reserved}
+        maximum = {
+            op: op.min_max_resource_requirements()[1] or ExecutionResources.inf()
+            for op in self._op_reserved
+        }
+
+        def shared(resource: str) -> float:
+            consumers = sum(
+                getattr(maximum[op], resource) > getattr(reserved[op], resource)
+                for op in self._op_reserved
+            )
+            return getattr(self._total_shared, resource) / max(consumers, 1)
+
+        shared_resources = ExecutionResources(
+            cpu=shared("cpu"),
+            gpu=shared("gpu"),
+            memory=shared("memory"),
+            object_store_memory=(
+                self._total_shared.object_store_memory / len(self._op_reserved)
+            ),
+        )
+        for op in self._op_reserved:
+            self._allocation_targets[op] = (
+                reserved[op].add(shared_resources).min(maximum[op])
+            )
 
     def _warn_if_op_starved_too_long(self, op: PhysicalOperator) -> None:
         # The operator isn't starved. Return early.
@@ -779,6 +1099,9 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
 
     def can_submit_new_task(self, op: PhysicalOperator) -> bool:
         """Return whether the given operator can submit a new task based on budget."""
+        grant = self._resource_manager.get_resource_admission_grant(op)
+        if grant is not None and not grant.may_submit:
+            return False
         budget = self.get_budget(op)
 
         if budget is None:
@@ -804,6 +1127,11 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         if budget is None:
             return None
         return budget.add(self._resource_manager.get_op_usage(op))
+
+    def get_allocation_target(
+        self, op: PhysicalOperator
+    ) -> Optional[ExecutionResources]:
+        return self._allocation_targets.get(op)
 
     def _get_total_reserved(self, op: PhysicalOperator) -> ExecutionResources:
         """Get total reserved resources for an operator, including outputs reservation."""
@@ -838,8 +1166,7 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         *,
         limits: ExecutionResources,
     ):
-        # Remaining resources to be distributed across operators
-        remaining_shared = self._update_reservation(limits)
+        self._update_reservation(limits)
 
         self._op_budgets.clear()
         eligible_ops = self._get_eligible_ops()

@@ -42,6 +42,7 @@ from ray.data._internal.execution.operators.map_transformer import (
     MapTransformer,
 )
 from ray.data._internal.execution.ranker import DefaultRanker
+from ray.data._internal.execution.resource_admission import ResourceAdmissionGrant
 from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor import (
     StreamingExecutor,
@@ -56,6 +57,7 @@ from ray.data._internal.execution.streaming_executor_state import (
     get_eligible_operators,
     process_completed_tasks,
     select_operator_to_run,
+    start_streaming_topology,
     update_operator_states,
 )
 from ray.data._internal.execution.util import make_ref_bundles
@@ -134,6 +136,49 @@ def test_build_streaming_topology(verbose_progress, ray_start_regular_shared):
     assert topo[o1].output_queue == topo[o2].input_queues[0], topo
     assert topo[o2].output_queue == topo[o3].input_queues[0], topo
     assert list(topo) == [o1, o2, o3]
+
+
+def test_build_then_start_streaming_topology_in_two_phases():
+    data_context = DataContext.get_current()
+    o1 = InputDataBuffer(data_context, input_data=[])
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: block),
+        o1,
+        data_context,
+    )
+    o1.start = MagicMock()
+    o2.start = MagicMock()
+    options = ExecutionOptions()
+    block_ref_counter = noop_counter()
+
+    topology = build_streaming_topology(
+        o2,
+        options,
+        block_ref_counter,
+        start_operators=False,
+    )
+
+    o1.start.assert_not_called()
+    o2.start.assert_not_called()
+    start_streaming_topology(topology, options, block_ref_counter)
+    o1.start.assert_called_once_with(options, block_ref_counter)
+    o2.start.assert_called_once_with(options, block_ref_counter)
+
+
+def test_start_streaming_topology_rolls_back_partial_start():
+    operators = [MagicMock(spec=PhysicalOperator) for _ in range(3)]
+    operators[1].start.side_effect = RuntimeError("start failed")
+    operators[1]._do_shutdown.side_effect = RuntimeError("cleanup failed")
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        start_streaming_topology(
+            dict.fromkeys(operators), ExecutionOptions(), noop_counter()
+        )
+
+    operators[0]._do_shutdown.assert_called_once_with(force=True)
+    operators[1]._do_shutdown.assert_called_once_with(force=True)
+    operators[2].start.assert_not_called()
+    operators[2]._do_shutdown.assert_not_called()
 
 
 def test_disallow_non_unique_operators(ray_start_regular_shared):
@@ -370,6 +415,21 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
             # To ensure liveness back-pressure limits will be ignored
             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
+
+    # Admission is a hard constraint: the idle-pipeline liveness fallback must
+    # not dispatch new input to a frontier pool and let it leapfrog upstream.
+    resource_manager.get_resource_admission_grant.side_effect = (
+        lambda op: ResourceAdmissionGrant(0, False) if op is o2 else None
+    )
+    assert (
+        get_eligible_operators(
+            topo,
+            [],
+            ensure_liveness=True,
+            resource_manager=resource_manager,
+        )
+        == []
+    )
 
 
 def test_backpressure_policy_tracking(ray_start_regular_shared):

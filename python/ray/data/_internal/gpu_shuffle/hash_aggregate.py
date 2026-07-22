@@ -1511,7 +1511,7 @@ class GPUHashAggregateActor:
             else None
         )
 
-    def setup_root(self) -> Tuple[int, bytes]:
+    def setup_root(self) -> bytes:
         logger.info("UCXX setup_root starting on GPU hash aggregate rank 0.")
         t0 = time.perf_counter()
         result = self._shuffler.setup_root()
@@ -1521,7 +1521,7 @@ class GPUHashAggregateActor:
             elapsed,
             result[0],
         )
-        return result
+        return result[1]
 
     def setup_worker(self, root_address: bytes) -> None:
         logger.info(
@@ -1534,7 +1534,7 @@ class GPUHashAggregateActor:
         elapsed = time.perf_counter() - t0
         logger.info("UCXX setup_worker completed in %.2fs.", elapsed)
 
-    def insert_batch(self, block: Block) -> int:
+    def insert_batch(self, block: Block) -> None:
         import cudf
 
         table = BlockAccessor.for_block(block).to_arrow()
@@ -1557,7 +1557,6 @@ class GPUHashAggregateActor:
             self._shuffle_columns = list(partial.columns)
 
         self._shuffler.insert_chunk(table=partial, column_names=self._shuffle_columns)
-        return table.num_rows
 
     def finish_and_extract(self) -> Iterator[pa.Table | bytes]:
         self._shuffler.insert_finished()

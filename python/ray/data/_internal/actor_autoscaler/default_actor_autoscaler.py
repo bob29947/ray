@@ -55,30 +55,55 @@ class DefaultActorAutoscaler(ActorAutoscaler):
         op: "PhysicalOperator",
         op_state: "OpState",
     ) -> ActorPoolScalingRequest:
-        # If all inputs have been consumed, short-circuit
-        if op.has_completed() or (
-            op._inputs_complete and op_state.total_enqueued_input_blocks() == 0
+        grant = self._resource_manager.get_resource_admission_grant(op)
+        uses_admission = grant is not None
+        min_size = actor_pool.min_size()
+        max_size = actor_pool.max_size()
+        if grant is not None:
+            actor_limit = grant.max_units
+            if op.metrics.num_inputs_received == 0:
+                min_size = max(min_size, actor_pool.initial_size())
+            min_size = min(min_size, actor_limit)
+            max_size = min(max_size, actor_limit)
+
+        # If all inputs have been consumed, short-circuit. A managed actor op can
+        # still hold its final rebundled input internally after the executor's
+        # external queue is empty; treating that as complete would remove its
+        # actors and prevent a later readmission from ever processing the bundle.
+        if (op.has_execution_finished() if uses_admission else op.has_completed()) or (
+            op._inputs_complete
+            and op_state.total_enqueued_input_blocks() == 0
+            and (not uses_admission or op.internal_input_queue_num_blocks() == 0)
         ):
-            num_to_scale_down = self._compute_downscale_delta(actor_pool)
-            return ActorPoolScalingRequest.downscale(
-                delta=-num_to_scale_down, force=True, reason="consumed all inputs"
+            count = (
+                actor_pool.current_size()
+                if uses_admission
+                else self._compute_downscale_delta(actor_pool)
+            )
+            return self._force_downscale(count, reason="consumed all inputs")
+
+        if grant is not None and grant.max_units == 0:
+            return self._force_downscale(
+                actor_pool.current_size(), reason="resource admission grant is zero"
             )
 
-        if actor_pool.current_size() < actor_pool.min_size():
+        if actor_pool.current_size() < min_size:
             # Scale up, if the actor pool is below min size.
+            delta = min_size - actor_pool.current_size()
             return ActorPoolScalingRequest.upscale(
-                delta=actor_pool.min_size() - actor_pool.current_size(),
+                delta=delta,
                 reason="pool below min size",
             )
-        elif actor_pool.current_size() > actor_pool.max_size():
+        elif actor_pool.current_size() > max_size:
             return ActorPoolScalingRequest.downscale(
-                delta=-(actor_pool.current_size() - actor_pool.max_size()),
+                delta=-(actor_pool.current_size() - max_size),
+                force=uses_admission,
                 reason="pool exceeding max size",
             )
 
         allocation = self._resource_manager.get_allocation(op)
         op_usage = self._resource_manager.get_op_usage(op)
-        if allocation is not None and op_usage is not None:
+        if not uses_admission and allocation is not None and op_usage is not None:
             over_budget_scale_down = _get_required_scale_down(
                 actor_pool, allocation.subtract(op_usage)
             )
@@ -107,14 +132,17 @@ class DefaultActorAutoscaler(ActorAutoscaler):
             # Do not scale up if either
             #   - Actor Pool is at max size already
             #   - Op is throttled (ie exceeding allocated resource quota)
-            if actor_pool.current_size() >= actor_pool.max_size():
+            if actor_pool.current_size() >= max_size:
                 return ActorPoolScalingRequest.no_op(reason="reached max size")
-            if not op_state._scheduling_status.under_resource_limits:
+            if (
+                not uses_admission
+                and not op_state._scheduling_status.under_resource_limits
+            ):
                 return ActorPoolScalingRequest.no_op(
                     reason="operator exceeding resource quota"
                 )
 
-            budget = self._resource_manager.get_budget(op)
+            budget = None if uses_admission else self._resource_manager.get_budget(op)
             budget_max_scale_up = (
                 _get_max_scale_up(actor_pool, budget) if budget else sys.maxsize
             )
@@ -126,7 +154,7 @@ class DefaultActorAutoscaler(ActorAutoscaler):
             max_scale_up: int = min(
                 budget_max_scale_up,
                 self._get_actor_pool_max_upscaling_delta(),
-                actor_pool.max_size() - actor_pool.current_size(),
+                max_size - actor_pool.current_size(),
             )
 
             if max_scale_up == 0:
@@ -155,10 +183,10 @@ class DefaultActorAutoscaler(ActorAutoscaler):
                 return ActorPoolScalingRequest.no_op(
                     reason="no downscaling while actors are pending"
                 )
-            if actor_pool.current_size() <= actor_pool.min_size():
+            if actor_pool.current_size() <= min_size:
                 return ActorPoolScalingRequest.no_op(reason="reached min size")
 
-            max_can_release = actor_pool.current_size() - actor_pool.min_size()
+            max_can_release = actor_pool.current_size() - min_size
             num_to_scale_down = min(
                 self._compute_downscale_delta(actor_pool), max_can_release
             )
@@ -185,6 +213,14 @@ class DefaultActorAutoscaler(ActorAutoscaler):
             if self._actor_pool_max_upscaling_delta is not None
             else sys.maxsize
         )
+
+    @staticmethod
+    def _force_downscale(count: int, reason: str) -> ActorPoolScalingRequest:
+        if count > 0:
+            return ActorPoolScalingRequest.downscale(
+                delta=-count, force=True, reason=reason
+            )
+        return ActorPoolScalingRequest.no_op(reason=reason)
 
     def _validate_autoscaling_config(self):
         # Validate that max upscaling delta is positive to prevent override by safeguard
