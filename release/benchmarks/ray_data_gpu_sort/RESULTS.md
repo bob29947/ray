@@ -33,7 +33,7 @@ has one observation and each GPU trend point has two.
 - RMM starts at 50% and is capped at 85% of VRAM. cuDF/MPF host spill and CPU
   fallback are disabled; Ray Core independently manages Plasma-to-disk spill.
 
-The artifact-generation diff recorded 9 production files and +2,394/-2
+The final allowlisted diff records 9 production files and +2,397/-2
 production lines, plus one 332-line focused test file. All 20 source,
 test, and harness paths were within `python/ray/data/**` or
 `release/benchmarks/ray_data_gpu_sort/**`; Ray Core, dependencies, build, CI,
@@ -89,7 +89,7 @@ spill, or fallback.
 
 The corrected CPU observations above use default Ray startup. Ray reported a
 200,000,000,000-byte (186.3-GiB) default object store; every input and final
-output ref was resident at its boundary. Ray nevertheless spilled transient
+output ref was materialized and Ray-locatable at its boundary. Ray nevertheless spilled transient
 shuffle objects in four wide cells, and those normal RAID writes/restores are
 inside the CPU times. Rejected earlier artifacts with forced CPU or object
 store settings are not used. The speedups therefore compare the tuned GPU
@@ -167,6 +167,64 @@ is directionally slower. Across the external points, the dominant added costs
 are Plasma sealing, RAID spill/restore, and orchestration, not the sub-second
 run-sort or roughly 0.4-1.3-second GPU-merge phases.
 
+## Natural size and object-store spill trend
+
+This follow-up removes the artificial GPU residency budgets. CPU and GPU both
+use Ray's default 200,000,000,000-byte Plasma store, GPU uses its normal
+50%/85% RMM policy, and Ray spills to RAID. Each CPU point has one observation
+and each GPU point has two. The scaled inputs repeat the fixed cohort with
+unique `row_id` values; 2.45x is two full copies plus a chronological 45%
+prefix, so natural-key cardinality does not grow with rows.
+
+| Scale | Input | CPU s | GPU r1/r2 s | GPU median | Speedup | GPU externalization; geometry |
+|:--|--:|--:|:--|--:|--:|:--|
+| 1x | 63.881 GiB | 271.564 | 53.761/53.872 | 53.816s | 5.05x | none; 0/0/0 |
+| 2x | 127.761 GiB | 1,179.517 | 318.731/322.611 | 320.671s | 3.68x | none; 0/0/0 |
+| 2.45x | 156.505 GiB | 2,077.804 | 519.244/508.137 | 513.690s | 4.04x | 156.514 GiB; 32 initial/16 replacement/1 merge pass |
+
+Ray spill below is cumulative write/restore traffic for the whole fresh
+runtime (input preparation plus timed sort), not peak disk occupancy. GPU run
+externalization from VRAM to Plasma is a separate layer and must not be added
+to these bytes.
+
+| Scale | CPU Ray write/restore | GPU median Ray write/restore | GPU/CPU writes | CPU/GPU write amplification |
+|:--|--:|--:|--:|:--|
+| 1x | 81.484/0.419 GiB | 0/0 GiB | 0.000x | 1.276x/0.000x |
+| 2x | 275.700/23.032 GiB | 255.592/0 GiB | 0.927x | 2.158x/2.001x |
+| 2.45x | 442.132/51.669 GiB | 626.122/163.890 GiB | 1.416x | 2.825x/4.001x |
+
+The storage crossover is clear. At 1x the GPU creates no Ray spill traffic;
+at 2x it remains GPU-resident and writes 7.3% less than CPU. At 2.45x it
+naturally enters external mode, externalizes every row, and writes 41.6% more
+than CPU while restoring 3.17x as much. Sorted GPU runs and their replacement
+merge runs create the additional Plasma traffic. Even after that crossover,
+the GPU remains 4.04x faster than default Ray/PyArrow at the same size.
+“GPU-resident” at 2x describes the GPU algorithm only: it creates no external
+GPU runs, but Ray still writes 255.592 GiB from Plasma to RAID. The speedup
+rebound from 3.68x at 2x to 4.04x at 2.45x does not mean spilling helps; GPU
+time grows 1.60x while CPU time grows even more, 1.76x.
+
+The earlier light/medium inversion is not a monotonic spill result. Both had
+the same 32/16/1 run geometry and essentially identical logical movement;
+light simply incurred 210.178/25.090 GiB Ray write/restore and 82.304 seconds
+of max-rank sealing versus medium's 188.672/18.228 GiB and 70.761 seconds.
+Heavy is the next distinct regime: 48 initial runs and a 202.285-second
+median. Thus spill cost should be compared by run-geometry regimes, with two
+observations treated as directional rather than statistical.
+
+The initial natural 2.45x attempt OOMed within roughly 95 MiB of the allocator
+ceiling using the 2.7 final-sort admission factor. The default is now 3.0,
+which externalizes earlier and completed with bounded memory. This is an
+empirical portable safety watermark, not a schema-independent proof or a
+benchmark-specific memory cap.
+
+The completed natural observations began after all-ref local-fetch completion;
+that does not prove every ref remained simultaneously in Plasma. The harness
+now holds raw Plasma-buffer pins until timer start for future observations.
+The retained 2.45x artifacts also predate the single-node counter reader, so
+their whole-runtime write/restore totals are reconstructed exactly while an
+input-versus-timed-sort split is deliberately not claimed.
+
 ## 191.642-GiB large/skew proof
 
 This proof repeats the full cohort three times with uniquely offset `row_id`,
@@ -218,7 +276,7 @@ step.
 With an explicit residency budget `B`, a normal wave may contain `B/2` per
 source when that exceeds the 256-MiB floor, as it did here. Sixteen
 adversarially skewed sources could therefore direct roughly `8B` of raw
-payload to one receiver before its retained-payload limit of `B/2.7` is
+payload to one receiver before its retained-payload limit of `B/3.0` is
 applied. An oversized input block is not split and can exceed that estimate.
 With the default budget the resident fast path uses one whole-input wave.
 
@@ -238,7 +296,9 @@ live resident/external smoke is the integration check. No broad Ray suite,
 failure injection, cloud run, or repeated correctness matrix was performed.
 
 Machine-readable evidence is in `.venv/gpu-sort-external-artifacts/study.json`
-and the unchanged raw JSON files under
+and `.venv/gpu-sort-external-artifacts/natural-size-study.json`. The natural
+size narrative is in `.venv/gpu-sort-external-artifacts/NATURAL_SIZE_REPORT.md`,
+with unchanged raw JSON files under
 `.venv/gpu-sort-external-artifacts/trials/`. Historical provenance remains in
 each trial; current environment identity is recorded separately in the study
 artifact.

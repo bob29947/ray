@@ -59,7 +59,10 @@ class GPUSortConfig:
     pinned_output_max_bytes: int = 12 << 30
     # Payload-to-workspace admission factors.  They are intentionally
     # conservative: spilling early is recoverable, an allocator OOM is not.
-    final_sort_workspace_factor: float = 2.7
+    # Keep enough room for libcudf's final ordering permutation plus the
+    # resident input, keys, and output buffers. A 2.7 factor can leave less
+    # than one small allocation of headroom at the RMM pool ceiling.
+    final_sort_workspace_factor: float = 3.0
     merge_workspace_factor: float = 2.5
 
     def __post_init__(self) -> None:

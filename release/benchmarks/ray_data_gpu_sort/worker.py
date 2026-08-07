@@ -20,7 +20,13 @@ from .backend_stats import (
     required_fields_missing,
     value,
 )
-from .data import cohort_slices, plan_dict, read_projection, smoke_slices
+from .data import (
+    cohort_slices,
+    plan_dict,
+    read_projection,
+    scaled_cohort_slices,
+    smoke_slices,
+)
 from .spec import (
     DATASET_ROOT,
     EXPECTED_BLOCKS,
@@ -102,12 +108,23 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def _spill_snapshot(ray: Any) -> dict[str, int | float]:
-    """Read cumulative Ray object spill/restore counters cluster-wide."""
+    """Read cumulative spill/restore counters from the sole local raylet."""
 
-    from ray._private.internal_api import get_memory_info_reply, get_state_from_address
+    from ray._private.internal_api import get_state_from_address, node_stats
 
     state = get_state_from_address(ray.get_runtime_context().gcs_address)
-    stats = get_memory_info_reply(state).store_stats
+    alive = [node for node in state.node_table() if node["Alive"]]
+    if len(alive) != 1:
+        raise RuntimeError(
+            "The DGX benchmark requires exactly one live Ray node for local "
+            f"spill accounting, found {len(alive)}"
+        )
+    node = alive[0]
+    stats = node_stats(
+        node_manager_address=node["NodeManagerAddress"],
+        node_manager_port=node["NodeManagerPort"],
+        include_memory_info=False,
+    ).store_stats
     return {name: getattr(stats, name) for name in _SPILL_FIELDS}
 
 
@@ -151,21 +168,66 @@ def _refs(dataset: Any) -> list[Any]:
     ]
 
 
-def _residency(ray: Any, dataset: Any, *, timeout_s: float = 5.0) -> dict[str, Any]:
+def _locations(ray: Any, dataset: Any, *, timeout_s: float = 5.0) -> dict[str, Any]:
+    """Check that Ray can locate every ref, whether in Plasma or on disk."""
+
     refs = _refs(dataset)
     deadline = time.monotonic() + timeout_s
     while True:
-        locations = ray.experimental.get_object_locations(refs)
-        resident = sum(bool(locations.get(ref, {}).get("node_ids")) for ref in refs)
-        if resident == len(refs) or time.monotonic() >= deadline:
+        located = 0
+        # A single location request for ~1,500 wide BTS blocks can exceed the
+        # control-plane RPC deadline while Ray is settling natural spill. Keep
+        # the check read-only and exact, but issue bounded requests.
+        for start in range(0, len(refs), 128):
+            batch = refs[start : start + 128]
+            locations = ray.experimental.get_object_locations(batch)
+            located += sum(
+                bool(locations.get(ref, {}).get("node_ids")) for ref in batch
+            )
+        if located == len(refs) or time.monotonic() >= deadline:
             break
         # Object-location publication can lag a just-completed ray.put by a
         # few scheduler heartbeats. This wait is outside every sort timer.
         time.sleep(0.05)
     return {
         "objects": len(refs),
-        "resident_objects": resident,
-        "all_resident": resident == len(refs),
+        "located_objects": located,
+        "all_locatable": located == len(refs),
+        "verification": (
+            "Ray object-location metadata; a location may be Plasma or disk spill"
+        ),
+    }
+
+
+def _pin_plasma_buffers(
+    ray: Any, dataset: Any, *, timeout_s: float = 300.0
+) -> tuple[list[Any], dict[str, Any]]:
+    """Fetch and pin every input as an unserialized local Plasma buffer."""
+
+    from ray._private.worker import global_worker
+
+    refs = _refs(dataset)
+    started = time.perf_counter()
+    pins = global_worker.core_worker.get_objects(refs, int(timeout_s * 1000))
+    elapsed = time.perf_counter() - started
+    missing = [
+        index for index, serialized in enumerate(pins) if serialized.data is None
+    ]
+    if len(pins) != len(refs) or missing:
+        received = len(pins)
+        pins.clear()
+        raise RuntimeError(
+            "Could not pin every materialized input ObjectRef in local Plasma: "
+            f"received={received}/{len(refs)}, missing={missing[:8]}"
+        )
+    return pins, {
+        "objects": len(refs),
+        "pinned_objects": len(pins),
+        "all_pinned": True,
+        "pin_fetch_s": elapsed,
+        "verification": (
+            "core-worker raw SerializedRayObject buffers held until timer start"
+        ),
     }
 
 
@@ -202,7 +264,9 @@ class GpuMonitor:
                         for index, handle in enumerate(handles):
                             used = int(pynvml.nvmlDeviceGetMemoryInfo(handle).used)
                             self.peaks[index] = max(self.peaks[index], used)
-                except BaseException as error:  # telemetry must invalidate, not kill, a trial
+                except (
+                    BaseException
+                ) as error:  # telemetry must invalidate, not kill, a trial
                     self.error = repr(error)
 
             self._thread = threading.Thread(target=sample, daemon=True)
@@ -257,6 +321,10 @@ def _start_ray(runtime: Path, kind: str, backend: str) -> tuple[Any, Path]:
         raise RuntimeError(
             "Ray disk spill must use local disk/RAID, never the RAM-backed /dev/shm"
         )
+    if not spill.resolve().is_relative_to(Path("/raid").resolve()):
+        raise RuntimeError(
+            "The DGX benchmark requires Ray filesystem spill under /raid"
+        )
     options: dict[str, Any] = dict(
         address="local",
         object_spilling_directory=str(spill),
@@ -266,25 +334,30 @@ def _start_ray(runtime: Path, kind: str, backend: str) -> tuple[Any, Path]:
         _plasma_directory=str(plasma_root),
     )
     if backend == "gpu":
-        options.update(
-            num_gpus=16,
-            object_store_memory={
-                "spill": SPILL_OBJECT_STORE_BYTES,
-                "large": LARGE_OBJECT_STORE_BYTES,
-            }.get(kind, OBJECT_STORE_BYTES),
-            _system_config={
-                # The timed boundary is explicitly object-store to object-store,
-                # including the smallest narrow-projection blocks.
-                "max_direct_call_object_size": 0,
-            },
-        )
+        options["num_gpus"] = 16
+        if kind != "natural":
+            options.update(
+                object_store_memory={
+                    "spill": SPILL_OBJECT_STORE_BYTES,
+                    "large": LARGE_OBJECT_STORE_BYTES,
+                }.get(kind, OBJECT_STORE_BYTES),
+                _system_config={
+                    # The timed boundary is explicitly object-store to object-store,
+                    # including the smallest narrow-projection blocks.
+                    "max_direct_call_object_size": 0,
+                },
+            )
     ray.init(**options)
     return ray, owned
 
 
 def _materialize(
-    ray: Any, plan: dict[str, Any], columns: tuple[str, ...]
-) -> tuple[Any, dict[str, Any]]:
+    ray: Any,
+    plan: dict[str, Any],
+    columns: tuple[str, ...],
+    *,
+    pin_for_sort: bool = False,
+) -> tuple[Any, dict[str, Any], list[Any]]:
     def read_and_seal(item: dict[str, Any], selected: tuple[str, ...]) -> Any:
         # A task's direct return may stay in a worker heap under default Ray
         # settings. The benchmark boundary requires Plasma, so explicitly put
@@ -303,49 +376,43 @@ def _materialize(
     dataset = ray.data.from_arrow_refs(refs).materialize()
     elapsed = time.perf_counter() - started
     stats = _metadata(dataset)
+    if pin_for_sort:
+        pins, boundary = _pin_plasma_buffers(ray, dataset)
+    else:
+        pins = []
+        boundary = _locations(ray, dataset)
     stats.update(
         {
             "read_materialize_s": elapsed,
-            "residency": _residency(ray, dataset),
+            "input_boundary": boundary,
             "schema": str(_schema(dataset)),
         }
     )
     if stats["rows"] != plan["rows"] or stats["blocks"] != plan["blocks"]:
         raise RuntimeError(f"Materialized input changed from its plan: {stats}")
-    if not stats["residency"]["all_resident"]:
-        raise RuntimeError("Input is not resident in Plasma before the timed sort")
-    return dataset, stats
-
-
-def _seal_inline_output(ray: Any, dataset: Any) -> Any:
-    """Seal any default-Ray inline result blocks before ending the timer."""
-
-    refs = _refs(dataset)
-    locations = ray.experimental.get_object_locations(refs)
-    missing = [
-        index
-        for index, ref in enumerate(refs)
-        if not locations.get(ref, {}).get("node_ids")
-    ]
-    if not missing:
-        return dataset
-    replacements = dict(zip(missing, ray.get([refs[index] for index in missing])))
-    sealed = [
-        ray.put(replacements[index]) if index in replacements else ref
-        for index, ref in enumerate(refs)
-    ]
-    return ray.data.from_arrow_refs(sealed).materialize()
+    if pin_for_sort and not boundary["all_pinned"]:
+        raise RuntimeError("Input is not pinned in Plasma before the timed sort")
+    if not pin_for_sort and not boundary["all_locatable"]:
+        raise RuntimeError("Ray cannot locate every materialized input ObjectRef")
+    return dataset, stats, pins
 
 
 def _sort(
-    ray: Any, dataset: Any, keys: tuple[str, ...], backend: str
+    dataset: Any,
+    keys: tuple[str, ...],
+    backend: str,
+    *,
+    input_pins: list[Any] | None = None,
 ) -> tuple[Any, float]:
     kwargs: dict[str, Any] = {"key": list(keys), "descending": [False] * len(keys)}
     if backend == "gpu":
         kwargs["backend"] = "gpu"
     started = time.perf_counter_ns()
+    if input_pins is not None:
+        # The timer begins while every input is simultaneously pinned. Release
+        # immediately so Ray can evict consumed blocks naturally during sort.
+        input_pins.clear()
     output = dataset.sort(**kwargs).materialize()
-    output = _seal_inline_output(ray, output)
     elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
     return output, elapsed
 
@@ -355,9 +422,10 @@ def _exact_snapshot(ray: Any, output: Any, path: Path) -> dict[str, str]:
 
     table = pa.concat_tables(ray.get(_refs(output))).combine_chunks()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_file(
-        sink, table.schema
-    ) as writer:
+    with (
+        pa.OSFile(str(path), "wb") as sink,
+        pa.ipc.new_file(sink, table.schema) as writer,
+    ):
         writer.write_table(table)
     return {
         "snapshot_path": str(path.resolve()),
@@ -410,37 +478,60 @@ def _validate_origin(ray: Any, output: Any) -> dict[str, Any]:
 
 def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
     root = args.dataset_root.resolve()
+    dataset_manifest_sha256 = hashlib.sha256(
+        (root / "manifest.json").read_bytes()
+    ).hexdigest()
     manifest = load_manifest(root)
     cell = cell_by_name(manifest, args.cell)
     if args.kind == "smoke":
         slices = smoke_slices(manifest)
         columns = tuple(manifest["schema_names"]) + ("row_id",)
         keys = SMOKE_KEYS
+    elif args.kind == "natural":
+        slices = scaled_cohort_slices(
+            manifest, args.scale_numerator, args.scale_denominator
+        )
+        columns = cell.columns
+        keys = cell.keys
     else:
         copies = LARGE_COPIES if args.kind == "large" else 1
         slices = cohort_slices(manifest, copies=copies)
         columns = cell.columns
         keys = cell.keys
     plan = plan_dict(slices, kind=args.kind)
+    spill = args.runtime / "ray-spill"
     before_input_spill = _spill_snapshot(ray)
-    dataset, input_stats = _materialize(ray, plan, columns)
+    dataset, input_stats, input_pins = _materialize(
+        ray, plan, columns, pin_for_sort=args.kind == "natural"
+    )
     after_input_spill = _stable_spill_snapshot(ray)
+    input_spill_source = "single-node GetNodeStats cumulative counters"
     input_spill = _spill_delta(before_input_spill, after_input_spill)
     input_stats["ray_object_store_io"] = input_spill
-    if args.kind != "smoke" and args.kind != "large":
+    input_stats["ray_object_store_io_source"] = input_spill_source
+    if args.kind not in ("smoke", "large", "natural"):
         if (
             input_stats["rows"] != EXPECTED_ROWS
             or input_stats["blocks"] != EXPECTED_BLOCKS
         ):
             raise RuntimeError("Performance trial does not use the exact fixed cohort")
-    spill = args.runtime / "ray-spill"
-    before_spill = _spill_snapshot(ray)
+    before_spill = after_input_spill
     monitor = GpuMonitor()
     with monitor:
-        output, cold_s = _sort(ray, dataset, keys, args.backend)
+        output, cold_s = _sort(
+            dataset,
+            keys,
+            args.backend,
+            input_pins=input_pins,
+        )
     after_spill = _stable_spill_snapshot(ray)
+    sort_spill_source = "single-node GetNodeStats cumulative counters"
     output_stats = _metadata(output)
-    output_stats["residency"] = _residency(ray, output)
+    output_stats["locations"] = _locations(ray, output)
+    output_stats["seal_verification"] = (
+        "Dataset.materialize completed with output ObjectRefs; location metadata "
+        "is used only to verify locatability"
+    )
     output_stats["schema"] = str(_schema(output))
     backend_stats = get_last_run_stats(output) if args.backend == "gpu" else {}
     ray_object_store_io = _spill_delta(before_spill, after_spill)
@@ -450,8 +541,11 @@ def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
         reasons.append("output row count differs from input")
     if output_stats["schema"] != input_stats["schema"]:
         reasons.append("output schema differs from input")
-    if args.kind != "large" and not output_stats["residency"]["all_resident"]:
-        reasons.append("output is not resident in Plasma")
+    if (
+        args.kind not in ("large", "natural")
+        and not output_stats["locations"]["all_locatable"]
+    ):
+        reasons.append("Ray cannot locate every materialized output ObjectRef")
     # Default Ray/PyArrow may use Ray's normal disk-backed object spilling while
     # executing a wide sort.  That is part of the CPU baseline, so record it
     # instead of overriding or rejecting Ray's default behavior.  Resident GPU
@@ -460,7 +554,7 @@ def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
         reasons.append(
             f"64 GiB trial wrote {ray_disk_spill} bytes to Ray's disk spill directory"
         )
-    if int(input_spill["spilled_bytes_total"]) != 0:
+    if args.kind != "natural" and int(input_spill["spilled_bytes_total"]) != 0:
         reasons.append("input materialization spilled before the timed sort")
     if args.kind in ("trend", "spill") and cell.name == "full":
         if input_stats["decoded_bytes"] != EXPECTED_FULL_BYTES:
@@ -509,11 +603,21 @@ def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
         "status": "accepted" if not reasons else "rejected",
         "kind": args.kind,
         "backend": args.backend,
-        "cell": cell.to_dict(),
+        "cell": {
+            **cell.to_dict(),
+            "columns": list(columns),
+            "keys": list(keys),
+        },
         "repetition": args.repetition,
         "budget_bytes": args.budget_bytes,
+        "scale_numerator": args.scale_numerator,
+        "scale_denominator": args.scale_denominator,
         "plan": {key: value for key, value in plan.items() if key != "slices"},
-        "timing_boundary": "materialized Plasma input through output sealed in Plasma",
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "timing_boundary": (
+            "materialized input ObjectRefs through materialized sorted output "
+            "ObjectRefs; natural-study input buffers are pinned until timer start"
+        ),
         "cold_sort_s": cold_s,
         "input": input_stats,
         "output": output_stats,
@@ -524,10 +628,15 @@ def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
         "nvml": monitor.to_dict(),
         "ray_disk_spill_bytes": ray_disk_spill,
         "ray_object_store_io": ray_object_store_io,
+        "ray_object_store_io_source": sort_spill_source,
         "object_store_memory_bytes": int(
             ray.cluster_resources().get("object_store_memory", 0)
         ),
-        "ray_startup_mode": "default" if args.backend == "pyarrow" else "gpu_benchmark",
+        "ray_startup_mode": (
+            "default"
+            if args.backend == "pyarrow" or args.kind == "natural"
+            else "gpu_benchmark"
+        ),
         "ray_disk_spill_directory": str(spill.resolve()),
         "validation": validation,
         "rejection_reasons": reasons,
@@ -544,12 +653,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--runtime", type=Path, required=True)
     result.add_argument("--dataset-root", type=Path, default=DATASET_ROOT)
     result.add_argument(
-        "--kind", choices=("trend", "spill", "smoke", "large"), required=True
+        "--kind",
+        choices=("trend", "spill", "smoke", "large", "natural"),
+        required=True,
     )
     result.add_argument("--backend", choices=("pyarrow", "gpu"), required=True)
     result.add_argument("--cell", default="full")
     result.add_argument("--repetition", type=int, default=1)
     result.add_argument("--budget-bytes", type=int)
+    result.add_argument("--scale-numerator", type=int, default=1)
+    result.add_argument("--scale-denominator", type=int, default=1)
     return result
 
 
@@ -578,6 +691,8 @@ def main() -> int:
             "cell": args.cell,
             "repetition": args.repetition,
             "budget_bytes": args.budget_bytes,
+            "scale_numerator": args.scale_numerator,
+            "scale_denominator": args.scale_denominator,
             "rejection_reasons": [f"{type(error).__name__}: {error}"],
             "exception": traceback.format_exc(),
         }

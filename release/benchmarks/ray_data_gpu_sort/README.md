@@ -5,7 +5,7 @@ normalized BTS corpus at
 `/raid/spark-team/bobbwang/datasets/bts-airline-on-time`; it does not download
 data, create cloud resources, or include dataset preparation code.
 
-Run everything from the project virtual environment:
+Run the original acceptance matrix from the project virtual environment:
 
 ```bash
 cd /raid/spark-team/bobbwang/projects/ray-data-gpu-external-sort
@@ -20,6 +20,7 @@ The stages can also be run separately:
 .venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner gpu-trends
 .venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner spill
 .venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner large
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner natural
 .venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner report
 ```
 
@@ -32,19 +33,22 @@ and adds two observations at 0.75B, 0.50B, and max(4 GiB, 0.25B), where B is
 the measured maximum per-rank resident allocation. At most one uninformative
 spill point is replaced. `large` runs the 3x cohort sorted by `Origin`, checks
 global order and the exact `row_id` sum without a CPU sort, and allows Ray to
-spill Plasma objects to RAID.
+spill Plasma objects to RAID. `natural` compares CPU and GPU at 1x, 2x, and
+2.45x with the same default Plasma policy and no forced GPU budget, including
+whole-runtime Ray spill traffic.
 
 The PyArrow worker uses literal Ray defaults for sizing: it passes no
 `num_cpus`, `num_gpus`, `object_store_memory`, or `_system_config`. On this DGX,
 Ray selected 96 CPUs and a 200,000,000,000-byte (186.3-GiB) object store; each
 trial records the selected value. GPU trials explicitly request 16 GPUs and
-the study-specific Plasma size.
+the study-specific Plasma size, except `natural`, which deliberately uses the
+same default object-store sizing as CPU.
 
 Plasma is RAM-backed at `/dev/shm/rgs/<token>/plasma`. GPU-externalized runs
 are first sealed there as Ray ObjectRefs. Actual filesystem spill is written
 to `.venv/gpu-sort-external-runtime/<trial>/ray-spill` on `/raid`, matching a
 cluster's local-disk/NVMe spill tier; workers reject any filesystem-spill path
-under `/dev/shm`. Restricted 64-GiB trials use 132 GiB of Plasma and the
+outside `/raid`, including `/dev/shm`. Restricted 64-GiB trials use 132 GiB of Plasma and the
 192-GiB proof uses 256 GiB. Cumulative Ray Core spill/restore counters retain
 the disk-traffic total even after restored spill files are deleted.
 
@@ -70,7 +74,9 @@ Results are written to:
 ```text
 .venv/gpu-sort-external-artifacts/
   REPORT.md
+  NATURAL_SIZE_REPORT.md
   study.json
+  natural-size-study.json
   spill-study.json
   trials/
   logs/

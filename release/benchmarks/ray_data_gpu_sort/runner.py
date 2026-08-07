@@ -16,14 +16,17 @@ from statistics import median
 from typing import Any
 
 from .backend_stats import spill_geometry, value
+from .data import cohort_slices, plan_dict, scaled_cohort_slices, smoke_slices
 from .spec import (
     DATASET_ROOT,
     GIB,
+    LARGE_COPIES,
     OLD_DGX,
     RAY_COMMIT,
     RAY_VERSION,
     RAY_WHEEL,
     RAY_WHEEL_SHA256,
+    SMOKE_KEYS,
     cells,
     load_manifest,
 )
@@ -76,6 +79,20 @@ def _overlay_hashes(root: Path) -> dict[str, Any]:
         "file_count": count,
         "sha256": digest.hexdigest(),
     }
+
+
+def _canonical_trial_command(command: list[str]) -> list[str]:
+    """Remove only the fresh-runtime nonce from a worker command identity."""
+
+    result = list(command)
+    try:
+        runtime_index = result.index("--runtime") + 1
+    except ValueError as error:
+        raise RuntimeError("Worker command has no --runtime argument") from error
+    if runtime_index >= len(result):
+        raise RuntimeError("Worker command has no --runtime value")
+    result[runtime_index] = "<fresh-runtime>"
+    return result
 
 
 def _wheel_identity(root: Path) -> dict[str, Any]:
@@ -352,6 +369,29 @@ def _ray_io(trial: dict[str, Any]) -> tuple[int, int]:
     )
 
 
+def _fresh_runtime_ray_io(trial: dict[str, Any]) -> tuple[int, int]:
+    """Return cumulative Ray spill traffic across input prep and timed sort."""
+
+    input_counters = trial.get("input", {}).get("ray_object_store_io") or {}
+    sort_counters = trial.get("ray_object_store_io") or {}
+    return (
+        int(input_counters.get("spilled_bytes_total", 0))
+        + int(sort_counters.get("spilled_bytes_total", 0)),
+        int(input_counters.get("restored_bytes_total", 0))
+        + int(sort_counters.get("restored_bytes_total", 0)),
+    )
+
+
+def _clean_timed_ray_io(trial: dict[str, Any]) -> bool:
+    """Whether the timed delta used identical cumulative counter sources."""
+
+    source = "single-node GetNodeStats cumulative counters"
+    return (
+        trial.get("input", {}).get("ray_object_store_io_source") == source
+        and trial.get("ray_object_store_io_source") == source
+    )
+
+
 def _file_count(value: int) -> str:
     return f"{value} {'file' if value == 1 else 'files'}"
 
@@ -410,7 +450,12 @@ class Study:
         self.logs = self.artifacts / "logs"
         self.artifacts.mkdir(parents=True, exist_ok=True)
         self.runtime.mkdir(parents=True, exist_ok=True)
-        self.manifest = load_manifest(args.dataset_root.resolve())
+        self.dataset_root = args.dataset_root.resolve()
+        self.dataset_manifest_path = self.dataset_root / "manifest.json"
+        self.dataset_manifest_sha256 = hashlib.sha256(
+            self.dataset_manifest_path.read_bytes()
+        ).hexdigest()
+        self.manifest = load_manifest(self.dataset_root)
         self.cells = {cell.name: cell for cell in cells(self.manifest)}
 
     def path(self, kind: str, name: str) -> Path:
@@ -425,20 +470,13 @@ class Study:
         repetition: int,
         name: str,
         budget_bytes: int | None = None,
+        scale_numerator: int = 1,
+        scale_denominator: int = 1,
         reuse: bool = False,
     ) -> dict[str, Any]:
         output = self.path(kind, name)
-        if reuse and output.is_file():
-            existing = read_json(output)
-            if existing.get("valid") and existing.get("provenance", {}).get(
-                "ray_overlay_sha256"
-            ) == _overlay_hashes(self.root):
-                print(f"[{kind}] {name}: reusing accepted observation", flush=True)
-                return existing
         log = self.logs / kind / f"{name}.log"
         runtime = self.runtime / f"{kind}-{name}-{uuid.uuid4().hex[:8]}"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        log.parent.mkdir(parents=True, exist_ok=True)
         command = [
             str(self.python),
             "-m",
@@ -457,11 +495,62 @@ class Study:
             cell,
             "--repetition",
             str(repetition),
+            "--scale-numerator",
+            str(scale_numerator),
+            "--scale-denominator",
+            str(scale_denominator),
         ]
         if budget_bytes is not None:
             command.extend(("--budget-bytes", str(budget_bytes)))
+        if kind == "smoke":
+            slices = smoke_slices(self.manifest)
+        elif kind == "natural":
+            slices = scaled_cohort_slices(
+                self.manifest, scale_numerator, scale_denominator
+            )
+        else:
+            slices = cohort_slices(
+                self.manifest, copies=LARGE_COPIES if kind == "large" else 1
+            )
+        input_plan = plan_dict(slices, kind=kind)
+        cell_spec = self.cells[cell].to_dict()
+        if kind == "smoke":
+            cell_spec["keys"] = list(SMOKE_KEYS)
+        overlay_manifest_sha256 = hashlib.sha256(
+            (self.root / ".venv/gpu-sort-ray-data-overlay.json").read_bytes()
+        ).hexdigest()
+        trial_identity = {
+            "canonical_command": _canonical_trial_command(command),
+            "kind": kind,
+            "backend": backend,
+            "cell": cell,
+            "repetition": repetition,
+            "budget_bytes": budget_bytes,
+            "scale_numerator": scale_numerator,
+            "scale_denominator": scale_denominator,
+            "cell_spec": cell_spec,
+            "input_plan_digest": input_plan["digest"],
+            "dataset_manifest_sha256": self.dataset_manifest_sha256,
+            "harness_sha256": _sha256_files(self.root),
+            "ray_overlay_sha256": _overlay_hashes(self.root),
+            "overlay_manifest_sha256": overlay_manifest_sha256,
+            "wheel_sha256": self.wheel["sha256"],
+        }
+        if reuse and output.is_file():
+            existing = read_json(output)
+            provenance = existing.get("provenance", {})
+            identity_matches = provenance.get("trial_identity") == trial_identity
+            if existing.get("valid") and identity_matches:
+                print(f"[{kind}] {name}: reusing accepted observation", flush=True)
+                return existing
+        output.parent.mkdir(parents=True, exist_ok=True)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # A failed worker must never leave a stale observation available to be
+        # stamped with the identity of this attempt.
+        output.unlink(missing_ok=True)
         print(
-            f"[{kind}] {name}: {backend}, budget={budget_bytes or 'default'}",
+            f"[{kind}] {name}: {backend}, budget={budget_bytes or 'default'}, "
+            f"scale={scale_numerator}/{scale_denominator}",
             flush=True,
         )
         if backend == "gpu":
@@ -486,17 +575,42 @@ class Study:
             if not output.is_file():
                 raise RuntimeError(f"Worker produced no artifact; see {log}")
             artifact = read_json(output)
+            identity_mismatches = []
+            expected_worker_fields = {
+                "kind": kind,
+                "backend": backend,
+                "repetition": repetition,
+                "budget_bytes": budget_bytes,
+                "scale_numerator": scale_numerator,
+                "scale_denominator": scale_denominator,
+                "wheel_sha256": self.wheel["sha256"],
+            }
+            for field, expected in expected_worker_fields.items():
+                if artifact.get(field) != expected:
+                    identity_mismatches.append(field)
+            if artifact.get("plan", {}).get("digest") != input_plan["digest"]:
+                identity_mismatches.append("input plan digest")
+            if artifact.get("cell") != cell_spec:
+                identity_mismatches.append("cell specification")
+            if artifact.get("dataset_manifest_sha256") != self.dataset_manifest_sha256:
+                identity_mismatches.append("dataset manifest digest")
+            if identity_mismatches:
+                artifact.setdefault("rejection_reasons", []).append(
+                    "Worker identity differs from controller: "
+                    + ", ".join(identity_mismatches)
+                )
+                artifact["valid"] = False
+                artifact["status"] = "rejected"
             artifact["provenance"] = {
                 "command": command,
+                "trial_identity": trial_identity,
                 "worker_returncode": result.returncode,
                 "wheel": self.wheel,
                 "wall_started_unix_s": started,
                 "git": _git_identity(self.root),
                 "harness_sha256": _sha256_files(self.root),
                 "ray_overlay_sha256": _overlay_hashes(self.root),
-                "overlay_manifest_sha256": hashlib.sha256(
-                    (self.root / ".venv/gpu-sort-ray-data-overlay.json").read_bytes()
-                ).hexdigest(),
+                "overlay_manifest_sha256": overlay_manifest_sha256,
             }
             write_json(output, artifact)
             if result.returncode or not artifact.get("valid"):
@@ -631,22 +745,17 @@ class Study:
         )
 
     def _full_gpu(self) -> list[dict[str, Any]]:
-        results = []
-        for repetition in (1, 2):
-            path = self.path("trend", f"full-gpu-r{repetition}")
-            if path.is_file() and read_json(path).get("valid"):
-                results.append(read_json(path))
-            else:
-                results.append(
-                    self.trial(
-                        kind="trend",
-                        backend="gpu",
-                        cell="full",
-                        repetition=repetition,
-                        name=f"full-gpu-r{repetition}",
-                    )
-                )
-        return results
+        return [
+            self.trial(
+                kind="trend",
+                backend="gpu",
+                cell="full",
+                repetition=repetition,
+                name=f"full-gpu-r{repetition}",
+                reuse=True,
+            )
+            for repetition in (1, 2)
+        ]
 
     def spill(self) -> None:
         resident = self._full_gpu()
@@ -729,6 +838,352 @@ class Study:
             raise RuntimeError("Large proof did not externalize GPU runs")
         if int(value(stats, "merge_pass_count", default=0)) <= 0:
             raise RuntimeError("Large proof did not execute a GPU merge pass")
+
+    def natural(self) -> None:
+        """Measure the unforced transition from resident to external GPU sort."""
+
+        def run_point(label: str, numerator: int, denominator: int) -> dict[str, Any]:
+            return {
+                "label": label,
+                "scale_numerator": numerator,
+                "scale_denominator": denominator,
+                "source": "current natural-spill harness",
+                "pyarrow": self.trial(
+                    kind="natural",
+                    backend="pyarrow",
+                    cell="full",
+                    repetition=1,
+                    name=f"full-{label}-pyarrow-r1",
+                    scale_numerator=numerator,
+                    scale_denominator=denominator,
+                    reuse=True,
+                ),
+                "gpu": [
+                    self.trial(
+                        kind="natural",
+                        backend="gpu",
+                        cell="full",
+                        repetition=repetition,
+                        name=f"full-{label}-gpu-r{repetition}",
+                        scale_numerator=numerator,
+                        scale_denominator=denominator,
+                        reuse=True,
+                    )
+                    for repetition in (1, 2)
+                ],
+            }
+
+        # Rerun 1x under the same 200-GB default Plasma policy as CPU. The
+        # historical GPU trend anchor used 512 GiB and is not a controlled
+        # object-store spill comparison.
+        points: list[dict[str, Any]] = [
+            run_point("1x", 1, 1),
+            run_point("2x", 2, 1),
+            run_point("2.45x", 49, 20),
+        ]
+
+        for point in points:
+            for trial in [point["pyarrow"], *point["gpu"]]:
+                if int(trial.get("object_store_memory_bytes", 0)) != 200_000_000_000:
+                    raise RuntimeError(
+                        f"{point['label']} does not use default 200-GB Plasma"
+                    )
+            shapes = {
+                (
+                    int(trial["input"]["rows"]),
+                    int(trial["input"]["blocks"]),
+                    int(trial["input"]["decoded_bytes"]),
+                )
+                for trial in [point["pyarrow"], *point["gpu"]]
+            }
+            if len(shapes) != 1:
+                raise RuntimeError(
+                    f"{point['label']} CPU/GPU inputs differ: {sorted(shapes)}"
+                )
+            geometries = {
+                (
+                    int(value(trial["gpu_stats"], "initial_run_count", default=0)),
+                    int(value(trial["gpu_stats"], "replacement_run_count", default=0)),
+                    int(value(trial["gpu_stats"], "merge_pass_count", default=0)),
+                )
+                for trial in point["gpu"]
+            }
+            modes = {
+                str(value(trial["gpu_stats"], "mode", default="missing"))
+                for trial in point["gpu"]
+            }
+            if len(geometries) != 1 or len(modes) != 1:
+                raise RuntimeError(
+                    f"{point['label']} GPU repetitions disagree on spill geometry: "
+                    f"modes={modes}, geometry={geometries}"
+                )
+            externalized = [
+                int(value(trial["gpu_stats"], "externalized_bytes", default=0))
+                for trial in point["gpu"]
+            ]
+            if (
+                max(externalized, default=0)
+                and (max(externalized) - min(externalized)) / max(externalized) > 0.001
+            ):
+                raise RuntimeError(
+                    f"{point['label']} GPU repetitions differ by more than 0.1% "
+                    f"externalized bytes: {externalized}"
+                )
+
+        external = [
+            point
+            for point in points[1:]
+            if max(
+                int(value(trial["gpu_stats"], "externalized_bytes", default=0))
+                for trial in point["gpu"]
+            )
+            > 0
+        ]
+        if not external:
+            raise RuntimeError(
+                "The 2.45x default-policy point did not naturally externalize; "
+                "add one larger input point instead of imposing a memory cap"
+            )
+        external_by_label = {
+            point["label"]: [
+                int(value(trial["gpu_stats"], "externalized_bytes", default=0))
+                for trial in point["gpu"]
+            ]
+            for point in points
+        }
+        if (
+            max(external_by_label["1x"]) > 0
+            or max(external_by_label["2x"]) > 0
+            or min(external_by_label["2.45x"]) <= 0
+        ):
+            raise RuntimeError(
+                "The fixed DGX bracket changed; expected resident 1x/2x and "
+                f"external 2.45x, got {external_by_label}"
+            )
+
+        rows: list[dict[str, Any]] = []
+        phase_names = (
+            "sampling",
+            "partition",
+            "mpf_shuffle",
+            "run_sort",
+            "gpu_merge",
+            "arrow_conversion",
+            "plasma_seal",
+            "orchestration",
+        )
+        lines = [
+            "# BTS Natural GPU Externalization and Ray Spill Trend",
+            "",
+            "No test memory cap was used. CPU and GPU both use Ray's default "
+            "200,000,000,000-byte (186.3-GiB) Plasma store, the GPU sort uses its "
+            "normal 50%/85% RMM policy, and Ray filesystem spill goes to RAID.",
+            "",
+            "The timer starts with raw local Plasma buffers simultaneously pinned for "
+            "every materialized input ObjectRef; those pins are released immediately "
+            "after timer start so Ray can evict consumed blocks. It ends after sorted "
+            "output ObjectRefs are materialized and sealed by Ray. Fresh-runtime Ray "
+            "spill traffic includes input preparation plus the timed sort; it is "
+            "cumulative RAID traffic, not peak disk occupancy.",
+            "",
+            "Scaled inputs repeat the fixed BTS cohort with unique row_id values; the "
+            "2.45x point is two full copies plus a chronological 45% prefix. It grows "
+            "payload and rows without growing natural-key cardinality.",
+            "",
+            "| Scale | Input | CPU | GPU r1/r2 | GPU median | Speedup | GPU mode | Externalized | Initial/replacement/passes |",
+            "|:--|--:|--:|:--|--:|--:|:--|--:|:--|",
+        ]
+        for point in points:
+            cpu = point["pyarrow"]
+            gpu = point["gpu"]
+            gpu_times = [float(trial["cold_sort_s"]) for trial in gpu]
+            gpu_median = median(gpu_times)
+            external_values = [
+                int(value(trial["gpu_stats"], "externalized_bytes", default=0))
+                for trial in gpu
+            ]
+            external_bytes = median(external_values)
+            geometry = {
+                (
+                    int(value(trial["gpu_stats"], "initial_run_count", default=0)),
+                    int(value(trial["gpu_stats"], "replacement_run_count", default=0)),
+                    int(value(trial["gpu_stats"], "merge_pass_count", default=0)),
+                )
+                for trial in gpu
+            }
+            if len(geometry) != 1:
+                raise RuntimeError(
+                    f"{point['label']} GPU repetitions changed run geometry: {geometry}"
+                )
+            runs, replacements, passes = next(iter(geometry))
+            cpu_write, cpu_restore = _fresh_runtime_ray_io(cpu)
+            gpu_writes, gpu_restores = zip(
+                *(_fresh_runtime_ray_io(trial) for trial in gpu)
+            )
+            phases = {
+                name: median(
+                    float(
+                        value(trial["gpu_stats"], "phases_s", default={}).get(name, 0)
+                    )
+                    for trial in gpu
+                )
+                for name in phase_names
+            }
+            phase_remainders = [
+                float(trial["cold_sort_s"])
+                - sum(
+                    float(
+                        value(trial["gpu_stats"], "phases_s", default={}).get(name, 0)
+                    )
+                    for name in phase_names
+                )
+                for trial in gpu
+            ]
+            decoded_bytes = int(gpu[0]["input"]["decoded_bytes"])
+            row = {
+                **point,
+                "gpu_median_s": gpu_median,
+                "speedup": float(cpu["cold_sort_s"]) / gpu_median,
+                "externalized_bytes": external_bytes,
+                "externalized_fraction": external_bytes / max(1, decoded_bytes),
+                "initial_runs": runs,
+                "replacement_runs": replacements,
+                "merge_passes": passes,
+                "cpu_fresh_runtime_ray_write_bytes": cpu_write,
+                "cpu_fresh_runtime_ray_restore_bytes": cpu_restore,
+                "gpu_median_fresh_runtime_ray_write_bytes": median(gpu_writes),
+                "gpu_median_fresh_runtime_ray_restore_bytes": median(gpu_restores),
+                "gpu_cpu_fresh_runtime_ray_write_ratio": median(gpu_writes)
+                / max(1, cpu_write),
+                "cpu_ray_write_amplification": cpu_write / max(1, decoded_bytes),
+                "gpu_ray_write_amplification": median(gpu_writes)
+                / max(1, decoded_bytes),
+                "clean_timed_ray_io": _clean_timed_ray_io(cpu)
+                and all(_clean_timed_ray_io(trial) for trial in gpu),
+                "gpu_median_phases_s": phases,
+                "gpu_median_unattributed_remainder_s": median(phase_remainders),
+            }
+            rows.append(row)
+            lines.append(
+                f"| {point['label']} | {decoded_bytes / GIB:.3f} GiB | "
+                f"{cpu['cold_sort_s']:.3f}s | {gpu_times[0]:.3f}/{gpu_times[1]:.3f}s | "
+                f"{gpu_median:.3f}s | {row['speedup']:.2f}x | "
+                f"{'external' if external_bytes else 'resident'} | "
+                f"{external_bytes / GIB:.3f} GiB "
+                f"({row['externalized_fraction']:.1%}) | "
+                f"{runs}/{replacements}/{passes} |"
+            )
+        first_external = external[0]["label"]
+        lines.extend(
+            [
+                "",
+                "## Ray object-store spill to RAID",
+                "",
+                "GPU run externalization (VRAM to Plasma) and Ray spill (Plasma to RAID) "
+                "are separate layers; their byte counts must not be added.",
+                "",
+                "| Scale | CPU whole-runtime W/R | GPU whole-runtime W/R | GPU/CPU writes | CPU/GPU write amplification | Timed-sort split |",
+                "|:--|--:|--:|--:|:--|:--|",
+            ]
+        )
+        for row in rows:
+            lines.append(
+                f"| {row['label']} | "
+                f"{row['cpu_fresh_runtime_ray_write_bytes'] / GIB:.3f}/"
+                f"{row['cpu_fresh_runtime_ray_restore_bytes'] / GIB:.3f} GiB | "
+                f"{row['gpu_median_fresh_runtime_ray_write_bytes'] / GIB:.3f}/"
+                f"{row['gpu_median_fresh_runtime_ray_restore_bytes'] / GIB:.3f} GiB | "
+                f"{row['gpu_cpu_fresh_runtime_ray_write_ratio']:.3f}x | "
+                f"{row['cpu_ray_write_amplification']:.3f}x/"
+                f"{row['gpu_ray_write_amplification']:.3f}x | "
+                f"{'exact' if row['clean_timed_ray_io'] else 'whole-runtime only'} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "## GPU cold-path attribution",
+                "",
+                "| Scale | Sampling | Partition | MPF | Run sort | GPU merge | Arrow | Plasma seal | Orchestration | Remainder |",
+                "|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+            ]
+        )
+        for row in rows:
+            phases = row["gpu_median_phases_s"]
+            lines.append(
+                f"| {row['label']} | {phases['sampling']:.2f}s | "
+                f"{phases['partition']:.2f}s | {phases['mpf_shuffle']:.2f}s | "
+                f"{phases['run_sort']:.2f}s | {phases['gpu_merge']:.2f}s | "
+                f"{phases['arrow_conversion']:.2f}s | {phases['plasma_seal']:.2f}s | "
+                f"{phases['orchestration']:.2f}s | "
+                f"{row['gpu_median_unattributed_remainder_s']:.2f}s |"
+            )
+
+        two = next(row for row in rows if row["label"] == "2x")
+        external_row = next(row for row in rows if row["label"] == first_external)
+        two_to_external_data = int(
+            external_row["gpu"][0]["input"]["decoded_bytes"]
+        ) / int(two["gpu"][0]["input"]["decoded_bytes"])
+        two_to_external_time = external_row["gpu_median_s"] / two["gpu_median_s"]
+        lines.extend(
+            [
+                "",
+                "## Findings",
+                "",
+                f"The first tested default-policy GPU externalization point is "
+                f"**{first_external}**. The 2x point remains GPU-resident. From 2x to "
+                f"{first_external}, input grows {two_to_external_data:.3f}x while GPU "
+                f"time grows {two_to_external_time:.3f}x; the difference is the natural "
+                "externalization/Plasma-pressure cliff, not extra GPU sorting work alone.",
+                "",
+                f"At 2x, the resident GPU writes "
+                f"{(1 - two['gpu_cpu_fresh_runtime_ray_write_ratio']):.1%} less Ray "
+                "spill traffic than CPU. At the first external point, GPU writes "
+                f"{(external_row['gpu_cpu_fresh_runtime_ray_write_ratio'] - 1):.1%} "
+                "more because sorted GPU runs and their replacements add Plasma "
+                "write/read amplification.",
+                "",
+                "GPU-resident at 2x describes the GPU algorithm only: it creates no "
+                "external GPU runs, but Ray can still spill Plasma objects to RAID. "
+                "The speedup rebound at the external point does not mean spilling "
+                "helps; GPU time grows sharply, while CPU time grows even more.",
+                "",
+                "The initial 2.45x attempt left less than one small allocation at the "
+                "RMM ceiling with a 2.7 final-sort workspace factor. The production "
+                "admission factor is now 3.0, which externalizes earlier and completed "
+                "with bounded memory. This is an empirical portable safety watermark, "
+                "not a schema-independent memory proof or per-benchmark cap; all size "
+                "points use the normal GPU policy.",
+                "",
+                "The artificial light and medium 1x points are not evidence that more "
+                "spilling is faster. Both used 32 initial runs, 16 replacements, one "
+                "merge pass, and effectively identical logical movement. Light happened "
+                "to incur 210.178/25.090 GiB Ray W/R and 82.304s max-rank sealing; medium "
+                "incurred 188.672/18.228 GiB and 70.761s. Light also varied by 18.947s "
+                "between its two observations. That inversion is storage scheduling and "
+                "object-lifetime variation within the same discrete run geometry. Heavy "
+                "is the meaningful next regime: 48 initial runs and a 202.285s median.",
+            ]
+        )
+        summary = {
+            "policy": {
+                "gpu_budget_override": None,
+                "gpu_rmm_initial_fraction": 0.50,
+                "gpu_rmm_max_fraction": 0.85,
+                "object_store_bytes": 200_000_000_000,
+                "object_store_sizing": "Ray default for CPU and GPU",
+                "ray_spill_filesystem": "RAID",
+            },
+            "first_tested_external_scale": first_external,
+            "fresh_runtime_io_definition": (
+                "input preparation counters plus timed sort counters"
+            ),
+            "points": rows,
+        }
+        write_json(self.artifacts / "natural-size-study.json", summary)
+        path = self.artifacts / "NATURAL_SIZE_REPORT.md"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(path)
 
     def report(self) -> None:
         implementation = _implementation_identity(self.root)
@@ -1198,6 +1653,7 @@ def parser() -> argparse.ArgumentParser:
             "gpu-trends",
             "spill",
             "large",
+            "natural",
             "report",
             "all",
         ),

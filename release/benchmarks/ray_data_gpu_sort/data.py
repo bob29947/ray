@@ -69,6 +69,39 @@ def cohort_slices(manifest: dict[str, Any], copies: int = 1) -> tuple[Slice, ...
     )
 
 
+def scaled_cohort_slices(
+    manifest: dict[str, Any], numerator: int, denominator: int = 1
+) -> tuple[Slice, ...]:
+    """Repeat a deterministic cohort prefix with contiguous unique row IDs."""
+
+    if numerator < 1 or denominator < 1:
+        raise ValueError("Cohort scale numerator and denominator must be positive")
+    target_rows = EXPECTED_ROWS * numerator // denominator
+    base = cohort_slices(manifest)
+    result: list[Slice] = []
+    next_row = 0
+    copy = 0
+    while next_row < target_rows:
+        for item in base:
+            if next_row >= target_rows:
+                break
+            rows = min(item.rows, target_rows - next_row)
+            result.append(
+                Slice(
+                    path=item.path,
+                    row_group=item.row_group,
+                    rows=rows,
+                    row_id_start=next_row,
+                    year=item.year,
+                    month=item.month,
+                    copy=copy,
+                )
+            )
+            next_row += rows
+        copy += 1
+    return tuple(result)
+
+
 def smoke_slices(
     manifest: dict[str, Any], rows_per_block: int = 10_000
 ) -> tuple[Slice, ...]:
