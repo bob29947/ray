@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 from ray.data._internal.logical.interfaces import (
     LogicalOperator,
@@ -189,7 +189,14 @@ class Sort(AbstractAllToAll, LogicalOperatorSupportsPredicatePassThrough):
         input_op: LogicalOperator,
         sort_key: SortKey,
         batch_format: Optional[str] = "default",
+        backend: Literal["cpu", "gpu"] = "cpu",
     ):
+        if backend not in ("cpu", "gpu"):
+            raise ValueError(
+                f"`backend` must be either 'cpu' or 'gpu', but got {backend!r}."
+            )
+        if backend == "gpu" and sort_key.boundaries is not None:
+            raise ValueError("GPU sort does not support explicit `boundaries`.")
         super().__init__(
             input_op,
             sub_progress_bar_names=[
@@ -200,6 +207,7 @@ class Sort(AbstractAllToAll, LogicalOperatorSupportsPredicatePassThrough):
         )
         self.sort_key = sort_key
         self.batch_format = batch_format
+        self.backend = backend
 
     def infer_metadata(self) -> "BlockMetadata":
         assert len(self.input_dependencies) == 1, len(self.input_dependencies)

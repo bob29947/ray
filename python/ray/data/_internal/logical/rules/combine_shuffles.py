@@ -83,6 +83,7 @@ class CombineShuffles(Rule):
                 input_op.input_dependencies[0],
                 sort_key=op.sort_key,
                 batch_format=op.batch_format,
+                backend=op.backend,
             )
 
         return op
