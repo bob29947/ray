@@ -667,6 +667,10 @@ def _run_performance(ray: Any, args: argparse.Namespace, manifest: dict[str, Any
                 reasons.append("GPU backend performed CPU sorting")
             if int(value(gpu_stats, "cpu_merge_rows", default=-1)) != 0:
                 reasons.append("GPU backend performed CPU merging")
+            if int(value(gpu_stats, "fallback_count", default=-1)) != 0:
+                reasons.append("GPU backend used an output-conversion fallback")
+            if int(value(gpu_stats, "mpf_host_spill_bytes", default=-1)) != 0:
+                reasons.append("GPU backend used MPF host spill")
     if args.kind == "trend" and (
         input_stats["rows"] != EXPECTED_ROWS or input_stats["blocks"] != EXPECTED_BLOCKS
     ):

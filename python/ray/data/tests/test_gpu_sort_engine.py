@@ -218,8 +218,20 @@ def test_gpu_sort_comparator_matches_arrow_null_nan_order(
         assert nulls == [
             null_order.AFTER,
             null_order.AFTER,
-            null_order.AFTER if ascending else null_order.BEFORE,
+            null_order.AFTER,
         ]
+
+        backend._float_hidden = {}
+        for null_position, expected_null_order in (
+            ("first", null_order.BEFORE),
+            ("last", null_order.AFTER),
+        ):
+            backend._config = GPUSortConfig(null_position=null_position)
+            direct_orders, direct_nulls = backend._order_and_nulls()
+            assert direct_orders == [
+                order.ASCENDING if ascending else order.DESCENDING
+            ]
+            assert direct_nulls == [expected_null_order]
 
 
 def test_gpu_sort_typed_all_null_arrow_output(gpu_backend_class):

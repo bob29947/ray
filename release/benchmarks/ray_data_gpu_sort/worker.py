@@ -581,6 +581,10 @@ def run(args: argparse.Namespace, ray: Any) -> dict[str, Any]:
             reasons.append("GPU backend performed CPU sorting")
         if int(value(backend_stats, "cpu_merge_rows", default=-1)) != 0:
             reasons.append("GPU backend performed CPU merging")
+        if int(value(backend_stats, "fallback_count", default=-1)) != 0:
+            reasons.append("GPU backend used an output-conversion fallback")
+        if int(value(backend_stats, "mpf_host_spill_bytes", default=-1)) != 0:
+            reasons.append("GPU backend used MPF host spill")
         if (
             args.budget_bytes is not None
             and int(value(backend_stats, "memory_budget_bytes", default=0))

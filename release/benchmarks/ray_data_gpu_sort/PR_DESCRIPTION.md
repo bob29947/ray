@@ -111,6 +111,15 @@ filesystem spill went to `/mnt/nvme`.
   pass, and zero CPU fallback. Default PyArrow reproducibly lost the head at
   the map-to-reduce boundary, so no 2.45x speedup is claimed.
 
+The numerical cloud comparisons are directional. Only the core cell is strict
+accepted end to end; the other displayed speedups completed exact row/schema/
+checksum/order validation but had incomplete Ray ObjectRef location metadata
+in at least one observation and are labeled `telemetry-warning` in the report.
+The PR-ready source also includes two post-run fixes that do not touch the
+measured ascending BTS paths: correct direction-independent libcudf null
+placement for descending keys, and aggregation/enforcement of the existing
+per-rank pinned-output fallback counter (zero in every archived rank).
+
 All campaign fleets were terminated and exact-tag scopes verified empty. The
 full directional results, spill amplification, phase telemetry, warnings, and
 repair provenance are in `RESULTS.md` and the generated cloud report.

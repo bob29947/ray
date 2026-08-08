@@ -347,7 +347,8 @@ The exact 160,000-row transport gate passed schema and every row/value with all
 16 ranks: default PyArrow took 1.011 seconds and GPU took 4.807 seconds. The
 post-fix 2.45x repair gate independently passed at 1.038/4.918 seconds.
 Across all 16 unique active GPU performance artifacts, the backend reported
-zero CPU-sort rows, zero CPU-merge rows, and zero MPF host-spill bytes.
+zero CPU-sort rows, zero CPU-merge rows, zero output-conversion fallbacks, and
+zero MPF host-spill bytes.
 
 ### Cloud payload and key trends
 
@@ -363,11 +364,16 @@ rather than strict statistical comparisons.
 
 The six resident GPU trend cells came from overlay
 `273c73b5b434f499f1773922e0b131488c64e809e352451454e39016a0475dec`; repaired
-GPU 2x/2.45x and CPU observations use final overlay
+GPU 2x/2.45x and CPU observations use benchmark overlay
 `e0105442cc991f372614e21671aee0a68e60e06fa189503b2f7e84f5e12632aa`. The only
 production difference is external-run workspace/headroom handling in
 `backend.py`. Every reused trend run remained resident and externalized zero
 bytes, so that code path could not execute in those cells.
+
+The PR-ready source subsequently fixed descending-key null placement and
+aggregated/enforced the existing per-rank pinned-output fallback counter. BTS
+benchmark keys are ascending and every archived rank fallback count is zero,
+so these correctness/telemetry-only changes do not alter a measured path.
 
 | Cell | Columns / GiB | Keys | CPU s | GPU r1/r2 s | GPU median | Speedup |
 |:--|--:|:--|--:|:--|--:|--:|

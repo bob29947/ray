@@ -709,6 +709,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "ray_disk_spill_bytes",
                 "cpu_sort_rows",
                 "cpu_merge_rows",
+                "fallback_count",
             ):
                 item.setdefault(name, 0)
             item.setdefault("phases_s", {})
@@ -781,6 +782,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "ray_disk_spill_bytes": total("ray_disk_spill_bytes"),
             "cpu_sort_rows": total("cpu_sort_rows"),
             "cpu_merge_rows": total("cpu_merge_rows"),
+            "fallback_count": total("fallback_count"),
             "phases_s": phases,
             "controller_phases_s": dict(self._controller_phases),
             "total_s": elapsed,

@@ -102,6 +102,8 @@ def required_fields_missing(stats: dict[str, Any]) -> list[str]:
         "merge_pass_count",
         "cpu_sort_rows",
         "cpu_merge_rows",
+        "fallback_count",
+        "mpf_host_spill_bytes",
         "phases_s",
     )
     return [name for name in required if name not in stats]

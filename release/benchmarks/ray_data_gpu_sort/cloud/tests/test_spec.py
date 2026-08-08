@@ -3,6 +3,7 @@ import types
 
 import pytest
 
+from release.benchmarks.ray_data_gpu_sort.backend_stats import required_fields_missing
 from release.benchmarks.ray_data_gpu_sort.cloud import worker as cloud_worker
 from release.benchmarks.ray_data_gpu_sort.cloud.spec import cpu_trials, gpu_trials
 from release.benchmarks.ray_data_gpu_sort.cloud.worker import _configure_gpu_sort
@@ -17,6 +18,24 @@ def test_exact_matrix() -> None:
     assert sum(item.kind == "trend" for item in cpu) == 6
     assert sum(item.kind == "natural" for item in cpu) == 2
     assert sum(item.kind == "natural" for item in gpu) == 5
+
+
+def test_gpu_acceptance_requires_fallback_and_mpf_spill_telemetry() -> None:
+    stats = {
+        "peak_device_bytes": 1,
+        "externalized_bytes": 0,
+        "initial_run_count": 0,
+        "merge_pass_count": 0,
+        "cpu_sort_rows": 0,
+        "cpu_merge_rows": 0,
+        "phases_s": {},
+    }
+    assert required_fields_missing(stats) == [
+        "fallback_count",
+        "mpf_host_spill_bytes",
+    ]
+    stats.update(fallback_count=0, mpf_host_spill_bytes=0)
+    assert required_fields_missing(stats) == []
 
 
 def test_wave_gate(tmp_path) -> None:

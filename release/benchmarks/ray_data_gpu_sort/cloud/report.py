@@ -1949,7 +1949,19 @@ def _ray_io(value: Mapping[str, Any], name: str) -> int | None:
 
 def _gpu_stat(value: Mapping[str, Any], name: str) -> float | None:
     stats = value.get("gpu_stats")
-    return _number(stats.get(name)) if isinstance(stats, Mapping) else None
+    if not isinstance(stats, Mapping):
+        return None
+    direct = _number(stats.get(name))
+    if direct is not None:
+        return direct
+    if name == "fallback_count":
+        ranks = stats.get("ranks")
+        if isinstance(ranks, list) and ranks and all(
+            isinstance(rank, Mapping) and _number(rank.get(name)) is not None
+            for rank in ranks
+        ):
+            return sum(float(rank[name]) for rank in ranks)
+    return None
 
 
 def _input(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -2533,6 +2545,7 @@ def build(
         "unique_active_performance_observations": len(active_gpu_performance),
         "all_cpu_sort_rows_zero": all_explicit_zero("cpu_sort_rows"),
         "all_cpu_merge_rows_zero": all_explicit_zero("cpu_merge_rows"),
+        "all_output_fallback_counts_zero": all_explicit_zero("fallback_count"),
         "all_mpf_host_spill_bytes_zero": all_explicit_zero("mpf_host_spill_bytes"),
     }
     completed_gpu_scales = [
@@ -2742,8 +2755,9 @@ def build(
         "- The timed boundary is projected input materialized in Plasma through sorted output sealed and Ray-locatable. Ray restart and input reading/materialization are excluded; GPU actor, CUDA, RMM, MPF, transfer, externalization, and merge startup are included.",
         "- Ray default Plasma sizing was retained on both arms. Filesystem spill used `/mnt/nvme`, never `/dev/shm`. The GPU fleet ran first and was terminated before CPU launch; all campaign instance scopes were verified empty after teardown.",
         "- Dataset: normalized public BTS On-Time Performance data from 2013-04 through 2025-12. Every 1× cell uses the same 80,738,761 rows and 627 blocks. Narrow retains `Origin, Dest, FlightDate, CRSDepTime, row_id` (5 columns); core retains the first 56 native columns through `DistanceGroup` plus `row_id` (57); full retains all 109 native columns plus `row_id` (110). The four-key baseline is `Origin, Dest, FlightDate, CRSDepTime`; the other full-payload cells use `Origin`, `OriginAirportID`, or `Origin, Dest`.",
-        "- Composite build provenance is explicit: the original six resident GPU trend cells use Ray Data overlay `273c73b5b434f499f1773922e0b131488c64e809e352451454e39016a0475dec`; GPU 2×/2.45× and repaired CPU observations use final overlay `e0105442cc991f372614e21671aee0a68e60e06fa189503b2f7e84f5e12632aa`. Their sole production difference is external-run workspace/headroom handling in `backend.py`. Every retained original trend cell stayed resident with zero externalized bytes, so that change cannot exercise there and those observations are intentionally reused.",
-        f"- GPU-only acceptance: `{gpu_only_acceptance['unique_active_performance_observations']}` unique active performance artifacts; CPU-sort rows zero `{gpu_only_acceptance['all_cpu_sort_rows_zero']}`; CPU-merge rows zero `{gpu_only_acceptance['all_cpu_merge_rows_zero']}`; MPF host-spill bytes zero `{gpu_only_acceptance['all_mpf_host_spill_bytes_zero']}`.",
+        "- Composite build provenance is explicit: the original six resident GPU trend cells use Ray Data overlay `273c73b5b434f499f1773922e0b131488c64e809e352451454e39016a0475dec`; GPU 2×/2.45× and repaired CPU observations use benchmark overlay `e0105442cc991f372614e21671aee0a68e60e06fa189503b2f7e84f5e12632aa`. Their sole production difference is external-run workspace/headroom handling in `backend.py`. Every retained original trend cell stayed resident with zero externalized bytes, so that change cannot exercise there and those observations are intentionally reused.",
+        "- The PR-ready source adds two post-run correctness/telemetry-only fixes: direction-independent libcudf null placement for descending keys, and top-level aggregation/enforcement of the already-recorded per-rank output-fallback counter. BTS benchmark keys are ascending and all archived rank fallback counters are zero, so neither fix changes a measured path or timing.",
+        f"- GPU-only acceptance: `{gpu_only_acceptance['unique_active_performance_observations']}` unique active performance artifacts; CPU-sort rows zero `{gpu_only_acceptance['all_cpu_sort_rows_zero']}`; CPU-merge rows zero `{gpu_only_acceptance['all_cpu_merge_rows_zero']}`; output-conversion fallback count zero `{gpu_only_acceptance['all_output_fallback_counts_zero']}`; MPF host-spill bytes zero `{gpu_only_acceptance['all_mpf_host_spill_bytes_zero']}`.",
         "- The six 1× cells and GPU 1×/2×/2.45× size points completed. Default CPU completed through 2×; its 2.45× resource rejection is reported as a capacity boundary, not a timing result.",
         "",
         "## Correctness and automatic-wave tuning",

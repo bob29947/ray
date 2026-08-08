@@ -402,18 +402,13 @@ def lazy_load_backend() -> type[Any]:
                     if ascending
                     else plc.types.Order.DESCENDING
                 )
-                if self._config.null_position == "first":
-                    value_nulls = (
-                        plc.types.NullOrder.BEFORE
-                        if ascending
-                        else plc.types.NullOrder.AFTER
-                    )
-                else:
-                    value_nulls = (
-                        plc.types.NullOrder.AFTER
-                        if ascending
-                        else plc.types.NullOrder.BEFORE
-                    )
+                # libcudf's BEFORE/AFTER is the requested position relative to
+                # non-null values, independent of the value sort direction.
+                value_nulls = (
+                    plc.types.NullOrder.BEFORE
+                    if self._config.null_position == "first"
+                    else plc.types.NullOrder.AFTER
+                )
                 order.append(value_order)
                 nulls.append(value_nulls)
             return order, nulls
