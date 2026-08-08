@@ -163,4 +163,3 @@ def validate_unique(values: Iterable[Trial]) -> None:
 
 validate_unique(gpu_trials())
 validate_unique(cpu_trials())
-

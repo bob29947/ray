@@ -1,6 +1,6 @@
-# DGX BTS unified spillable GPU sort
+# BTS unified spillable GPU sort: DGX and AWS
 
-## Result
+## DGX result
 
 One adaptive Ray Data algorithm now covers resident and external execution.
 It range-partitions over all 16 GPUs with RAPIDS-MPF, retains a destination
@@ -33,9 +33,9 @@ has one observation and each GPU trend point has two.
 - RMM starts at 50% and is capped at 85% of VRAM. cuDF/MPF host spill and CPU
   fallback are disabled; Ray Core independently manages Plasma-to-disk spill.
 
-The final allowlisted diff records 9 production files and +2,397/-2
-production lines, plus one 332-line focused test file. All 20 source,
-test, and harness paths were within `python/ray/data/**` or
+The DGX checkpoint's allowlisted diff recorded 9 production files and
++2,397/-2 production lines, plus one 332-line focused test file. All 20
+source, test, and harness paths were within `python/ray/data/**` or
 `release/benchmarks/ray_data_gpu_sort/**`; Ray Core, dependencies, build, CI,
 and the host were unchanged.
 
@@ -292,8 +292,9 @@ fast path.
 Focused tests cover API/schema planning, inverse-inclusion sample weights,
 PyArrow-compatible null/NaN comparison, typed all-null output, equal-key
 distribution, spill transition, and bounded fan-in merge progress. The exact
-live resident/external smoke is the integration check. No broad Ray suite,
-failure injection, cloud run, or repeated correctness matrix was performed.
+live resident/external smoke is the integration check. At this DGX checkpoint,
+no broad Ray suite, failure injection, cloud run, or repeated correctness
+matrix was performed.
 
 Machine-readable evidence is in `.venv/gpu-sort-external-artifacts/study.json`
 and `.venv/gpu-sort-external-artifacts/natural-size-study.json`. The natural
@@ -302,3 +303,149 @@ with unchanged raw JSON files under
 `.venv/gpu-sort-external-artifacts/trials/`. Historical provenance remains in
 each trial; current environment identity is recorded separately in the study
 artifact.
+
+## AWS L4 replication
+
+### Execution and implementation
+
+The cloud replication used the simple lifecycle that had worked previously:
+one retained 16-node fleet per arm, with Ray stopped and restarted between
+observations on the same instances. EC2 was not reprovisioned per trial. The
+GPU arm used 16 `g6.4xlarge` nodes, one L4 rank per node; the CPU arm used 16
+`m5dn.4xlarge` nodes with unchanged default Ray/PyArrow sorting. The GPU fleet
+was terminated before CPU launch, and every campaign's tagged instance scope
+was verified empty after final teardown.
+
+Each fresh Ray runtime used default Plasma sizing and a new trial-specific
+filesystem-spill directory under `/mnt/nvme`, never `/dev/shm`. The immutable
+BTS publication and environment stayed staged on local NVMe. The cold timer
+started with projected input materialized in Plasma and ended after sorted
+output was sealed; reading/materialization and Ray restart were excluded,
+while GPU actors, CUDA/RMM/MPF startup, transfer, externalization, GPU merge,
+Arrow conversion, and sealing were included.
+
+The production follow-up added only cloud-portable behavior:
+
+- GPU actors expose their actual MPF rank, Ray node ID, and usable RMM budget.
+- Input refs are assigned to the rank on their Plasma node, balanced by decoded
+  bytes; full-baseline observations achieved 100% local input assignment.
+- Shuffle waves are derived from measured device headroom. A 0.50 versus 0.375
+  screen selected 0.50: 0.375 was telemetry-incomplete and was also 2.31%
+  slower, so it could not meet the 3% improvement gate.
+- Allocator-headroom-aware concatenation and run slicing keep final-sort
+  workspace within the L4 pool. Resident and external states still use the
+  same GPU-only operator; no CPU sort, merge, or fallback was introduced.
+
+One cloud-harness bug was repaired without changing production sort code.
+Node-affined readers had returned nested `ray.put()` refs owned by temporary
+workers. At 2.45x, loss of an owner under object-store pressure left pending
+refs unreconstructable and the trial waited indefinitely. Readers now return
+Arrow tables directly, leaving Ray with reconstructable task-output refs. A
+minimal retained-fleet rerun then completed both 2.45x GPU observations.
+
+The exact 160,000-row transport gate passed schema and every row/value with all
+16 ranks: default PyArrow took 1.011 seconds and GPU took 4.807 seconds. The
+post-fix 2.45x repair gate independently passed at 1.038/4.918 seconds.
+Across all 16 unique active GPU performance artifacts, the backend reported
+zero CPU-sort rows, zero CPU-merge rows, and zero MPF host-spill bytes.
+
+### Cloud payload and key trends
+
+All cells use the same 80,738,761-row, 627-block cohort from April 2013 through
+December 2025. Narrow retains `Origin, Dest, FlightDate, CRSDepTime, row_id`;
+core retains the first 56 native columns through `DistanceGroup` plus
+`row_id`; full retains all 109 native columns plus `row_id`. The four-key
+baseline is `Origin, Dest, FlightDate, CRSDepTime`. GPU values are two
+observations and their median; CPU has one observation. `telemetry-warning`
+observations passed row count, schema, checksum, and global ordering, but a Ray
+input/output location-metadata query was incomplete, so these are directional
+rather than strict statistical comparisons.
+
+The six resident GPU trend cells came from overlay
+`273c73b5b434f499f1773922e0b131488c64e809e352451454e39016a0475dec`; repaired
+GPU 2x/2.45x and CPU observations use final overlay
+`e0105442cc991f372614e21671aee0a68e60e06fa189503b2f7e84f5e12632aa`. The only
+production difference is external-run workspace/headroom handling in
+`backend.py`. Every reused trend run remained resident and externalized zero
+bytes, so that code path could not execute in those cells.
+
+| Cell | Columns / GiB | Keys | CPU s | GPU r1/r2 s | GPU median | Speedup |
+|:--|--:|:--|--:|:--|--:|--:|
+| Narrow | 5 / 2.857 | four | 69.060 | 7.259/7.072 | 7.165 | 9.64x |
+| Core | 57 / 35.108 | four | 115.686 | 22.965/23.304 | 23.135 | 5.00x |
+| Full | 110 / 63.881 | four | 118.931 | 39.146/39.112 | 39.129 | 3.04x |
+| Origin string | 110 / 63.881 | `Origin` | 82.643 | 41.548/40.035 | 40.791 | 2.03x |
+| Origin integer | 110 / 63.881 | `OriginAirportID` | 59.012 | 40.379/39.389 | 39.884 | 1.48x |
+| Route | 110 / 63.881 | `Origin, Dest` | 122.760 | 40.585/38.827 | 39.706 | 3.09x |
+
+The cloud trends agree directionally with DGX:
+
+- Payload is the dominant GPU cost. Narrow-to-full makes GPU 5.46x slower
+  while CPU becomes 1.72x slower, reducing speedup from 9.64x to 3.04x.
+  Moving, partitioning, converting, and sealing the extra payload dominate;
+  the sort-key kernel itself is not the bottleneck.
+- Integer keys help CPU much more. `OriginAirportID` is 28.6% faster than the
+  `Origin` string on CPU, whereas GPU medians differ by only 2.3%. The easiest
+  CPU cell therefore has the smallest GPU advantage, 1.48x.
+- At full payload, GPU is effectively flat across one, two, and four natural
+  keys: 40.79, 39.71, and 39.13 seconds. CPU is 82.64, 122.76, and 118.93
+  seconds. Route/multi-key comparison work strengthens the GPU story, though
+  one CPU observation and location warnings do not support a fine-grained
+  two-versus-four-key claim.
+
+For the 1x full baseline, median GPU controller phases were 3.534 seconds
+sampling, 2.277 partitioning, 19.256 MPF shuffle, 0.165 run/final sort, 0 GPU
+merge, 3.173 Arrow conversion, 1.281 Plasma sealing, and 8.191 orchestration.
+Peak per-rank RMM/NVML was 15.1/15.5 GiB, leaving at least 6.9 GiB physical
+headroom; output balance was 1.07-1.09x.
+
+### Natural size and spill trend
+
+No GPU budget was artificially reduced in this study. Both arms used default
+Ray object-store policy; GPU used its normal RMM 0.50/0.85 policy and the
+selected 0.50 automatic wave fraction. The 1x and 2x observations admitted one
+whole-input wave; 2.45x used two waves with a 10,055,139,328-byte (9.36-GiB)
+target.
+
+| Scale | Input | CPU s | GPU r1/r2 s | GPU median | Speedup | GPU externalization and geometry |
+|:--|--:|--:|:--|--:|--:|:--|
+| 1x | 63.881 GiB | 118.931 | 39.146/39.112 | 39.129 | 3.04x | none; 0/0/0 |
+| 2x | 127.762 GiB | 499.946 | 137.161/138.121 | 137.641 | 3.63x | 127.8 GiB; 48 initial/16 replacement/1 merge |
+| 2.45x | 156.505 GiB | n/a | 159.308/162.441 | 160.874 | n/a | 156.5 GiB; 48 initial/16 replacement/1 merge |
+
+At 1x neither backend spilled. At 2x, CPU wrote/restored 269.2/4.4 GiB through
+Ray's Plasma-to-NVMe spill, while the GPU observations wrote 508.9/148.1 and
+505.2/148.1 GiB. These are cumulative I/O counters during the timed sort, not
+simultaneous disk footprint. The GPU externalized every row once from VRAM to
+sorted Plasma runs; run generation and the replacement merge raise H2D/D2H
+amplification from 2x/1x to 3x/2x and Plasma read/write amplification from
+0x/1x to 2x/3x. Despite 1.88x the CPU Ray-write volume, GPU remained 3.63x
+faster.
+
+At 2.45x, the two GPU observations wrote/restored 566.0/207.9 and
+556.4/219.8 GiB and completed with exact global order, checksum, expected
+197,809,964 rows, bounded memory, and zero CPU sort/merge/fallback. Default
+PyArrow did not produce a completed comparison: on two fresh CPU runtimes the
+shuffle map reached 100%, reduce remained at 0%, a greater-than-16-GiB driver
+memory warning appeared, and the head connection closed after diagnostic-only
+intervals of 380 and 374 seconds. This is a reproduced default-Ray CPU
+capacity boundary, not a completed time, so no 2.45x speedup is claimed.
+
+The cloud result therefore shows a clean natural transition: the unified GPU
+operator is resident at 1x, external at 2x and 2.45x, and does not crash when
+VRAM fills. Externalization is expensive and produces more object-store spill
+than CPU at 2x, but it preserves a substantial completed-sort advantage. At
+2.45x it completes a workload for which this default CPU fleet cannot enter
+the reduce phase.
+
+### Cloud evidence
+
+The complete generated Markdown report and machine-readable companion JSON
+are under
+`.venv/gpu-sort-cloud-artifacts/studies/bts-external-cloud-20260807-g/report/`.
+They retain every observation, phase, per-rank memory/locality/network metric,
+Ray spill counter, run geometry, repair provenance, lifecycle receipt, and the
+superseded attempts. Raw campaign artifacts remain untracked. Focused cloud
+tests cover locality, automatic wave choice, direct task-output ownership,
+artifact recovery/provenance, retained-fleet lifecycle, and report overlay
+validation; no broad Ray suite was run.

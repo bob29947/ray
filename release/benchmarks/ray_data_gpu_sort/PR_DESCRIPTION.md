@@ -18,7 +18,7 @@ algorithm:
 
 The implementation and benchmarks are confined to `python/ray/data/**` and
 `release/benchmarks/ray_data_gpu_sort/**`. There are no Ray Core, build, CI,
-dependency, host, or cloud changes.
+global dependency, or host changes. AWS lifecycle code is benchmark-only.
 
 ## Why `partition_then_sort`
 
@@ -53,6 +53,13 @@ disk/NVMe spill directory and restores them for merge. GPU-to-Plasma
 externalization, Ray-to-disk spill, and RAPIDS-MPF spill are separately
 reported.
 
+For multi-node execution, actors report their real MPF rank, Ray node ID, and
+usable RMM budget. Input ObjectRefs are assigned to the GPU actor on their
+Plasma node and balanced by decoded bytes. Shuffle waves are bounded from
+measured device memory, while allocator-headroom-aware concatenation and run
+slicing reserve the workspace needed by the final GPU sort. These are portable
+production behaviors rather than a separate cloud algorithm.
+
 The DGX harness uses `/dev/shm` only for Plasma. Actual Ray spill files use a
 per-trial path on RAID and a worker rejects a spill path below `/dev/shm`.
 
@@ -83,14 +90,41 @@ Two GPU observations per trend/spill cell are directional, not a statistical
 study. The complete artifacts and phase telemetry are in `RESULTS.md` and the
 benchmark harness output.
 
+## AWS L4 evidence
+
+The same production backend ran on 16 retained `g6.4xlarge` L4 nodes against
+default Ray/PyArrow on 16 retained `m5dn.4xlarge` nodes. Ray was restarted for
+every observation without reprovisioning EC2; default Plasma was used and Ray
+filesystem spill went to `/mnt/nvme`.
+
+- The exact 160,000-row, 16-rank transport smoke matched every row/value.
+- On the fixed 80,738,761-row cohort, cloud GPU medians were 7.165s narrow,
+  23.135s core, and 39.129s full, for 9.64x, 5.00x, and 3.04x over the CPU
+  observations.
+- Full-payload GPU medians remained near-flat for `Origin`, `Origin, Dest`, and
+  the four-key baseline: 40.791, 39.706, and 39.129 seconds. CPU took 82.643,
+  122.760, and 118.931 seconds.
+- At natural 2x size (127.762 GiB), GPU externalized every row, completed in a
+  137.641-second median, and remained 3.63x faster than CPU's 499.946 seconds.
+- At natural 2.45x size (156.505 GiB), GPU completed twice in 159.308 and
+  162.441 seconds with 48 initial runs, 16 replacement runs, one GPU merge
+  pass, and zero CPU fallback. Default PyArrow reproducibly lost the head at
+  the map-to-reduce boundary, so no 2.45x speedup is claimed.
+
+All campaign fleets were terminated and exact-tag scopes verified empty. The
+full directional results, spill amplification, phase telemetry, warnings, and
+repair provenance are in `RESULTS.md` and the generated cloud report.
+
 ## Validation
 
 - One exact live PyArrow/resident-GPU/external-GPU equivalence smoke.
 - Focused tests for comparator ordering, nullable typed output, deterministic
   equal-key spreading, inverse-inclusion sample weights, spill transition, and
-  bounded merge progress.
+  bounded merge progress, plus cloud locality, wave selection, task-output
+  ownership, lifecycle, artifact provenance, and report overlays.
 - Ruff, Black, compilation, diff, and allowlist checks.
-- No broad Ray suite and no cloud run.
+- One exact DGX smoke and one exact 16-node cloud transport smoke; no broad Ray
+  suite or repeated correctness matrix.
 
 ## Known limitation
 
