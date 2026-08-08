@@ -1,0 +1,7 @@
+# CPython 3.10; no Ray Data or CPU-sort tuning is installed here.
+numpy==2.2.6
+pyarrow==24.0.0
+pandas==2.3.3
+psutil==7.2.2
+packaging==26.2
+

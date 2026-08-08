@@ -1,0 +1,13 @@
+{
+  "region": "us-west-2",
+  "availability_zone": "us-west-2b",
+  "ami_id": "ami-REPLACE",
+  "subnet_id": "subnet-REPLACE",
+  "security_group_ids": ["sg-REPLACE"],
+  "iam_instance_profile_arn": "arn:aws:iam::ACCOUNT:instance-profile/REPLACE",
+  "ec2_key_name": "REPLACE",
+  "ssh_private_key_path": "/absolute/path/to/key.pem",
+  "ssh_user": "ubuntu",
+  "root_volume_gib": 100,
+  "aws_profile": null
+}

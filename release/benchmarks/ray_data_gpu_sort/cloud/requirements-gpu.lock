@@ -1,0 +1,19 @@
+# CPython 3.10; Ray itself is installed from the exact prebuilt wheel.
+numpy==2.2.6
+pyarrow==24.0.0
+pandas==2.3.3
+psutil==7.2.2
+nvidia-ml-py==13.610.43
+packaging==26.2
+cudf-cu12==26.2.1
+libcudf-cu12==26.2.1
+pylibcudf-cu12==26.2.1
+rmm-cu12==26.2.0
+librmm-cu12==26.2.0
+cupy-cuda12x==14.1.1
+rapidsmpf-cu12==26.2.0
+librapidsmpf-cu12==26.2.0
+ucxx-cu12==0.48.0
+libucxx-cu12==0.48.0
+libucx-cu12==1.19.0
+

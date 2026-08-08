@@ -1,0 +1,20 @@
+{
+  "gpu": {
+    "name": "bts-gpu-16x-g6-4xlarge",
+    "instance_type": "g6.4xlarge",
+    "nodes": 16,
+    "vcpus_per_node": 16,
+    "gpus_per_node": 1,
+    "docker_shm_gib": 32,
+    "instance_store_devices": 1
+  },
+  "cpu": {
+    "name": "bts-cpu-16x-m5dn-4xlarge",
+    "instance_type": "m5dn.4xlarge",
+    "nodes": 16,
+    "vcpus_per_node": 16,
+    "gpus_per_node": 0,
+    "docker_shm_gib": 32,
+    "instance_store_devices": 2
+  }
+}
