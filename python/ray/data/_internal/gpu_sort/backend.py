@@ -101,6 +101,30 @@ def _sum_spill_bytes(value: Any, path: str = "") -> int:
     return 0
 
 
+def _workspace_bounded_payload_bytes(
+    pool_max_bytes: int,
+    current_allocated_bytes: int,
+    workspace_factor: float,
+    reserve_bytes: int,
+) -> int:
+    """Return payload that can be sorted without exceeding the RMM pool.
+
+    ``workspace_factor`` includes the input payload itself.  The input is
+    already reflected in ``current_allocated_bytes``. A bounded concatenate
+    needs one additional payload, while sorting needs ``factor - 1``; the
+    stricter of those two allocations must fit in the available headroom.
+    """
+
+    available = max(
+        0,
+        int(pool_max_bytes)
+        - int(current_allocated_bytes)
+        - max(0, int(reserve_bytes)),
+    )
+    additional_factor = max(1.0, float(workspace_factor) - 1.0)
+    return max(0, int(available / additional_factor))
+
+
 def lazy_load_backend() -> type[Any]:
     """Build the implementation only inside a one-GPU Ray actor."""
 
@@ -739,13 +763,21 @@ def lazy_load_backend() -> type[Any]:
                 for partition in range(
                     self.rank(), self._num_partitions, self.nranks()
                 ):
-                    for chunk in received.get(partition, []):
+                    chunks = received.pop(partition, [])
+                    while chunks:
+                        chunk = chunks.pop()
                         unpack_started = time.perf_counter()
                         table = self._unpack_one(chunk)
                         cp.cuda.runtime.deviceSynchronize()
+                        # ``unpack_and_concat`` owns the resulting table. Drop
+                        # the consumed packed receive buffer before a retained
+                        # range may need its run-sort workspace.
+                        del chunk
                         mpf_elapsed += time.perf_counter() - unpack_started
                         received_rows += int(table.num_rows())
                         self._accept_received(partition, table, wave_id)
+                        del table
+                received.clear()
                 cp.cuda.runtime.deviceSynchronize()
                 self._stats["phases_s"]["mpf_shuffle"] += mpf_elapsed
             finally:
@@ -808,16 +840,105 @@ def lazy_load_backend() -> type[Any]:
                 return
             self._device_tables[partition] = []
             self._device_bytes[partition] = 0
-            table = (
-                tables[0] if len(tables) == 1 else plc.concatenate.concatenate(tables)
-            )
-            tables.clear()
-            sort_started = time.perf_counter()
-            table = self._sort_table(table)
-            cp.cuda.runtime.deviceSynchronize()
-            self._stats["phases_s"]["run_sort"] += time.perf_counter() - sort_started
-            run = self._store_table_as_run(table, initial=True)
-            self._runs[partition].append(run)
+            while tables:
+                cp.cuda.runtime.deviceSynchronize()
+                # Concurrent MPF receive buffers count against the same RMM
+                # pool. They are already included in ``current_allocated``;
+                # bound both concatenate and final-sort workspace by the
+                # actual remaining headroom.
+                current_allocated = int(self._mr.current_allocated)
+                available = max(0, self._pool_max_bytes - current_allocated)
+                group_limit = _workspace_bounded_payload_bytes(
+                    self._pool_max_bytes,
+                    current_allocated,
+                    self._config.final_sort_workspace_factor,
+                    0,
+                )
+                group_limit = min(
+                    self._payload_limit_bytes, available, group_limit
+                )
+                if group_limit <= 0:
+                    raise GPUSortCapacityError(
+                        "GPU sort cannot reserve run-sort workspace while "
+                        "shuffle buffers are live. Reduce the automatic wave size."
+                    )
+
+                # Destructively remove only a group whose concatenate output
+                # can coexist with all remaining sources. Once the new table
+                # is synchronized, releasing ``group`` drops the old buffers
+                # before sort workspace is allocated.
+                group = []
+                group_bytes = 0
+                while tables:
+                    candidate_bytes = self._table_bytes(tables[-1])
+                    if group and group_bytes + candidate_bytes > group_limit:
+                        break
+                    group.append(tables.pop())
+                    group_bytes += candidate_bytes
+                    if group_bytes >= group_limit:
+                        break
+                if len(group) == 1:
+                    table = group.pop()
+                else:
+                    table = plc.concatenate.concatenate(group)
+                    cp.cuda.runtime.deviceSynchronize()
+                    group.clear()
+
+                rows = int(table.num_rows())
+                start = 0
+                while start < rows:
+                    cp.cuda.runtime.deviceSynchronize()
+                    piece_limit = min(
+                        self._payload_limit_bytes,
+                        _workspace_bounded_payload_bytes(
+                            self._pool_max_bytes,
+                            int(self._mr.current_allocated),
+                            self._config.final_sort_workspace_factor,
+                            0,
+                        ),
+                    )
+                    if piece_limit <= 0:
+                        raise GPUSortCapacityError(
+                            "GPU sort cannot reserve run-sort workspace while "
+                            "shuffle buffers are live. Reduce the automatic wave size."
+                        )
+                    remaining = self._slice_table(table, start, rows)
+                    remaining_bytes = self._table_bytes(remaining)
+                    piece_rows = max(
+                        1,
+                        int(
+                            (rows - start)
+                            * piece_limit
+                            / max(1, remaining_bytes)
+                        ),
+                    )
+                    end = min(rows, start + piece_rows)
+                    piece = self._slice_table(table, start, end)
+                    piece_bytes = self._table_bytes(piece)
+                    while piece_bytes > piece_limit and end - start > 1:
+                        piece_rows = max(
+                            1,
+                            int((end - start) * piece_limit / piece_bytes),
+                        )
+                        end = start + piece_rows
+                        piece = self._slice_table(table, start, end)
+                        piece_bytes = self._table_bytes(piece)
+                    if piece_bytes > piece_limit:
+                        raise GPUSortCapacityError(
+                            "One GPU sort row exceeds the available run-sort workspace."
+                        )
+
+                    sort_started = time.perf_counter()
+                    sorted_piece = self._sort_table(piece)
+                    cp.cuda.runtime.deviceSynchronize()
+                    self._stats["phases_s"]["run_sort"] += (
+                        time.perf_counter() - sort_started
+                    )
+                    run = self._store_table_as_run(sorted_piece, initial=True)
+                    self._runs[partition].append(run)
+                    del sorted_piece, piece, remaining
+                    start = end
+                del table
             self._stats["state"] = "EXTERNAL_RUNS"
             self._stats["mode"] = "external"
             if self._stats["first_externalize_s"] is None:

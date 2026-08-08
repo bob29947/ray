@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import ray
 from ray.actor import ActorHandle
@@ -105,6 +105,78 @@ class _InputBlock:
     num_rows: int
 
 
+def _underlying_object_ref(block: _InputBlock) -> Any:
+    value = block.value
+    return value[0] if isinstance(value, tuple) and len(value) == 3 else value
+
+
+def _assign_blocks_by_locality(
+    blocks: Sequence[_InputBlock],
+    actor_node_ids: Sequence[str],
+    object_locations: Mapping[Any, Mapping[str, Any]],
+) -> Tuple[
+    List[List[_InputBlock]],
+    List[int],
+    List[int],
+    List[int],
+    List[int],
+]:
+    """Assign blocks locally, with deterministic decoded-byte balancing.
+
+    An object may have multiple replicas, no reported location (for example an
+    inline object), or a location on a node without a GPU-sort actor.  The same
+    size-first rule is used within the local candidates and as the global
+    fallback, so location lookup is never a correctness dependency.
+    """
+
+    nranks = len(actor_node_ids)
+    if nranks < 1:
+        raise ValueError("GPU sort requires at least one actor for block assignment.")
+    blocks_by_rank: List[List[_InputBlock]] = [[] for _ in range(nranks)]
+    assigned_bytes = [0] * nranks
+    assigned_blocks = [0] * nranks
+    local_bytes = [0] * nranks
+    local_blocks = [0] * nranks
+
+    for block in blocks:
+        ref = _underlying_object_ref(block)
+        try:
+            location = object_locations.get(ref, {})
+        except TypeError:
+            location = {}
+        node_ids = set(location.get("node_ids", ()) or ())
+        candidates = [
+            rank
+            for rank, node_id in enumerate(actor_node_ids)
+            if node_id and node_id in node_ids
+        ]
+        is_local = bool(candidates)
+        if not candidates:
+            candidates = list(range(nranks))
+        rank = min(
+            candidates,
+            key=lambda item: (
+                assigned_bytes[item],
+                assigned_blocks[item],
+                item,
+            ),
+        )
+        blocks_by_rank[rank].append(block)
+        assigned_bytes[rank] += int(block.size_bytes)
+        assigned_blocks[rank] += 1
+        if is_local:
+            local_bytes[rank] += int(block.size_bytes)
+            local_blocks[rank] += 1
+
+    return (
+        blocks_by_rank,
+        assigned_bytes,
+        assigned_blocks,
+        local_bytes,
+        local_blocks,
+    )
+
+
 def _make_waves(
     blocks_by_rank: Sequence[Sequence[_InputBlock]],
     target_bytes_per_rank: Optional[int],
@@ -140,6 +212,30 @@ def _make_waves(
     ]
 
 
+def _wave_target_bytes(
+    blocks_by_rank: Sequence[Sequence[_InputBlock]],
+    *,
+    explicit_residency_budget_bytes: Optional[int],
+    actor_usable_budgets: Sequence[int],
+    auto_wave_fraction: float,
+) -> Optional[int]:
+    """Return a bounded-wave target, or ``None`` for the resident fast path."""
+
+    if explicit_residency_budget_bytes is not None:
+        # Preserve the original capacity-study behavior exactly.
+        return max(256 << 20, int(explicit_residency_budget_bytes) // 2)
+
+    budgets = [int(value) for value in actor_usable_budgets if int(value) > 0]
+    if not budgets:
+        raise RuntimeError("GPU sort actors did not report usable memory budgets.")
+    target = max(256 << 20, int(min(budgets) * float(auto_wave_fraction)))
+    largest_rank_input = max(
+        (sum(block.size_bytes for block in blocks) for blocks in blocks_by_rank),
+        default=0,
+    )
+    return None if largest_rank_input <= target else target
+
+
 def _derive_num_ranks(data_context: DataContext) -> int:
     configured = data_context.gpu_shuffle_num_actors
     if configured is not None:
@@ -166,6 +262,9 @@ def _operator_config(data_context: DataContext) -> Dict[str, Any]:
         sample_seed=int(data_context.get_config("gpu_sort_sample_seed", 0)),
         residency_budget_bytes=(
             env_budget if env_budget is not None else context_budget
+        ),
+        auto_wave_fraction=float(
+            data_context.get_config("gpu_sort_auto_wave_fraction", 0.50)
         ),
         exchange_batch_bytes=int(
             data_context.get_config("gpu_sort_exchange_batch_bytes", 512 << 20)
@@ -194,6 +293,7 @@ class _RankPool:
         self.ascending = ascending
         self.config = config
         self.actors: List[ActorHandle] = []
+        self.rank_infos: List[Dict[str, Any]] = []
         self._shutdown_lock = threading.Lock()
 
     def start(self) -> None:
@@ -227,6 +327,7 @@ class _RankPool:
             timeout=timeout,
         )
         actors_by_rank: List[Optional[ActorHandle]] = [None] * self.nranks
+        infos_by_rank: List[Optional[Dict[str, Any]]] = [None] * self.nranks
         for actor, result in zip(self.actors, setup):
             rank = int(result["rank"])
             if not 0 <= rank < self.nranks or actors_by_rank[rank] is not None:
@@ -234,9 +335,11 @@ class _RankPool:
                     f"GPU sort communicator returned invalid rank {rank}."
                 )
             actors_by_rank[rank] = actor
+            infos_by_rank[rank] = dict(result)
         if any(actor is None for actor in actors_by_rank):
             raise RuntimeError("GPU sort communicator rank assignment is incomplete.")
         self.actors = [actor for actor in actors_by_rank if actor is not None]
+        self.rank_infos = [info for info in infos_by_rank if info is not None]
         ready = ray.get(
             [actor.is_ready.remote() for actor in self.actors], timeout=timeout
         )
@@ -296,9 +399,14 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._rank_pool = _RankPool(
             nranks, key_columns, [not value for value in descending], config
         )
+        self._input_blocks: List[_InputBlock] = []
         self._blocks_by_rank: List[List[_InputBlock]] = [[] for _ in range(nranks)]
         self._assigned_bytes = [0] * nranks
         self._assigned_blocks = [0] * nranks
+        self._local_bytes = [0] * nranks
+        self._local_blocks = [0] * nranks
+        self._wave_target_bytes: Optional[int] = None
+        self._wave_count = 0
         self._input_bundles: List[RefBundle] = []
         self._input_rows = 0
         self._input_bytes = 0
@@ -345,23 +453,40 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                     if full_rows
                     else int(metadata.size_bytes or 0)
                 )
-            # Size-first placement avoids the block-count imbalance that can
-            # leave one GPU as the long pole on variable-sized Parquet blocks.
-            rank = min(
-                range(self._rank_pool.nranks),
-                key=lambda item: (
-                    self._assigned_bytes[item],
-                    self._assigned_blocks[item],
-                    item,
-                ),
-            )
-            self._blocks_by_rank[rank].append(
+            # Actor placement and communicator rank order are not known until
+            # MPF bootstrap, so assignment is deliberately deferred.
+            self._input_blocks.append(
                 _InputBlock(value=value, size_bytes=size_bytes, num_rows=rows)
             )
-            self._assigned_bytes[rank] += size_bytes
-            self._assigned_blocks[rank] += 1
             self._input_bytes += size_bytes
             self._input_rows += rows
+
+    def _assign_input_blocks(self) -> None:
+        actor_node_ids = [
+            str(info.get("node_id", "")) for info in self._rank_pool.rank_infos
+        ]
+        refs = []
+        seen = set()
+        for block in self._input_blocks:
+            ref = _underlying_object_ref(block)
+            if isinstance(ref, ray.ObjectRef) and ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+        try:
+            locations = ray.experimental.get_object_locations(refs) if refs else {}
+        except Exception:
+            # The API is experimental and excludes some valid objects.  A
+            # deterministic non-local assignment is always safe.
+            locations = {}
+        (
+            self._blocks_by_rank,
+            self._assigned_bytes,
+            self._assigned_blocks,
+            self._local_bytes,
+            self._local_blocks,
+        ) = _assign_blocks_by_locality(
+            self._input_blocks, actor_node_ids, locations
+        )
 
     def _sample(self) -> Tuple[Any, Any]:
         target = self._config["sample_size"]
@@ -402,18 +527,25 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
 
     def _plan_waves(self) -> List[List[List[Any]]]:
         budget = self._config["residency_budget_bytes"]
-        # Preserve the current one-wave resident fast path.  A benchmark or
-        # capacity planner that supplies a smaller residency budget gets
-        # bounded waves; complete sorted runs are the spill unit.
-        target = None if budget is None else max(256 << 20, int(budget) // 2)
-        return _make_waves(self._blocks_by_rank, target)
+        self._wave_target_bytes = _wave_target_bytes(
+            self._blocks_by_rank,
+            explicit_residency_budget_bytes=budget,
+            actor_usable_budgets=[
+                int(info.get("usable_memory_budget_bytes", 0) or 0)
+                for info in self._rank_pool.rank_infos
+            ],
+            auto_wave_fraction=float(self._config["auto_wave_fraction"]),
+        )
+        waves = _make_waves(self._blocks_by_rank, self._wave_target_bytes)
+        self._wave_count = len(waves)
+        return waves
 
     def _try_finalize(self) -> None:
         if self._finalization_started or not self._inputs_complete:
             return
         self._finalization_started = True
         self._run_started_at = time.perf_counter()
-        if not any(self._blocks_by_rank):
+        if not self._input_blocks:
             self._finalization_succeeded = True
             self._publish_diagnostics([])
             return
@@ -422,6 +554,12 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             started = time.perf_counter()
             self._rank_pool.start()
             self._controller_phases["startup"] = time.perf_counter() - started
+
+            started = time.perf_counter()
+            self._assign_input_blocks()
+            self._controller_phases["input_assignment"] = (
+                time.perf_counter() - started
+            )
 
             started = time.perf_counter()
             schema, boundaries = self._sample()
@@ -537,8 +675,25 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         for default_rank, raw in enumerate(diagnostics):
             item = dict(raw or {})
             item.setdefault("rank", default_rank)
+            item.setdefault(
+                "node_id",
+                self._rank_pool.rank_infos[default_rank].get("node_id", "")
+                if default_rank < len(self._rank_pool.rank_infos)
+                else "",
+            )
+            item.setdefault(
+                "usable_memory_budget_bytes",
+                self._rank_pool.rank_infos[default_rank].get(
+                    "usable_memory_budget_bytes", 0
+                )
+                if default_rank < len(self._rank_pool.rank_infos)
+                else 0,
+            )
             item.setdefault("peak_device_bytes", 0)
             item.setdefault("input_bytes", self._assigned_bytes[default_rank])
+            item.setdefault("input_blocks", self._assigned_blocks[default_rank])
+            item.setdefault("local_input_bytes", self._local_bytes[default_rank])
+            item.setdefault("local_input_blocks", self._local_blocks[default_rank])
             for name in (
                 "output_bytes",
                 "externalized_bytes",
@@ -605,6 +760,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             ),
             "input_rows": self._input_rows,
             "input_bytes": self._input_bytes,
+            "auto_wave_fraction": float(self._config["auto_wave_fraction"]),
+            "wave_target_bytes": self._wave_target_bytes,
+            "wave_count": self._wave_count,
             "ranks": ranks,
             "externalized_bytes": externalized_bytes,
             "externalized_rows": total("externalized_rows"),

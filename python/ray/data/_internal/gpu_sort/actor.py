@@ -71,12 +71,18 @@ class GPUSortActor:
             num_partitions=num_partitions,
             config=config,
         )
+        self._node_id = ray.get_runtime_context().get_node_id()
 
     def setup_root(self) -> tuple[int, bytes]:
         return self._backend.setup_root()
 
     def setup_worker(self, root_address_bytes: bytes) -> Dict[str, Any]:
-        return self._backend.setup_worker(root_address_bytes)
+        result = dict(self._backend.setup_worker(root_address_bytes))
+        result["node_id"] = self._node_id
+        result["usable_memory_budget_bytes"] = int(
+            result.get("memory_budget_bytes", 0) or 0
+        )
+        return result
 
     def is_ready(self) -> bool:
         return self._backend.is_ready()
@@ -107,7 +113,12 @@ class GPUSortActor:
                 raise
 
     def diagnostics(self) -> Dict[str, Any]:
-        return self._backend.diagnostics()
+        result = dict(self._backend.diagnostics())
+        result["node_id"] = self._node_id
+        result["usable_memory_budget_bytes"] = int(
+            result.get("memory_budget_bytes", 0) or 0
+        )
+        return result
 
     def release(self) -> None:
         self._backend.release()

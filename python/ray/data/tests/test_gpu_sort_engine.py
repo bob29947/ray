@@ -11,13 +11,16 @@ import ray
 from ray.data._internal.gpu_sort.backend import (
     _ExternalRun,
     _scale_sample_weights,
+    _workspace_bounded_payload_bytes,
     lazy_load_backend,
 )
 from ray.data._internal.gpu_sort.config import GPUSortConfig
 from ray.data._internal.gpu_sort.operator import (
     _InputBlock,
+    _assign_blocks_by_locality,
     _make_waves,
     _validate_gpu_schema,
+    _wave_target_bytes,
 )
 from ray.data._internal.logical.rules.combine_shuffles import CombineShuffles
 from ray.data.tests.conftest import *  # noqa
@@ -80,6 +83,84 @@ def test_gpu_sort_schema_and_wave_planning():
     waves = _make_waves(blocks, target_bytes_per_rank=8)
     assert waves == [[["a"], ["c"]], [["b"], []]]
     assert _make_waves(blocks, target_bytes_per_rank=None) == [[["a", "b"], ["c"]]]
+
+
+def test_gpu_sort_locality_assignment_balances_decoded_bytes():
+    blocks = [
+        _InputBlock("n0-large", 9, 1),
+        _InputBlock("n0-small", 4, 1),
+        _InputBlock("n1", 7, 1),
+        _InputBlock("replicated", 7, 1),
+        _InputBlock("unknown", 6, 1),
+    ]
+    locations = {
+        "n0-large": {"node_ids": ["node-0"]},
+        "n0-small": {"node_ids": ["node-0"]},
+        "n1": {"node_ids": ["node-1"]},
+        "replicated": {"node_ids": ["node-0", "node-1"]},
+    }
+    assigned, assigned_bytes, assigned_blocks, local_bytes, local_blocks = (
+        _assign_blocks_by_locality(blocks, ["node-0", "node-1"], locations)
+    )
+
+    assert [[block.value for block in rank] for rank in assigned] == [
+        ["n0-large", "n0-small", "unknown"],
+        ["n1", "replicated"],
+    ]
+    assert assigned_bytes == [19, 14]
+    assert assigned_blocks == [3, 2]
+    assert local_bytes == [13, 14]
+    assert local_blocks == [2, 2]
+
+
+def test_gpu_sort_automatic_wave_target_uses_smallest_actor_budget():
+    gib = 1 << 30
+    small = [
+        [_InputBlock("a", 2 * gib, 1)],
+        [_InputBlock("b", 3 * gib, 1)],
+    ]
+    assert (
+        _wave_target_bytes(
+            small,
+            explicit_residency_budget_bytes=None,
+            actor_usable_budgets=[20 * gib, 16 * gib],
+            auto_wave_fraction=0.50,
+        )
+        is None
+    )
+
+    large = [
+        [_InputBlock("a", 5 * gib, 1), _InputBlock("b", 4 * gib, 1)],
+        [_InputBlock("c", 2 * gib, 1)],
+    ]
+    assert _wave_target_bytes(
+        large,
+        explicit_residency_budget_bytes=None,
+        actor_usable_budgets=[20 * gib, 16 * gib],
+        auto_wave_fraction=0.50,
+    ) == 8 * gib
+    assert _wave_target_bytes(
+        large,
+        explicit_residency_budget_bytes=None,
+        actor_usable_budgets=[20 * gib, 16 * gib],
+        auto_wave_fraction=0.375,
+    ) == 6 * gib
+    assert _wave_target_bytes(
+        large,
+        explicit_residency_budget_bytes=4 * gib,
+        actor_usable_budgets=[],
+        auto_wave_fraction=0.50,
+    ) == 2 * gib
+
+    with pytest.raises(RuntimeError, match="usable memory budgets"):
+        _wave_target_bytes(
+            large,
+            explicit_residency_budget_bytes=None,
+            actor_usable_budgets=[],
+            auto_wave_fraction=0.50,
+        )
+    with pytest.raises(ValueError, match="wave fraction"):
+        GPUSortConfig(auto_wave_fraction=0)
 
 
 def test_gpu_sort_inverse_inclusion_sample_weights():
@@ -312,6 +393,173 @@ def test_gpu_sort_transitions_before_residency_overflow(gpu_backend_class):
     assert transitions[-1] == (0, 8, 10)
     assert backend._device_bytes[0] == 0
     assert backend._stats["peak_live_bytes"] <= backend._payload_limit_bytes
+
+
+def test_gpu_sort_externalization_reserves_live_allocator_workspace(
+    gpu_backend_class, monkeypatch
+):
+    class Table:
+        def __init__(self, rows, size_bytes):
+            self.rows = rows
+            self.size_bytes = size_bytes
+
+        def num_rows(self):
+            return self.rows
+
+    cp = types.ModuleType("cupy")
+    cp.cuda = types.SimpleNamespace(
+        runtime=types.SimpleNamespace(deviceSynchronize=lambda: None)
+    )
+    monkeypatch.setitem(sys.modules, "cupy", cp)
+    monkeypatch.setitem(sys.modules, "pylibcudf", types.ModuleType("pylibcudf"))
+
+    assert _workspace_bounded_payload_bytes(100, 50, 3.0, 6) == 22
+
+    backend = object.__new__(gpu_backend_class)
+    backend._config = GPUSortConfig(
+        exchange_batch_bytes=10,
+        final_sort_workspace_factor=3.0,
+    )
+    backend._pool_max_bytes = 100
+    backend._mr = types.SimpleNamespace(current_allocated=50)
+    backend._payload_limit_bytes = 40
+    backend._device_tables = {0: [Table(40, 40)]}
+    backend._device_bytes = {0: 40}
+    backend._runs = {0: []}
+    backend._started_at = 0.0
+    backend._stats = {
+        "state": "DEVICE_ACCUMULATING",
+        "mode": "resident",
+        "first_externalize_s": None,
+        "first_externalize_wave": None,
+        "peak_device_bytes": 0,
+        "phases_s": {"run_sort": 0.0},
+    }
+    backend._slice_table = lambda table, start, end: Table(
+        end - start, table.size_bytes * (end - start) // table.rows
+    )
+    backend._table_bytes = lambda table: table.size_bytes
+    sorted_sizes = []
+
+    def sort_table(table):
+        sorted_sizes.append(table.size_bytes)
+        return table
+
+    backend._sort_table = sort_table
+    backend._store_table_as_run = lambda table, initial: _ExternalRun()
+    backend._externalize_device_tables(0, wave_id=3)
+
+    assert sorted_sizes == [25, 15]
+    assert len(backend._runs[0]) == 2
+    assert backend._stats["state"] == "EXTERNAL_RUNS"
+    assert backend._stats["first_externalize_wave"] == 3
+
+
+def test_gpu_sort_externalization_bounds_multitable_concat(
+    gpu_backend_class, monkeypatch
+):
+    class MemoryResource:
+        def __init__(self, current_allocated):
+            self.current_allocated = current_allocated
+            self.peak = current_allocated
+
+        def allocate(self, size_bytes):
+            self.current_allocated += size_bytes
+            self.peak = max(self.peak, self.current_allocated)
+
+        def free(self, size_bytes):
+            self.current_allocated -= size_bytes
+
+    memory = MemoryResource(current_allocated=10)
+
+    class Table:
+        def __init__(self, rows, size_bytes, *, owns_allocation=False):
+            self.rows = rows
+            self.size_bytes = size_bytes
+            self.owns_allocation = owns_allocation
+            if owns_allocation:
+                memory.allocate(size_bytes)
+
+        def num_rows(self):
+            return self.rows
+
+        def __del__(self):
+            if self.owns_allocation:
+                self.owns_allocation = False
+                memory.free(self.size_bytes)
+
+    cp = types.ModuleType("cupy")
+    cp.cuda = types.SimpleNamespace(
+        runtime=types.SimpleNamespace(deviceSynchronize=lambda: None)
+    )
+    monkeypatch.setitem(sys.modules, "cupy", cp)
+    plc = types.ModuleType("pylibcudf")
+    concat_sizes = []
+
+    def bounded_concat(tables):
+        size_bytes = sum(table.size_bytes for table in tables)
+        if memory.current_allocated + size_bytes > 100:
+            raise AssertionError("concatenate exceeded the RMM pool")
+        concat_sizes.append(size_bytes)
+        return Table(
+            sum(table.rows for table in tables),
+            size_bytes,
+            owns_allocation=True,
+        )
+
+    plc.concatenate = types.SimpleNamespace(concatenate=bounded_concat)
+    monkeypatch.setitem(sys.modules, "pylibcudf", plc)
+
+    backend = object.__new__(gpu_backend_class)
+    backend._config = GPUSortConfig(final_sort_workspace_factor=3.0)
+    backend._pool_max_bytes = 100
+    backend._mr = memory
+    backend._payload_limit_bytes = 50
+    backend._device_tables = {
+        0: [Table(10, 10, owns_allocation=True) for _ in range(5)]
+    }
+    backend._device_bytes = {0: 50}
+    backend._runs = {0: []}
+    backend._started_at = 0.0
+    backend._stats = {
+        "state": "DEVICE_ACCUMULATING",
+        "mode": "resident",
+        "first_externalize_s": None,
+        "first_externalize_wave": None,
+        "peak_device_bytes": 0,
+        "phases_s": {"run_sort": 0.0},
+    }
+    backend._slice_table = lambda table, start, end: (
+        table
+        if start == 0 and end == table.rows
+        else Table(
+            end - start,
+            table.size_bytes * (end - start) // table.rows,
+        )
+    )
+    backend._table_bytes = lambda table: table.size_bytes
+    sorted_sizes = []
+
+    def sort_table(table):
+        assert (
+            memory.current_allocated + 2 * table.size_bytes
+            <= backend._pool_max_bytes
+        )
+        sorted_sizes.append(table.size_bytes)
+        return table
+
+    backend._sort_table = sort_table
+    backend._store_table_as_run = lambda table, initial: _ExternalRun()
+    backend._externalize_device_tables(0, wave_id=4)
+
+    # Concatenating all five sources would require 60 + 50 > 100 bytes.
+    # Bounded groups allocate and then release 20 and 30 source bytes.
+    assert concat_sizes == [20, 30]
+    assert sorted_sizes == [20, 30]
+    assert len(backend._runs[0]) == 2
+    assert backend._device_tables[0] == []
+    assert memory.current_allocated == 10
+    assert memory.peak == 80
 
 
 def test_gpu_sort_merge_passes_have_bounded_fan_in(gpu_backend_class):

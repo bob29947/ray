@@ -51,6 +51,11 @@ class GPUSortConfig:
     rmm_initial_fraction: float = 0.50
     rmm_max_fraction: float = 0.85
     residency_budget_bytes: Optional[int] = None
+    # Fraction of the smallest actor-reported usable memory budget assigned to
+    # one automatic source wave.  This is deliberately internal: callers that
+    # need an exact capacity experiment should continue to use the explicit
+    # residency budget.
+    auto_wave_fraction: float = 0.50
     exchange_batch_bytes: int = 512 << 20
     merge_fan_in: int = 4
     run_chunk_bytes: int = 512 << 20
@@ -77,6 +82,8 @@ class GPUSortConfig:
             raise ValueError(
                 "GPU sort requires 0 < rmm_initial_fraction <= " "rmm_max_fraction < 1."
             )
+        if not 0 < self.auto_wave_fraction <= 1:
+            raise ValueError("GPU sort automatic wave fraction must be in (0, 1].")
         if self.exchange_batch_bytes <= 0 or self.run_chunk_bytes <= 0:
             raise ValueError("GPU sort batch and run sizes must be positive.")
         if self.merge_fan_in < 2:
