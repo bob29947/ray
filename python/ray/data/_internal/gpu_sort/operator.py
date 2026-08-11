@@ -420,6 +420,13 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._run_started_at: Optional[float] = None
         self._controller_phases: Dict[str, float] = {}
         self._sample_manifests: List[Dict[str, Any]] = []
+        self._sample_rows = 0
+        self._sample_bytes = 0
+        self._sampling_subphases = {
+            "cpu_sample_construction": 0.0,
+            "boundary_sort": 0.0,
+            "orchestration_remainder": 0.0,
+        }
         self._progress = {"GPU Sample": None, "GPU Sort/Merge": None}
 
     def start(self, options: ExecutionOptions) -> None:
@@ -492,6 +499,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         target = self._config["sample_size"]
         per_rank = max(1, math.ceil(target / self._rank_pool.nranks))
         seed = self._config["sample_seed"]
+        construction_started = time.perf_counter()
         refs = [
             actor.sample_blocks.remote(
                 [block.value for block in blocks], per_rank, seed + rank
@@ -501,6 +509,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             )
         ]
         manifests = ray.get(refs, timeout=self._config["setup_timeout_s"])
+        self._sampling_subphases["cpu_sample_construction"] = (
+            time.perf_counter() - construction_started
+        )
         self._sample_manifests = [dict(item) for item in manifests]
         schema = self._input_schema or next(
             (
@@ -522,6 +533,11 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         result = ray.get(
             self._rank_pool.actors[0].compute_boundaries.remote(samples, schema),
             timeout=self._config["setup_timeout_s"],
+        )
+        self._sample_rows = int(result.get("sample_rows", 0) or 0)
+        self._sample_bytes = int(result.get("sample_bytes", 0) or 0)
+        self._sampling_subphases["boundary_sort"] = float(
+            result.get("boundary_sort_s", 0.0) or 0.0
         )
         return schema, result["boundaries"]
 
@@ -564,6 +580,12 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             started = time.perf_counter()
             schema, boundaries = self._sample()
             self._controller_phases["sampling"] = time.perf_counter() - started
+            self._sampling_subphases["orchestration_remainder"] = max(
+                0.0,
+                self._controller_phases["sampling"]
+                - self._sampling_subphases["cpu_sample_construction"]
+                - self._sampling_subphases["boundary_sort"],
+            )
 
             started = time.perf_counter()
             ray.get(
@@ -702,6 +724,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "merge_pass_count",
                 "replacement_run_count",
                 "h2d_bytes",
+                "planning_h2d_bytes",
                 "d2h_bytes",
                 "plasma_read_bytes",
                 "plasma_write_bytes",
@@ -755,6 +778,11 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         ]
         LAST_RUN_STATS = {
             "mode": "external" if externalized_bytes else "resident",
+            "sampling_mode": "cpu_sampled_arrow",
+            "sample_rows": self._sample_rows,
+            "sample_bytes": self._sample_bytes,
+            "planning_h2d_bytes": total("planning_h2d_bytes"),
+            "sampling_subphases_s": dict(self._sampling_subphases),
             "memory_budget_bytes": max(budgets, default=0) or configured_budget,
             "peak_device_bytes": max(
                 (int(item["peak_device_bytes"]) for item in ranks), default=0

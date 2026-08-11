@@ -24,6 +24,19 @@ The stages can also be run separately:
 .venv/bin/python -m release.benchmarks.ray_data_gpu_sort.runner report
 ```
 
+To run only the CPU-sampled boundary-planning A/B, including one exact
+PyArrow/resident-GPU smoke followed by two fresh 64-GiB candidate observations:
+
+```bash
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.sampling_ab
+```
+
+This command reads the accepted PyArrow and GPU baseline artifacts from
+`.venv/gpu-sort-external-artifacts` without rerunning them. Candidate trials,
+logs, the JSON summary, and `SAMPLING_AB_REPORT.md` are isolated under
+`.venv/gpu-sort-sampling-ab-artifacts`. It runs no forced-spill, payload,
+key-count, size, cloud, or legacy-GPU observations.
+
 `smoke` compares exact schema/order/values for PyArrow, resident GPU, and a
 memory-constrained GPU run. `trends` runs the exact prior six-cell cohort with
 one CPU and two GPU observations per cell. `gpu-trends` refreshes only those

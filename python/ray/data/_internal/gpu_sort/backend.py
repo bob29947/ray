@@ -3,8 +3,8 @@
 The controller invokes one synchronized RAPIDS-MPF collective per input wave.
 Destination ranks retain received tables while they fit their residency budget.
 Crossing that watermark converts complete GPU-sorted runs to Arrow ObjectRefs;
-those immutable runs are later merged with bounded pylibcudf operations.  Host
-code owns buffers and scalar offsets only--it never orders or merges rows.
+those immutable runs are later merged with bounded pylibcudf operations. The
+CPU orders only the bounded planning sample, never dataset rows or runs.
 """
 
 from __future__ import annotations
@@ -77,6 +77,118 @@ def _scale_sample_weights(weights: Any, population_rows: int, sample_rows: int) 
     if remainder:
         scaled = scaled + (weights * remainder) // sample_rows
     return scaled.astype("uint64")
+
+
+def _sampled_arrow_row_weights(sampled: Any) -> Any:
+    """Return decoded row weights for an already sampled Arrow table.
+
+    Sampling before calling this helper is important: variable-width lengths
+    are evaluated for only the control-plane rows, never for the full input.
+    The accounting intentionally matches the GPU planner it replaces.
+    """
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    if not isinstance(sampled, pa.Table):
+        raise TypeError("GPU sort sampling requires a PyArrow table.")
+    fixed = 0
+    variable: List[tuple[str, int]] = []
+    for field in sampled.schema:
+        typ = field.type
+        if pa.types.is_string(typ) or pa.types.is_binary(typ):
+            variable.append((field.name, 4))
+        elif pa.types.is_large_string(typ) or pa.types.is_large_binary(typ):
+            variable.append((field.name, 8))
+        elif pa.types.is_boolean(typ):
+            fixed += 1
+        elif pa.types.is_fixed_size_binary(typ):
+            fixed += int(typ.byte_width)
+        elif hasattr(typ, "bit_width"):
+            fixed += max(1, int(typ.bit_width) // 8)
+        else:
+            fixed += 8
+        if field.nullable:
+            fixed += 1
+
+    weights = np.full(sampled.num_rows, max(1, fixed), dtype=np.uint64)
+    for name, offset_width in variable:
+        lengths = pc.fill_null(pc.binary_length(sampled[name]), 0).to_numpy(
+            zero_copy_only=False
+        )
+        weights += lengths.astype(np.uint64, copy=False) + offset_width
+    return weights
+
+
+def _cpu_sample_boundaries(
+    samples: List[Any],
+    *,
+    schema: Any,
+    key_columns: List[str],
+    ascending: List[bool],
+    num_partitions: int,
+    null_position: str,
+    weight_name: str,
+) -> Dict[str, Any]:
+    """Sort the small weighted planning sample and choose ordered ranges."""
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    key_schema = pa.schema([schema.field(name) for name in key_columns])
+    if not samples:
+        return {
+            "boundaries": key_schema.empty_table(),
+            "sample_rows": 0,
+            "sample_bytes": 0,
+            "boundary_sort_s": 0.0,
+            "boundary_select_s": 0.0,
+        }
+
+    sort_started = time.perf_counter()
+    arrow = pa.concat_tables(samples)
+    indices = pc.sort_indices(
+        arrow,
+        sort_keys=[
+            (name, "ascending" if direction else "descending")
+            for name, direction in zip(key_columns, ascending)
+        ],
+        null_placement="at_start" if null_position == "first" else "at_end",
+    )
+    sorted_arrow = arrow.take(indices)
+    select_started = time.perf_counter()
+    rows = int(sorted_arrow.num_rows)
+    if num_partitions == 1 or rows == 0:
+        boundaries = key_schema.empty_table()
+    else:
+        weights = (
+            sorted_arrow[weight_name]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.uint64, copy=False)
+        )
+        cumulative = np.cumsum(weights, dtype=np.uint64)
+        total_weight = int(cumulative[-1])
+        targets = np.asarray(
+            [
+                max(0, int(total_weight * part / num_partitions) - 1)
+                for part in range(1, num_partitions)
+            ],
+            dtype=np.uint64,
+        )
+        positions = np.searchsorted(cumulative, targets, side="left")
+        boundaries = sorted_arrow.select(key_columns).take(pa.array(positions))
+    boundary_select_s = time.perf_counter() - select_started
+    boundary_sort_s = time.perf_counter() - sort_started
+    return {
+        "boundaries": boundaries,
+        "sample_rows": int(arrow.num_rows),
+        "sample_bytes": int(arrow.nbytes),
+        "boundary_sort_s": boundary_sort_s,
+        "boundary_select_s": boundary_select_s,
+    }
 
 
 def _sum_spill_bytes(value: Any, path: str = "") -> int:
@@ -205,6 +317,7 @@ def lazy_load_backend() -> type[Any]:
                 "merge_pass_count": 0,
                 "replacement_run_count": 0,
                 "h2d_bytes": 0,
+                "planning_h2d_bytes": 0,
                 "d2h_bytes": 0,
                 "plasma_read_bytes": 0,
                 "plasma_write_bytes": 0,
@@ -415,47 +528,10 @@ def lazy_load_backend() -> type[Any]:
 
         # -- bounded GPU sampling and boundary selection -----------------
 
-        def _row_weights(self, frame: Any):
-            import cupy as cp
-            import cudf
-            import pyarrow as pa
-
-            rows = len(frame)
-            fixed = 0
-            variable: List[tuple[str, int]] = []
-            for field in self._arrow_schema:
-                typ = field.type
-                if pa.types.is_string(typ) or pa.types.is_binary(typ):
-                    variable.append((field.name, 4))
-                elif pa.types.is_large_string(typ) or pa.types.is_large_binary(typ):
-                    variable.append((field.name, 8))
-                elif pa.types.is_boolean(typ):
-                    fixed += 1
-                elif pa.types.is_fixed_size_binary(typ):
-                    fixed += int(typ.byte_width)
-                elif hasattr(typ, "bit_width"):
-                    fixed += max(1, int(typ.bit_width) // 8)
-                else:
-                    # The public validator rejects nested data; this fallback
-                    # only affects weighting of an otherwise cuDF-compatible
-                    # scalar extension.
-                    fixed += 8
-                if field.nullable:
-                    fixed += 1
-            values = cp.full(rows, max(1, fixed), dtype=cp.uint64)
-            weights = cudf.Series(values)
-            for name, offset_width in variable:
-                weights = weights + (
-                    frame[name].str.byte_count().fillna(0).astype("uint64")
-                    + offset_width
-                )
-            return weights
-
         def sample_blocks(
             self, blocks: List[Any], *, target_rows: int, seed: int
         ) -> Dict[str, Any]:
-            import cupy as cp
-            import cudf
+            import numpy as np
             import pyarrow as pa
 
             started = time.perf_counter()
@@ -471,31 +547,30 @@ def lazy_load_backend() -> type[Any]:
                 total_bytes += int(arrow.nbytes)
                 if rows == 0:
                     continue
-                frame = cudf.DataFrame.from_arrow(arrow)
-                self._stats["h2d_bytes"] += int(arrow.nbytes)
                 take = min(rows, per_block)
                 stride = max(1, rows // max(1, take))
                 offset = int((seed + block_index * 0x9E3779B1) % stride)
-                indices = (offset + cp.arange(take, dtype=cp.int64) * stride) % rows
-                weights = self._row_weights(frame)
-                selected = frame[self._key_columns].iloc[indices].reset_index(drop=True)
-                sampled_weights = weights.iloc[indices].reset_index(drop=True)
-                selected[self._weight_name] = _scale_sample_weights(
-                    sampled_weights,
-                    rows,
-                    take,
+                indices = pa.array(
+                    offset + np.arange(take, dtype=np.int64) * stride,
+                    type=pa.int64(),
+                )
+                sampled = arrow.take(indices)
+                weights = _scale_sample_weights(
+                    _sampled_arrow_row_weights(sampled), rows, take
+                )
+                selected = sampled.select(self._key_columns).append_column(
+                    self._weight_name, pa.array(weights, type=pa.uint64())
                 )
                 sample_schema = pa.schema(
                     [self._arrow_schema.field(name) for name in self._key_columns]
                     + [pa.field(self._weight_name, pa.uint64(), nullable=False)]
                 )
-                samples.append(self._frame_to_arrow(selected, sample_schema))
-                del selected, sampled_weights, weights, frame
-            cp.cuda.runtime.deviceSynchronize()
+                samples.append(selected.cast(sample_schema))
             sample = pa.concat_tables(samples) if samples else None
             self._stats["input_rows"] = total_rows
             self._stats["input_bytes"] = total_bytes
-            self._stats["phases_s"]["sampling"] += time.perf_counter() - started
+            elapsed = time.perf_counter() - started
+            self._stats["phases_s"]["sampling"] += elapsed
             self._update_peak()
             return {
                 "rank": self.rank(),
@@ -504,68 +579,29 @@ def lazy_load_backend() -> type[Any]:
                 "rows": total_rows,
                 "input_bytes": total_bytes,
                 "sample_rows": 0 if sample is None else int(sample.num_rows),
+                "sample_bytes": 0 if sample is None else int(sample.nbytes),
+                "cpu_sample_construction_s": elapsed,
+                "planning_h2d_bytes": 0,
             }
 
         def compute_boundaries(self, samples: List[Any], schema: Any) -> Dict[str, Any]:
-            import cupy as cp
-            import cudf
-            import pyarrow as pa
-            import pylibcudf as plc
-            from rapidsmpf.utils.cudf import (
-                cudf_to_pylibcudf_table,
-                pylibcudf_to_cudf_dataframe,
-            )
-
             started = time.perf_counter()
             self._set_schema(schema)
-            key_schema = pa.schema(
-                [self._arrow_schema.field(name) for name in self._key_columns]
+            result = _cpu_sample_boundaries(
+                samples,
+                schema=self._arrow_schema,
+                key_columns=self._key_columns,
+                ascending=self._ascending,
+                num_partitions=self._num_partitions,
+                null_position=self._config.null_position,
+                weight_name=self._weight_name,
             )
-            if not samples:
-                return {
-                    "rank": self.rank(),
-                    "boundaries": key_schema.empty_table(),
-                    "sample_rows": 0,
-                }
-            arrow = pa.concat_tables(samples)
-            frame = cudf.DataFrame.from_arrow(arrow)
-            base_names = list(frame.columns)
-            table = cudf_to_pylibcudf_table(frame)
-            table, names = self._augment_table(table, base_names)
-            keys = self._comparison_table(table, names)
-            order, nulls = self._order_and_nulls()
-            sorted_table = plc.sorting.sort_by_key(table, keys, order, nulls)
-            sorted_frame = pylibcudf_to_cudf_dataframe(sorted_table, names)
-            rows = len(sorted_frame)
-            if self._num_partitions == 1 or rows == 0:
-                boundary_frame = sorted_frame[self._key_columns].head(0)
-            else:
-                cumulative = sorted_frame[self._weight_name].cumsum()
-                total_weight = int(cumulative.iloc[-1])
-                targets = cp.asarray(
-                    [
-                        max(0, int(total_weight * part / self._num_partitions) - 1)
-                        for part in range(1, self._num_partitions)
-                    ],
-                    dtype=cp.uint64,
-                )
-                positions = cp.searchsorted(
-                    cumulative.values, targets, side="left"
-                ).astype(cp.int64)
-                boundary_frame = (
-                    sorted_frame[self._key_columns]
-                    .iloc[positions]
-                    .reset_index(drop=True)
-                )
-            boundaries = self._frame_to_arrow(boundary_frame, key_schema)
-            cp.cuda.runtime.deviceSynchronize()
-            self._stats["h2d_bytes"] += int(arrow.nbytes)
             self._stats["phases_s"]["sampling"] += time.perf_counter() - started
             self._update_peak()
             return {
                 "rank": self.rank(),
-                "boundaries": boundaries,
-                "sample_rows": int(arrow.num_rows),
+                **result,
+                "planning_h2d_bytes": 0,
             }
 
         def install_plan(self, schema: Any, boundaries: Any) -> Dict[str, Any]:
@@ -573,7 +609,10 @@ def lazy_load_backend() -> type[Any]:
             from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
 
             self._set_schema(schema)
+            boundary_bytes = int(boundaries.nbytes)
             boundary_frame = cudf.DataFrame.from_arrow(boundaries)
+            self._stats["h2d_bytes"] += boundary_bytes
+            self._stats["planning_h2d_bytes"] += boundary_bytes
             boundary_table = cudf_to_pylibcudf_table(boundary_frame)
             boundary_table, names = self._augment_table(
                 boundary_table, list(boundary_frame.columns)

@@ -10,6 +10,8 @@ import pytest
 import ray
 from ray.data._internal.gpu_sort.backend import (
     _ExternalRun,
+    _cpu_sample_boundaries,
+    _sampled_arrow_row_weights,
     _scale_sample_weights,
     _workspace_bounded_payload_bytes,
     lazy_load_backend,
@@ -175,6 +177,77 @@ def test_gpu_sort_inverse_inclusion_sample_weights():
         np.asarray([5, 7], dtype=np.uint64), population_rows=5, sample_rows=2
     )
     assert uneven.tolist() == [12, 17]
+
+
+def test_gpu_sort_cpu_sampled_weights_and_boundaries():
+    payload_schema = pa.schema(
+        [
+            pa.field("fixed", pa.int32(), nullable=False),
+            pa.field("category", pa.string()),
+            pa.field("score", pa.float64()),
+        ]
+    )
+    payload = pa.Table.from_arrays(
+        [
+            pa.array([1, 2, 3], type=pa.int32()),
+            pa.array(["xy", "x" * 1_000, None], type=pa.string()),
+            pa.array([float("nan"), 1.0, None], type=pa.float64()),
+        ],
+        schema=payload_schema,
+    )
+
+    # Row selection precedes byte accounting, so the large unsampled string is
+    # never included in the variable-width calculation.
+    sampled = payload.take(pa.array([0, 2], type=pa.int64()))
+    weights = _sampled_arrow_row_weights(sampled)
+    assert weights.dtype == np.dtype("uint64")
+    assert weights.tolist() == [20, 18]
+
+    weight_name = "__sample_weight"
+    planning_schema = pa.schema(
+        [
+            pa.field("category", pa.string()),
+            pa.field("fixed", pa.int64(), nullable=False),
+            pa.field("score", pa.float64()),
+            pa.field(weight_name, pa.uint64(), nullable=False),
+        ]
+    )
+    planning_sample = pa.Table.from_arrays(
+        [
+            pa.array(["b", "a", "a", "a", "a", "b", None]),
+            pa.array([1, 2, 3, 3, 3, 1, 9], type=pa.int64()),
+            pa.array(
+                [float("nan"), None, 2.0, -1.0, -1.0, 5.0, 0.0],
+                type=pa.float64(),
+            ),
+            pa.array([10] * 7, type=pa.uint64()),
+        ],
+        schema=planning_schema,
+    )
+    result = _cpu_sample_boundaries(
+        [planning_sample.slice(0, 3), planning_sample.slice(3)],
+        schema=planning_schema,
+        key_columns=["category", "fixed", "score"],
+        ascending=[True, False, True],
+        num_partitions=7,
+        null_position="last",
+        weight_name=weight_name,
+    )
+
+    boundaries = result["boundaries"].to_pylist()
+    assert boundaries[:4] == [
+        {"category": "a", "fixed": 3, "score": -1.0},
+        {"category": "a", "fixed": 3, "score": -1.0},
+        {"category": "a", "fixed": 3, "score": 2.0},
+        {"category": "a", "fixed": 2, "score": None},
+    ]
+    assert boundaries[4] == {"category": "b", "fixed": 1, "score": 5.0}
+    assert boundaries[5]["category"] == "b"
+    assert boundaries[5]["fixed"] == 1
+    assert math.isnan(boundaries[5]["score"])
+    assert boundaries[0] == boundaries[1]
+    assert result["sample_rows"] == 7
+    assert result["sample_bytes"] > 0
 
 
 def test_gpu_sort_comparator_matches_arrow_null_nan_order(
