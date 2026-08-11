@@ -297,6 +297,7 @@ def _trend_rows(
                 if new_median is None or not old_gpu
                 else 100 * (new_median - old_gpu) / old_gpu,
                 "archived_cpu_s": cpu,
+                "archived_cpu_classification": old[cell].get("cpu_classification"),
                 "directional_cpu_gpu_speedup": None
                 if new_median is None or not cpu
                 else cpu / new_median,
@@ -340,6 +341,15 @@ def _natural_rows(
         old_gpu = _number(old[scale].get("gpu_observed_median_s"))
         cpu = _number(old[scale].get("cpu_s"))
         io = [_io_metrics(value) for value in values]
+        archived_cpu_io = old[scale].get("cpu_io") or {}
+        median_ray_write_gib = median(
+            [float(item["ray_write_gib"] or 0) for item in io]
+        )
+        median_ray_restore_gib = median(
+            [float(item["ray_restore_gib"] or 0) for item in io]
+        )
+        archived_cpu_ray_write_gib = _number(archived_cpu_io.get("ray_write_gib"))
+        archived_cpu_ray_restore_gib = _number(archived_cpu_io.get("ray_restore_gib"))
         rows.append(
             {
                 "scale": scale,
@@ -357,14 +367,19 @@ def _natural_rows(
                 if new_median is None or not cpu
                 else cpu / new_median,
                 "archived_cpu_classification": old[scale].get("cpu_classification"),
-                "archived_cpu_io": old[scale].get("cpu_io"),
+                "archived_cpu_io": archived_cpu_io,
                 "io": io,
                 "median_externalized_gib": median(
                     [float(item["externalized_gib"] or 0) for item in io]
                 ),
-                "median_ray_write_gib": median(
-                    [float(item["ray_write_gib"] or 0) for item in io]
-                ),
+                "median_ray_write_gib": median_ray_write_gib,
+                "median_ray_restore_gib": median_ray_restore_gib,
+                "gpu_cpu_ray_write_ratio": None
+                if not archived_cpu_ray_write_gib
+                else median_ray_write_gib / archived_cpu_ray_write_gib,
+                "gpu_cpu_ray_restore_ratio": None
+                if not archived_cpu_ray_restore_gib
+                else median_ray_restore_gib / archived_cpu_ray_restore_gib,
                 "repeat_digests": _repeat_digests(values),
                 "phase_medians_s": _phase_medians(values),
                 "observations": values,
@@ -526,6 +541,16 @@ def build(
     def fmt(value: Any, digits: int = 2) -> str:
         return "n/a" if value is None else f"{float(value):.{digits}f}"
 
+    warnings = [
+        f"{row['cell']} r{index}"
+        for row in trend
+        for index, observation in enumerate(row["observations"], start=1)
+        if _classification(observation) == "telemetry-warning"
+    ]
+    archived_cpu_statuses = ", ".join(
+        f"{row['cell']}={row['archived_cpu_classification']}" for row in trend
+    )
+
     lines = [
         f"# BTS AWS GPU Sort — {plan['campaign']}",
         "",
@@ -538,6 +563,8 @@ def build(
         f"- CPU sort/merge, output fallback, and MPF host spill are all zero: `{all(zero_gates.values())}`.",
         f"- Selected automatic wave fraction `{selected}`: {provenance['selection'].get('reason')}.",
         f"- Overall acceptance: `{acceptance['all_gates_passed']}`. Location metadata gaps are usable only when they are the sole warning and the completed result passes exact validation.",
+        f"- Retained metadata-warning GPU observations: `{', '.join(warnings) if warnings else 'none'}`. These timings passed placement-plan, zero-pre-timer-spill, row/schema/order/checksum, and output-residency checks; only the experimental input ObjectRef-location lookup was incomplete.",
+        "- Performance-cell checksum means the deterministic `row_id` sum. Exact every-column/every-value equality was checked in the 160k-row smoke, not repeated for each large cell.",
         "",
         "## Payload, datatype, and key trends",
         "",
@@ -556,6 +583,7 @@ def build(
             f"- GPU payload cost: core/narrow `{fmt(directional['payload_narrow_to_core'])}×`; full/core `{fmt(directional['payload_core_to_full'])}×`.",
             f"- Full-payload Origin string/integer GPU ratio: `{fmt(directional['origin_string_over_integer'])}×`.",
             f"- Key-count GPU ratios versus one Origin key: route `{fmt(directional['route_over_one_key'])}×`; four keys `{fmt(directional['four_keys_over_one_key'])}×`.",
+            f"- Archived CPU classifications: {archived_cpu_statuses}. These remain directional cross-campaign denominators; metadata warnings are not fresh paired measurements.",
             "",
             "## Fixed-stride versus stratified planning",
             "",
@@ -581,7 +609,9 @@ def build(
     lines.extend(
         [
             "",
-            "Sampling quality is assessed with repeatable plan/index/boundary digests and observed output-range balance. The focused pre-AWS periodic-input test covers the aliasing pattern that fixed strides can miss.",
+            "The identical plan/index/boundary digests prove reproducibility, not sampling quality. Robustness comes from selecting one seeded pseudorandom row per stratum; the focused periodic-input test demonstrates the aliasing pattern that fixed strides can miss. On BTS, output balance was comparable rather than uniformly better (the single-key cells changed from about 2.04× to 2.10×).",
+            "",
+            "The AWS implementation change also includes the previously accepted sample-first CPU planner. The H2D and timing gains should be attributed primarily to avoiding a full GPU planning pass, not to randomization alone: on DGX, stratification was 0.7% slower than the 48.801-second CPU-sampled fixed-stride baseline (49.136 seconds), while passing the gate.",
             "",
             "## Natural spill trend",
             "",
@@ -601,6 +631,12 @@ def build(
         )
     lines.extend(
         [
+            "",
+            f"At 2×, GPU Ray spill wrote `{fmt(natural[1]['median_ray_write_gib'])}` GiB versus archived CPU `{fmt(natural[1]['archived_cpu_io'].get('ray_write_gib'))}` GiB (`{fmt(natural[1]['gpu_cpu_ray_write_ratio'])}×` as much), and restored `{fmt(natural[1]['median_ray_restore_gib'])}` versus `{fmt(natural[1]['archived_cpu_io'].get('ray_restore_gib'))}` GiB (`{fmt(natural[1]['gpu_cpu_ray_restore_ratio'], 1)}×`). GPU still finished `{fmt(natural[1]['directional_cpu_gpu_speedup'])}×` faster, so additional object-store churn did not erase the compute advantage.",
+            "",
+            "`VRAM externalized` is cumulative sorted-run output, not simultaneous excess VRAM or final disk footprint. Every row was externalized once at 2× and 2.45×; Ray NVMe writes are cumulative object-store writes and therefore include amplification.",
+            "",
+            "The phase maps are inner component timings and are not an additive reconstruction of cold wall time; the measured cold time is authoritative and includes the remaining outer scheduling/orchestration gap.",
             "",
             "No CPU speedup is claimed at 2.45× because the archived default-Ray CPU observation did not complete. The companion JSON retains every raw GPU observation, sampling digest and subphase, full phase map, run geometry, per-rank memory/locality/output balance, per-node NVML/network data, and Ray spill counters.",
         ]
