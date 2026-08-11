@@ -37,6 +37,20 @@ logs, the JSON summary, and `SAMPLING_AB_REPORT.md` are isolated under
 `.venv/gpu-sort-sampling-ab-artifacts`. It runs no forced-spill, payload,
 key-count, size, cloud, or legacy-GPU observations.
 
+After changing the production sampler to deterministic stratified-random
+selection, run its focused pre-AWS gate with:
+
+```bash
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.stratified_gate
+```
+
+It runs one exact PyArrow/GPU smoke and exactly two fresh-runtime full 64-GiB
+GPU observations. It compares against the accepted 48.801-second CPU-sampled
+median, requires identical sample-plan, sample-index, and boundary digests,
+and writes isolated untracked results under
+`.venv/gpu-sort-stratified-gate-artifacts`. Run the lightweight harness checks
+without launching Ray or using a GPU with `--self-check`.
+
 `smoke` compares exact schema/order/values for PyArrow, resident GPU, and a
 memory-constrained GPU run. `trends` runs the exact prior six-cell cohort with
 one CPU and two GPU observations per cell. `gpu-trends` refreshes only those

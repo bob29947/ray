@@ -22,11 +22,13 @@ from .render import (
 from .spec import CPUS, NODES, Trial, trials
 
 FULL_TRIAL_MODE = "full"
+GPU_ONLY_TRIAL_MODE = "gpu-only"
 GPU_REPAIR_TRIAL_MODE = "gpu-repair"
 GPU_245X_REPAIR_TRIAL_MODE = "gpu-245x-repair"
 CPU_REPAIR_TRIAL_MODE = "cpu-repair"
 TRIAL_MODES = (
     FULL_TRIAL_MODE,
+    GPU_ONLY_TRIAL_MODE,
     GPU_REPAIR_TRIAL_MODE,
     GPU_245X_REPAIR_TRIAL_MODE,
     CPU_REPAIR_TRIAL_MODE,
@@ -219,7 +221,9 @@ def _validate_prior_cpu_teardown(
 
 
 def _trial_values(arm: str, trial_mode: str) -> tuple[Trial, ...]:
-    if trial_mode == FULL_TRIAL_MODE:
+    if trial_mode in (FULL_TRIAL_MODE, GPU_ONLY_TRIAL_MODE):
+        if trial_mode == GPU_ONLY_TRIAL_MODE and arm != "gpu":
+            raise ValueError(f"{trial_mode} trial mode has no {arm.upper()} arm")
         return trials(arm)
     if trial_mode == GPU_245X_REPAIR_TRIAL_MODE:
         if arm != "gpu":
@@ -494,7 +498,7 @@ def prepare(
                 "--prior-gpu-teardown is only valid with --trial-mode gpu-repair"
             )
         prior_cpu = _validate_prior_cpu_teardown(prior_cpu_teardown)
-    elif trial_mode == FULL_TRIAL_MODE:
+    elif trial_mode in (FULL_TRIAL_MODE, GPU_ONLY_TRIAL_MODE):
         if prior_gpu_teardown is not None or prior_cpu_teardown is not None:
             raise ValueError(
                 "prior teardown flags are only valid with a matching repair mode"
@@ -507,7 +511,11 @@ def prepare(
         root=root, output=bundle_root, dataset_manifest=dataset_manifest
     )
     arms: dict[str, Any] = {}
-    if trial_mode in (GPU_REPAIR_TRIAL_MODE, GPU_245X_REPAIR_TRIAL_MODE):
+    if trial_mode in (
+        GPU_ONLY_TRIAL_MODE,
+        GPU_REPAIR_TRIAL_MODE,
+        GPU_245X_REPAIR_TRIAL_MODE,
+    ):
         arm_names = ("gpu",)
     elif trial_mode == CPU_REPAIR_TRIAL_MODE:
         arm_names = ("cpu",)
@@ -607,7 +615,9 @@ def prepare(
         "campaign": campaign,
         "trial_mode": trial_mode,
         "execution_order": (
-            ["verified_prior_gpu_teardown", trial_mode, "verified_teardown"]
+            ["gpu", "verified_teardown"]
+            if trial_mode == GPU_ONLY_TRIAL_MODE
+            else ["verified_prior_gpu_teardown", trial_mode, "verified_teardown"]
             if trial_mode in (GPU_REPAIR_TRIAL_MODE, GPU_245X_REPAIR_TRIAL_MODE)
             else ["verified_prior_cpu_teardown", "cpu-repair", "verified_teardown"]
             if trial_mode == CPU_REPAIR_TRIAL_MODE
@@ -618,6 +628,7 @@ def prepare(
         "fresh_ray_runtime_per_trial": True,
         "retained_ec2_fleet_per_arm": True,
         "ray_default_plasma_both_arms": True,
+        "archived_cpu_comparison_only": trial_mode == GPU_ONLY_TRIAL_MODE,
         "dataset_digest": manifest["dataset_digest"],
         "dataset_manifest_sha256": file_sha256(dataset_manifest),
         "bundle": bundle,

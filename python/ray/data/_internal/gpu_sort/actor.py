@@ -88,10 +88,17 @@ class GPUSortActor:
         return self._backend.is_ready()
 
     def sample_blocks(
-        self, blocks: List[Any], target_rows: int, seed: int
+        self,
+        blocks: List[Any],
+        block_ordinals: List[int],
+        sample_quotas: List[int],
+        seed: int,
     ) -> Dict[str, Any]:
         return self._backend.sample_blocks(
-            _resolve_blocks(blocks), target_rows=target_rows, seed=seed
+            _resolve_blocks(blocks),
+            block_ordinals=block_ordinals,
+            sample_quotas=sample_quotas,
+            seed=seed,
         )
 
     def compute_boundaries(self, samples: List[Any], schema: Any) -> Dict[str, Any]:

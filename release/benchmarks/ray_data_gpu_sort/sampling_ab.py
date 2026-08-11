@@ -146,6 +146,7 @@ def _semantic_table(path: Path) -> Any:
 
 def _resident_reasons(trial: dict[str, Any]) -> list[str]:
     stats = trial.get("gpu_stats", {})
+    ranks = rank_stats(stats)
     reasons = []
     checks = {
         "GPU externalization": int(value(stats, "externalized_bytes", default=-1)),
@@ -155,9 +156,17 @@ def _resident_reasons(trial: dict[str, Any]) -> list[str]:
         "CPU merge rows": int(value(stats, "cpu_merge_rows", default=-1)),
         "fallback count": int(value(stats, "fallback_count", default=-1)),
     }
-    reasons.extend(f"{name} was {amount}, expected zero" for name, amount in checks.items() if amount)
-    if len(rank_stats(stats)) != 16:
-        reasons.append(f"GPU rank count was {len(rank_stats(stats))}, expected 16")
+    reasons.extend(
+        f"{name} was {amount}, expected zero"
+        for name, amount in checks.items()
+        if amount
+    )
+    if len(ranks) != 16:
+        reasons.append(f"GPU rank count was {len(ranks)}, expected 16")
+    if len(ranks) == 16 and any(
+        int(item.get("output_bytes", 0)) <= 0 for item in ranks
+    ):
+        reasons.append("one or more GPU ranks produced an empty output partition")
     locations = trial.get("output", {}).get("locations", {})
     if not locations.get("all_locatable"):
         reasons.append("not every output ObjectRef is Ray-locatable")
@@ -244,11 +253,8 @@ def _nvml_summary(trial: dict[str, Any]) -> dict[str, int]:
 
 def _observation(trial: dict[str, Any]) -> dict[str, Any]:
     stats = trial["gpu_stats"]
-    outputs = [
-        int(item.get("output_bytes", 0))
-        for item in rank_stats(stats)
-        if int(item.get("output_bytes", 0)) > 0
-    ]
+    outputs = [int(item.get("output_bytes", 0)) for item in rank_stats(stats)]
+    balanced_outputs = len(outputs) == 16 and all(item > 0 for item in outputs)
     subphases = stats.get("sampling_subphases_s", {})
     return {
         "repetition": trial["repetition"],
@@ -270,7 +276,7 @@ def _observation(trial: dict[str, Any]) -> dict[str, Any]:
         "output_balance": {
             "minimum_bytes": min(outputs, default=0),
             "maximum_bytes": max(outputs, default=0),
-            "max_over_min": max(outputs) / min(outputs) if outputs else None,
+            "max_over_min": max(outputs) / min(outputs) if balanced_outputs else None,
         },
         "externalized_bytes": int(value(stats, "externalized_bytes", default=-1)),
         "ray_disk_spill_bytes": int(trial.get("ray_disk_spill_bytes", -1)),
@@ -309,7 +315,9 @@ def _build_report(
         for item in baseline
     )
     candidate_sampling = median(item["sampling_s"] for item in observations)
-    health_reasons = [reason for item in candidates for reason in _resident_reasons(item)]
+    health_reasons = [
+        reason for item in candidates for reason in _resident_reasons(item)
+    ]
     telemetry_reasons = []
     for item in observations:
         rep = item["repetition"]
@@ -317,7 +325,11 @@ def _build_report(
             telemetry_reasons.append(f"r{rep} sampling_mode is not {PLANNER_MODE}")
         if item["sample_rows"] < 65_536 or item["sample_bytes"] <= 0:
             telemetry_reasons.append(f"r{rep} sample row/byte telemetry is incomplete")
-        missing = [name for name in REQUIRED_SUBPHASES if name not in item["sampling_subphases_s"]]
+        missing = [
+            name
+            for name in REQUIRED_SUBPHASES
+            if name not in item["sampling_subphases_s"]
+        ]
         if missing:
             telemetry_reasons.append(f"r{rep} is missing sampling subphases: {missing}")
         if item["planning_h2d_bytes"] < 0 or item["h2d_bytes"] < 0:
@@ -349,7 +361,9 @@ def _build_report(
     summary = {
         "schema_version": 1,
         "kind": "cpu_sampled_boundary_planning_ab",
-        "status": "accepted" if not health_reasons and not telemetry_reasons else "rejected",
+        "status": "accepted"
+        if not health_reasons and not telemetry_reasons
+        else "rejected",
         "worthwhile": worthwhile,
         "workload": {
             "rows": EXPECTED_ROWS,
@@ -393,7 +407,8 @@ def _build_report(
                     for item in baseline
                 ],
                 "artifacts": [
-                    _artifact_ref(path, item) for path, item in zip(baseline_paths, baseline)
+                    _artifact_ref(path, item)
+                    for path, item in zip(baseline_paths, baseline)
                 ],
             },
         },
@@ -415,8 +430,10 @@ def _build_report(
             "seconds_saved": baseline_median - candidate_median,
             "total_time_reduction_fraction": 1 - candidate_median / baseline_median,
             "sampling_seconds_saved": baseline_sampling - candidate_sampling,
-            "baseline_speedup_vs_pyarrow": float(pyarrow["cold_sort_s"]) / baseline_median,
-            "candidate_speedup_vs_pyarrow": float(pyarrow["cold_sort_s"]) / candidate_median,
+            "baseline_speedup_vs_pyarrow": float(pyarrow["cold_sort_s"])
+            / baseline_median,
+            "candidate_speedup_vs_pyarrow": float(pyarrow["cold_sort_s"])
+            / candidate_median,
         },
         "acceptance_gates": gates,
         "rejection_reasons": health_reasons + telemetry_reasons,

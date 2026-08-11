@@ -13,14 +13,18 @@ from ray.data._internal.gpu_sort.backend import (
     _cpu_sample_boundaries,
     _sampled_arrow_row_weights,
     _scale_sample_weights,
+    _scale_sample_weights_by_stratum,
+    _stratified_sample_indices,
     _workspace_bounded_payload_bytes,
     lazy_load_backend,
 )
 from ray.data._internal.gpu_sort.config import GPUSortConfig
 from ray.data._internal.gpu_sort.operator import (
     _InputBlock,
+    _allocate_stratified_sample_quotas,
     _assign_blocks_by_locality,
     _make_waves,
+    _sampling_plan_digest,
     _validate_gpu_schema,
     _wave_target_bytes,
 )
@@ -46,6 +50,7 @@ def test_gpu_sort_api_and_logical_backend(ray_start_regular):
     gpu_ds = ds.sort("k", backend="gpu")
     gpu_sort = gpu_ds._logical_plan.dag
     assert gpu_sort.backend == "gpu"
+    assert gpu_ds._plan.require_preserve_order()
     assert (
         CombineShuffles._combine(
             gpu_ds.sort("payload", backend="gpu")._logical_plan.dag
@@ -135,24 +140,33 @@ def test_gpu_sort_automatic_wave_target_uses_smallest_actor_budget():
         [_InputBlock("a", 5 * gib, 1), _InputBlock("b", 4 * gib, 1)],
         [_InputBlock("c", 2 * gib, 1)],
     ]
-    assert _wave_target_bytes(
-        large,
-        explicit_residency_budget_bytes=None,
-        actor_usable_budgets=[20 * gib, 16 * gib],
-        auto_wave_fraction=0.50,
-    ) == 8 * gib
-    assert _wave_target_bytes(
-        large,
-        explicit_residency_budget_bytes=None,
-        actor_usable_budgets=[20 * gib, 16 * gib],
-        auto_wave_fraction=0.375,
-    ) == 6 * gib
-    assert _wave_target_bytes(
-        large,
-        explicit_residency_budget_bytes=4 * gib,
-        actor_usable_budgets=[],
-        auto_wave_fraction=0.50,
-    ) == 2 * gib
+    assert (
+        _wave_target_bytes(
+            large,
+            explicit_residency_budget_bytes=None,
+            actor_usable_budgets=[20 * gib, 16 * gib],
+            auto_wave_fraction=0.50,
+        )
+        == 8 * gib
+    )
+    assert (
+        _wave_target_bytes(
+            large,
+            explicit_residency_budget_bytes=None,
+            actor_usable_budgets=[20 * gib, 16 * gib],
+            auto_wave_fraction=0.375,
+        )
+        == 6 * gib
+    )
+    assert (
+        _wave_target_bytes(
+            large,
+            explicit_residency_budget_bytes=4 * gib,
+            actor_usable_budgets=[],
+            auto_wave_fraction=0.50,
+        )
+        == 2 * gib
+    )
 
     with pytest.raises(RuntimeError, match="usable memory budgets"):
         _wave_target_bytes(
@@ -163,6 +177,10 @@ def test_gpu_sort_automatic_wave_target_uses_smallest_actor_budget():
         )
     with pytest.raises(ValueError, match="wave fraction"):
         GPUSortConfig(auto_wave_fraction=0)
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        GPUSortConfig(sample_seed=-1)
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        GPUSortConfig(sample_seed=1 << 64)
 
 
 def test_gpu_sort_inverse_inclusion_sample_weights():
@@ -177,6 +195,152 @@ def test_gpu_sort_inverse_inclusion_sample_weights():
         np.asarray([5, 7], dtype=np.uint64), population_rows=5, sample_rows=2
     )
     assert uneven.tolist() == [12, 17]
+
+
+def test_gpu_sort_global_stratified_sample_allocation():
+    blocks = [
+        _InputBlock("empty", 0, 0, ordinal=0),
+        _InputBlock("tiny", 1, 1, ordinal=1),
+        _InputBlock("medium", 9, 9, ordinal=2),
+        _InputBlock("large", 20, 20, ordinal=3),
+    ]
+    quotas, target = _allocate_stratified_sample_quotas(blocks, 8)
+    assert target == sum(quotas) == 8
+    assert quotas == [0, 1, 2, 5]
+
+    # One sample per nonempty block takes precedence over a smaller configured
+    # target, including for one-row blocks.
+    tiny = [_InputBlock(str(i), 1, 1, ordinal=i) for i in range(4)]
+    assert _allocate_stratified_sample_quotas(tiny, 2) == ([1, 1, 1, 1], 4)
+
+    # Equal largest remainders are resolved by logical ordinal, not list/rank.
+    tied = [
+        _InputBlock("later", 3, 3, ordinal=5),
+        _InputBlock("earlier", 3, 3, ordinal=2),
+    ]
+    assert _allocate_stratified_sample_quotas(tied, 3) == ([1, 2], 3)
+
+
+def test_gpu_sort_deterministic_stratified_indices_and_exact_weights():
+    indices, widths = _stratified_sample_indices(10, 3, seed=7, block_ordinal=4)
+    assert indices.tolist() == [1, 5, 8]
+    assert widths.tolist() == [3, 3, 4]
+    assert 0 <= indices[0] < 3
+    assert 3 <= indices[1] < 6
+    assert 6 <= indices[2] < 10
+    assert sum(widths) == 10
+    assert _scale_sample_weights_by_stratum(
+        np.asarray([5, 7, 11], dtype=np.uint64), widths
+    ).tolist() == [15, 21, 44]
+
+    repeated, repeated_widths = _stratified_sample_indices(
+        10, 3, seed=7, block_ordinal=4
+    )
+    assert np.array_equal(indices, repeated)
+    assert np.array_equal(widths, repeated_widths)
+    changed, _ = _stratified_sample_indices(10, 3, seed=8, block_ordinal=4)
+    assert not np.array_equal(indices, changed)
+    changed_ordinal, _ = _stratified_sample_indices(10, 3, seed=7, block_ordinal=5)
+    assert not np.array_equal(indices, changed_ordinal)
+
+
+def test_gpu_sort_stratified_sampling_is_locality_invariant_and_breaks_periodicity():
+    blocks = [
+        _InputBlock("a", 40, 40, ordinal=0),
+        _InputBlock("b", 80, 80, ordinal=1),
+        _InputBlock("c", 120, 120, ordinal=2),
+    ]
+    quotas, target = _allocate_stratified_sample_quotas(blocks, 48)
+    plan_digest = _sampling_plan_digest(blocks, quotas, seed=91, target_rows=target)
+    remapped = [blocks[2], blocks[0], blocks[1]]
+    remapped_quotas = [quotas[2], quotas[0], quotas[1]]
+    assert (
+        _sampling_plan_digest(remapped, remapped_quotas, seed=91, target_rows=target)
+        == plan_digest
+    )
+    assert len(plan_digest) == 64
+
+    def coordinates(block_order, quota_order):
+        result = []
+        for block, quota in zip(block_order, quota_order):
+            selected, _ = _stratified_sample_indices(
+                block.num_rows,
+                quota,
+                seed=91,
+                block_ordinal=block.ordinal,
+            )
+            result.extend(
+                (block.ordinal, i, int(row)) for i, row in enumerate(selected)
+            )
+        return sorted(result)
+
+    assert coordinates(blocks, quotas) == coordinates(remapped, remapped_quotas)
+
+    weight_name = "__weight"
+    block_name = "__block"
+    stratum_name = "__stratum"
+    index_name = "__index"
+
+    def sample_table(block, quota):
+        selected, widths = _stratified_sample_indices(
+            block.num_rows,
+            quota,
+            seed=91,
+            block_ordinal=block.ordinal,
+        )
+        return pa.table(
+            {
+                "key": pa.array(
+                    [block.ordinal * 1_000 + int(row) for row in selected],
+                    type=pa.int64(),
+                ),
+                weight_name: pa.array(widths, type=pa.uint64()),
+                block_name: pa.array([block.ordinal] * quota, type=pa.uint64()),
+                stratum_name: pa.array(range(quota), type=pa.uint64()),
+                index_name: pa.array(selected, type=pa.uint64()),
+            }
+        )
+
+    by_ordinal = {
+        block.ordinal: sample_table(block, quota)
+        for block, quota in zip(blocks, quotas)
+    }
+    boundary_args = {
+        "schema": next(iter(by_ordinal.values())).schema,
+        "key_columns": ["key"],
+        "ascending": [True],
+        "num_partitions": 4,
+        "null_position": "last",
+        "weight_name": weight_name,
+        "sample_block_name": block_name,
+        "sample_stratum_name": stratum_name,
+        "sample_index_name": index_name,
+    }
+    original_result = _cpu_sample_boundaries(
+        [
+            pa.concat_tables([by_ordinal[0], by_ordinal[2]]),
+            by_ordinal[1],
+        ],
+        **boundary_args,
+    )
+    remapped_result = _cpu_sample_boundaries(
+        [
+            by_ordinal[2],
+            pa.concat_tables([by_ordinal[1], by_ordinal[0]]),
+        ],
+        **boundary_args,
+    )
+    assert (
+        original_result["sample_index_digest"] == remapped_result["sample_index_digest"]
+    )
+    assert original_result["boundary_digest"] == remapped_result["boundary_digest"]
+    assert original_result["sample_bytes"] > original_result["planning_sample_bytes"]
+
+    # A stride of four could lock onto one phase of this periodic input. One
+    # randomized selection in every four-row stratum represents every phase.
+    selected, widths = _stratified_sample_indices(400, 100, seed=17, block_ordinal=8)
+    assert set((selected % 4).tolist()) == {0, 1, 2, 3}
+    assert set(widths.tolist()) == {4}
 
 
 def test_gpu_sort_cpu_sampled_weights_and_boundaries():
@@ -301,9 +465,7 @@ def test_gpu_sort_comparator_matches_arrow_null_nan_order(
         ):
             backend._config = GPUSortConfig(null_position=null_position)
             direct_orders, direct_nulls = backend._order_and_nulls()
-            assert direct_orders == [
-                order.ASCENDING if ascending else order.DESCENDING
-            ]
+            assert direct_orders == [order.ASCENDING if ascending else order.DESCENDING]
             assert direct_nulls == [expected_null_order]
 
 
@@ -627,8 +789,7 @@ def test_gpu_sort_externalization_bounds_multitable_concat(
 
     def sort_table(table):
         assert (
-            memory.current_allocated + 2 * table.size_bytes
-            <= backend._pool_max_bytes
+            memory.current_allocated + 2 * table.size_bytes <= backend._pool_max_bytes
         )
         sorted_sizes.append(table.size_bytes)
         return table

@@ -57,6 +57,37 @@ arm using `STUDY/executions/cpu`. A failed 16-rank exact smoke stops the GPU arm
 before performance work. Ordinary performance failures are retained as results
 and do not prevent independent later cells.
 
+## GPU-only full campaign
+
+Use `gpu-only` to rerun the complete GPU matrix without provisioning a CPU
+fleet. It uses the same exact smoke, both 2× wave screens, selected 2× second
+observation, twelve six-cell trend observations, and two 2.45× observations as
+the full study.
+
+```bash
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.cloud.study prepare \
+  --campaign-id bts-external-YYYYMMDD-gpu-only-a \
+  --trial-mode gpu-only \
+  --local-config .venv/gpu-sort-bts-cloud-artifacts/local-config.json \
+  --dataset-manifest .venv/gpu-sort-bts-cloud-artifacts/dataset/controller-manifest.portable.json \
+  --output-root GPU_ONLY_STUDY
+
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.cloud.study execute-arm \
+  --plan GPU_ONLY_STUDY/study.json --arm gpu \
+  --artifact-root GPU_ONLY_STUDY/dry-run/gpu
+
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.cloud.study execute-arm \
+  --plan GPU_ONLY_STUDY/study.json --arm gpu \
+  --artifact-root GPU_ONLY_STUDY/executions/gpu \
+  --execute --confirm-plan-sha SHA_FROM_DRY_RUN
+```
+
+Every GPU result must prove the deterministic stratified CPU planner ran,
+including its mode/version, fixed seed, sample counts and bytes, quota summary,
+sample-plan/index/boundary digests, CPU planning subphases, and at most 1 MiB of
+planning H2D. CPU dataset sort/merge, output fallback, and MPF host spill must
+remain zero.
+
 ## GPU repair-only campaign
 
 When a production fix needs only the GPU spill-path observations repeated, use
@@ -202,3 +233,19 @@ The report refuses a repair overlay unless its study, completed lifecycle,
 dataset staging receipt, exact trial identities, Ray wheel, Ray Data overlay,
 harness hashes, input plans, cells, keys, and columns all reconcile with the
 original study and the supplied artifacts.
+
+For a `gpu-only` campaign, compare against the immutable finalized AWS report
+instead of supplying a new CPU result tree:
+
+```bash
+.venv/bin/python -m release.benchmarks.ray_data_gpu_sort.cloud.gpu_only_report \
+  --study GPU_ONLY_STUDY/study.json \
+  --gpu-results GPU_ONLY_STUDY/executions/gpu/remote-results \
+  --archived-report .venv/gpu-sort-cloud-artifacts/studies/bts-external-cloud-20260807-g/report/BTS_CLOUD_EXTERNAL_SORT_FINAL.json \
+  --output GPU_ONLY_STUDY/report/BTS_CLOUD_STRATIFIED_GPU_ONLY.md
+```
+
+The archived report is accepted only at SHA-256
+`96a08625bc6709a68e085f1c090614d18ad229635e5bfd1ba1b51412912cf534`.
+Its CPU values are labeled cross-campaign directional denominators; no 2.45×
+speedup is claimed because that archived CPU observation did not complete.

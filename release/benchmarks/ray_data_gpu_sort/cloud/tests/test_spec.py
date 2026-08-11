@@ -6,7 +6,14 @@ import pytest
 from release.benchmarks.ray_data_gpu_sort.backend_stats import required_fields_missing
 from release.benchmarks.ray_data_gpu_sort.cloud import worker as cloud_worker
 from release.benchmarks.ray_data_gpu_sort.cloud.spec import cpu_trials, gpu_trials
-from release.benchmarks.ray_data_gpu_sort.cloud.worker import _configure_gpu_sort
+from release.benchmarks.ray_data_gpu_sort.cloud.study import (
+    GPU_ONLY_TRIAL_MODE,
+    _trial_values,
+)
+from release.benchmarks.ray_data_gpu_sort.cloud.worker import (
+    _configure_gpu_sort,
+    _sampling_telemetry_reasons,
+)
 from release.benchmarks.ray_data_gpu_sort.cloud.workflow import select
 
 
@@ -18,6 +25,57 @@ def test_exact_matrix() -> None:
     assert sum(item.kind == "trend" for item in cpu) == 6
     assert sum(item.kind == "natural" for item in cpu) == 2
     assert sum(item.kind == "natural" for item in gpu) == 5
+
+
+def test_gpu_only_mode_reuses_the_exact_full_gpu_matrix() -> None:
+    assert _trial_values("gpu", GPU_ONLY_TRIAL_MODE) == gpu_trials()
+    with pytest.raises(ValueError, match="has no CPU arm"):
+        _trial_values("cpu", GPU_ONLY_TRIAL_MODE)
+
+
+def _sampling_stats() -> dict:
+    return {
+        "sampling_mode": "cpu_sampled_arrow",
+        "sampling_scheme": "deterministic_stratified_random",
+        "sampling_scheme_version": 1,
+        "sample_seed": 0,
+        "sample_target_rows": 65_536,
+        "sample_rows": 65_536,
+        "sample_bytes": 1024,
+        "planning_sample_bytes": 512,
+        "sampled_block_count": 627,
+        "sample_quota_rows": {"min": 104, "median": 105.0, "max": 105},
+        "sample_plan_digest": "a" * 64,
+        "sample_index_digest": "b" * 64,
+        "boundary_digest": "c" * 64,
+        "planning_h2d_bytes": 4096,
+        "sampling_subphases_s": {
+            "cpu_sample_construction": 0.5,
+            "boundary_sort": 0.1,
+            "orchestration_remainder": 0.05,
+        },
+    }
+
+
+def test_sampling_acceptance_proves_stratified_cpu_planner() -> None:
+    stats = _sampling_stats()
+    assert (
+        _sampling_telemetry_reasons(stats, input_rows=80_738_761, input_blocks=627)
+        == []
+    )
+
+    stats["sample_index_digest"] = "not-a-digest"
+    stats["planning_h2d_bytes"] = (1 << 20) + 1
+    reasons = _sampling_telemetry_reasons(stats)
+    assert any("sample_index_digest" in reason for reason in reasons)
+    assert any("1 MiB" in reason for reason in reasons)
+
+    stats = _sampling_stats()
+    stats["sample_rows"] -= 1
+    reasons = _sampling_telemetry_reasons(
+        stats, input_rows=80_738_761, input_blocks=627
+    )
+    assert any("target and actual" in reason for reason in reasons)
 
 
 def test_gpu_acceptance_requires_fallback_and_mpf_spill_telemetry() -> None:
@@ -49,6 +107,9 @@ def test_wave_gate(tmp_path) -> None:
     assert select(default, candidate, output)["selected_wave_fraction"] == 0.50
     candidate.write_text(json.dumps({"valid": True, "cold_sort_s": 96.0}))
     assert select(default, candidate, output)["selected_wave_fraction"] == 0.375
+    default.write_text(json.dumps({"valid": False, "cold_sort_s": 90.0}))
+    with pytest.raises(RuntimeError, match="default 0.50"):
+        select(default, candidate, output)
 
 
 def test_gpu_wave_fraction_is_captured_before_materialization(monkeypatch) -> None:

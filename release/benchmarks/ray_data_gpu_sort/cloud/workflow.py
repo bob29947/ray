@@ -27,13 +27,12 @@ def _usable(path: Path) -> tuple[dict[str, Any], float] | None:
 def select(default_path: Path, candidate_path: Path, output: Path) -> dict[str, Any]:
     default = _usable(default_path)
     candidate = _usable(candidate_path)
-    if default is None and candidate is None:
-        raise RuntimeError("neither automatic-wave screen produced a valid result")
     if default is None:
-        selected = 0.375
-        reason = "default 0.50 screen was invalid"
-        improvement = None
-    elif candidate is None:
+        raise RuntimeError(
+            "default 0.50 automatic-wave screen was invalid; the 0.375 "
+            "candidate cannot clear a relative-speed gate without it"
+        )
+    if candidate is None:
         selected = 0.50
         reason = "0.375 screen was invalid"
         improvement = None

@@ -10,7 +10,7 @@ CPU orders only the bounded planning sample, never dataset rows or runs.
 from __future__ import annotations
 
 import gc
-import math
+import hashlib
 import time
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, Iterator, List, Mapping, Optional
@@ -22,6 +22,9 @@ GPU_SORT_DIAGNOSTICS_KEY = b"ray-data-gpu-sort-diagnostics"
 
 _WEIGHT_BASE = "__ray_gpu_sort_byte_weight"
 _HIDDEN_BASE = "__ray_gpu_sort_cmp"
+_SAMPLE_BLOCK_BASE = "__ray_gpu_sort_sample_block"
+_SAMPLE_STRATUM_BASE = "__ray_gpu_sort_sample_stratum"
+_SAMPLE_INDEX_BASE = "__ray_gpu_sort_sample_index"
 
 
 @dataclass
@@ -79,6 +82,113 @@ def _scale_sample_weights(weights: Any, population_rows: int, sample_rows: int) 
     return scaled.astype("uint64")
 
 
+def _stratified_sample_indices(
+    population_rows: int,
+    sample_rows: int,
+    *,
+    seed: int,
+    block_ordinal: int,
+) -> tuple[Any, Any]:
+    """Select one deterministic PCG64 row from every equal integer stratum.
+
+    The stream depends only on the user-controlled global seed and the logical
+    input block ordinal.  It is therefore independent of Ray actor, node, GPU,
+    communicator rank, and locality assignment.
+    """
+
+    import numpy as np
+
+    population_rows = int(population_rows)
+    sample_rows = int(sample_rows)
+    block_ordinal = int(block_ordinal)
+    if sample_rows <= 0 or population_rows < sample_rows:
+        raise ValueError("Sample rows must be in [1, population_rows].")
+    if block_ordinal < 0:
+        raise ValueError("Logical block ordinals must be nonnegative.")
+    if block_ordinal >= 1 << 64:
+        raise ValueError("Logical block ordinals must fit in unsigned 64 bits.")
+    if not 0 <= int(seed) < 1 << 64:
+        raise ValueError("GPU sort sample seeds must fit in unsigned 64 bits.")
+
+    if population_rows > np.iinfo(np.int64).max:
+        raise ValueError("Arrow row indices must fit in signed 64 bits.")
+
+    # Use Python integers for the boundary products. A vectorized uint64
+    # ``j * population_rows`` can overflow for an otherwise valid large block.
+    # This is only the bounded control-plane sample (normally 65K entries).
+    boundaries = np.fromiter(
+        (j * population_rows // sample_rows for j in range(sample_rows + 1)),
+        dtype=np.int64,
+        count=sample_rows + 1,
+    )
+    lows = boundaries[:-1]
+    highs = boundaries[1:]
+    widths = (highs - lows).astype(np.uint64)
+    if np.any(widths == 0):
+        raise RuntimeError("GPU sort sampling produced an empty stratum.")
+
+    # SeedSequence accepts an integer vector without depending on process hash
+    # randomization. Split the validated uint64 inputs into fixed 32-bit words
+    # so no two supported seeds or ordinals alias the same PCG64 stream.
+    seed_word = int(seed)
+    ordinal_word = block_ordinal
+    entropy = [
+        seed_word & 0xFFFFFFFF,
+        seed_word >> 32,
+        ordinal_word & 0xFFFFFFFF,
+        ordinal_word >> 32,
+    ]
+    raw = np.random.PCG64(np.random.SeedSequence(entropy)).random_raw(sample_rows)
+    indices = lows.astype(np.uint64) + raw % widths
+    return indices.astype(np.int64), widths.astype(np.uint64)
+
+
+def _scale_sample_weights_by_stratum(weights: Any, stratum_widths: Any) -> Any:
+    """Apply exact inverse-inclusion weights for unequal integer strata."""
+
+    import numpy as np
+
+    weights = np.asarray(weights, dtype=np.uint64)
+    stratum_widths = np.asarray(stratum_widths, dtype=np.uint64)
+    if weights.shape != stratum_widths.shape or np.any(stratum_widths == 0):
+        raise ValueError("Every sampled row must have one nonempty stratum.")
+    return np.multiply(weights, stratum_widths, dtype=np.uint64)
+
+
+def _arrow_table_digest(table: Any) -> str:
+    """Hash an Arrow table including its schema and ordered physical values."""
+
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+
+
+def _sample_index_digest(
+    sample: Any,
+    *,
+    block_name: str,
+    stratum_name: str,
+    index_name: str,
+) -> str:
+    """Hash canonical ``(block, stratum, row)`` sample coordinates."""
+
+    import numpy as np
+
+    columns = []
+    for name in (block_name, stratum_name, index_name):
+        columns.append(
+            sample[name]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+            .astype("<u8", copy=False)
+        )
+    coordinates = np.column_stack(columns).astype("<u8", copy=False)
+    return hashlib.sha256(coordinates.tobytes(order="C")).hexdigest()
+
+
 def _sampled_arrow_row_weights(sampled: Any) -> Any:
     """Return decoded row weights for an already sampled Arrow table.
 
@@ -130,6 +240,9 @@ def _cpu_sample_boundaries(
     num_partitions: int,
     null_position: str,
     weight_name: str,
+    sample_block_name: Optional[str] = None,
+    sample_stratum_name: Optional[str] = None,
+    sample_index_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Sort the small weighted planning sample and choose ordered ranges."""
 
@@ -139,25 +252,53 @@ def _cpu_sample_boundaries(
 
     key_schema = pa.schema([schema.field(name) for name in key_columns])
     if not samples:
+        boundaries = key_schema.empty_table()
         return {
-            "boundaries": key_schema.empty_table(),
+            "boundaries": boundaries,
             "sample_rows": 0,
             "sample_bytes": 0,
+            "planning_sample_bytes": 0,
             "boundary_sort_s": 0.0,
             "boundary_select_s": 0.0,
+            "sample_index_digest": hashlib.sha256(b"").hexdigest(),
+            "boundary_digest": _arrow_table_digest(boundaries),
         }
 
     sort_started = time.perf_counter()
     arrow = pa.concat_tables(samples)
+    ordering_names = (sample_block_name, sample_stratum_name, sample_index_name)
+    if all(ordering_names):
+        missing = [name for name in ordering_names if name not in arrow.column_names]
+        if missing:
+            raise ValueError(
+                "GPU sort samples are missing deterministic coordinates: " f"{missing}."
+            )
+        canonical_indices = pc.sort_indices(
+            arrow,
+            sort_keys=[
+                (sample_block_name, "ascending"),
+                (sample_stratum_name, "ascending"),
+            ],
+        )
+        arrow = arrow.take(canonical_indices)
+        index_digest = _sample_index_digest(
+            arrow,
+            block_name=sample_block_name,
+            stratum_name=sample_stratum_name,
+            index_name=sample_index_name,
+        )
+    else:
+        index_digest = hashlib.sha256(b"").hexdigest()
+    planning_arrow = arrow.select(key_columns + [weight_name])
     indices = pc.sort_indices(
-        arrow,
+        planning_arrow,
         sort_keys=[
             (name, "ascending" if direction else "descending")
             for name, direction in zip(key_columns, ascending)
         ],
         null_placement="at_start" if null_position == "first" else "at_end",
     )
-    sorted_arrow = arrow.take(indices)
+    sorted_arrow = planning_arrow.take(indices)
     select_started = time.perf_counter()
     rows = int(sorted_arrow.num_rows)
     if num_partitions == 1 or rows == 0:
@@ -184,10 +325,13 @@ def _cpu_sample_boundaries(
     boundary_sort_s = time.perf_counter() - sort_started
     return {
         "boundaries": boundaries,
-        "sample_rows": int(arrow.num_rows),
+        "sample_rows": int(planning_arrow.num_rows),
         "sample_bytes": int(arrow.nbytes),
+        "planning_sample_bytes": int(planning_arrow.nbytes),
         "boundary_sort_s": boundary_sort_s,
         "boundary_select_s": boundary_select_s,
+        "sample_index_digest": index_digest,
+        "boundary_digest": _arrow_table_digest(boundaries),
     }
 
 
@@ -229,9 +373,7 @@ def _workspace_bounded_payload_bytes(
 
     available = max(
         0,
-        int(pool_max_bytes)
-        - int(current_allocated_bytes)
-        - max(0, int(reserve_bytes)),
+        int(pool_max_bytes) - int(current_allocated_bytes) - max(0, int(reserve_bytes)),
     )
     additional_factor = max(1.0, float(workspace_factor) - 1.0)
     return max(0, int(available / additional_factor))
@@ -274,6 +416,9 @@ def lazy_load_backend() -> type[Any]:
             self._merge_key_names: List[str] = []
             self._merge_key_indices: List[int] = []
             self._weight_name = ""
+            self._sample_block_name = ""
+            self._sample_stratum_name = ""
+            self._sample_index_name = ""
             self._boundary_keys = None
 
             self._mr = None
@@ -433,6 +578,12 @@ def lazy_load_backend() -> type[Any]:
                 raise ValueError(f"GPU sort key columns are missing: {missing}.")
             names = list(schema.names)
             self._weight_name = _private_name(_WEIGHT_BASE, names)
+            names.append(self._weight_name)
+            self._sample_block_name = _private_name(_SAMPLE_BLOCK_BASE, names)
+            names.append(self._sample_block_name)
+            self._sample_stratum_name = _private_name(_SAMPLE_STRATUM_BASE, names)
+            names.append(self._sample_stratum_name)
+            self._sample_index_name = _private_name(_SAMPLE_INDEX_BASE, names)
             work_fields = list(schema)
             merge_names: List[str] = []
             for key in self._key_columns:
@@ -529,41 +680,83 @@ def lazy_load_backend() -> type[Any]:
         # -- bounded GPU sampling and boundary selection -----------------
 
         def sample_blocks(
-            self, blocks: List[Any], *, target_rows: int, seed: int
+            self,
+            blocks: List[Any],
+            *,
+            block_ordinals: List[int],
+            sample_quotas: List[int],
+            seed: int,
         ) -> Dict[str, Any]:
             import numpy as np
             import pyarrow as pa
 
+            if not (len(blocks) == len(block_ordinals) == len(sample_quotas)):
+                raise ValueError("GPU sort sampling plan does not match its blocks.")
             started = time.perf_counter()
             samples = []
             total_rows = 0
             total_bytes = 0
-            per_block = max(1, math.ceil(int(target_rows) / max(1, len(blocks))))
-            for block_index, block in enumerate(blocks):
+            sampled_blocks = 0
+            for block, block_ordinal, quota in zip(
+                blocks, block_ordinals, sample_quotas
+            ):
                 arrow = self._to_arrow_table(block)
                 self._set_schema(arrow.schema)
                 rows = int(arrow.num_rows)
                 total_rows += rows
                 total_bytes += int(arrow.nbytes)
                 if rows == 0:
+                    if int(quota) != 0:
+                        raise ValueError("Empty GPU sort blocks cannot be sampled.")
                     continue
-                take = min(rows, per_block)
-                stride = max(1, rows // max(1, take))
-                offset = int((seed + block_index * 0x9E3779B1) % stride)
-                indices = pa.array(
-                    offset + np.arange(take, dtype=np.int64) * stride,
-                    type=pa.int64(),
+                take = int(quota)
+                if not 1 <= take <= rows:
+                    raise ValueError(
+                        "Every nonempty GPU sort block needs between one and "
+                        "all of its rows sampled."
+                    )
+                sampled_blocks += 1
+                indices, stratum_widths = _stratified_sample_indices(
+                    rows,
+                    take,
+                    seed=seed,
+                    block_ordinal=int(block_ordinal),
                 )
-                sampled = arrow.take(indices)
-                weights = _scale_sample_weights(
-                    _sampled_arrow_row_weights(sampled), rows, take
+                sampled = arrow.take(pa.array(indices, type=pa.int64()))
+                weights = _scale_sample_weights_by_stratum(
+                    _sampled_arrow_row_weights(sampled), stratum_widths
                 )
-                selected = sampled.select(self._key_columns).append_column(
-                    self._weight_name, pa.array(weights, type=pa.uint64())
+                selected = sampled.select(self._key_columns)
+                selected = (
+                    selected.append_column(
+                        self._weight_name, pa.array(weights, type=pa.uint64())
+                    )
+                    .append_column(
+                        self._sample_block_name,
+                        pa.array(
+                            np.full(take, int(block_ordinal), dtype=np.uint64),
+                            type=pa.uint64(),
+                        ),
+                    )
+                    .append_column(
+                        self._sample_stratum_name,
+                        pa.array(np.arange(take, dtype=np.uint64), type=pa.uint64()),
+                    )
+                    .append_column(
+                        self._sample_index_name,
+                        pa.array(indices.astype(np.uint64), type=pa.uint64()),
+                    )
                 )
                 sample_schema = pa.schema(
                     [self._arrow_schema.field(name) for name in self._key_columns]
-                    + [pa.field(self._weight_name, pa.uint64(), nullable=False)]
+                    + [
+                        pa.field(self._weight_name, pa.uint64(), nullable=False),
+                        pa.field(self._sample_block_name, pa.uint64(), nullable=False),
+                        pa.field(
+                            self._sample_stratum_name, pa.uint64(), nullable=False
+                        ),
+                        pa.field(self._sample_index_name, pa.uint64(), nullable=False),
+                    ]
                 )
                 samples.append(selected.cast(sample_schema))
             sample = pa.concat_tables(samples) if samples else None
@@ -580,6 +773,7 @@ def lazy_load_backend() -> type[Any]:
                 "input_bytes": total_bytes,
                 "sample_rows": 0 if sample is None else int(sample.num_rows),
                 "sample_bytes": 0 if sample is None else int(sample.nbytes),
+                "sampled_block_count": sampled_blocks,
                 "cpu_sample_construction_s": elapsed,
                 "planning_h2d_bytes": 0,
             }
@@ -595,6 +789,9 @@ def lazy_load_backend() -> type[Any]:
                 num_partitions=self._num_partitions,
                 null_position=self._config.null_position,
                 weight_name=self._weight_name,
+                sample_block_name=self._sample_block_name,
+                sample_stratum_name=self._sample_stratum_name,
+                sample_index_name=self._sample_index_name,
             )
             self._stats["phases_s"]["sampling"] += time.perf_counter() - started
             self._update_peak()
@@ -888,9 +1085,7 @@ def lazy_load_backend() -> type[Any]:
                     self._config.final_sort_workspace_factor,
                     0,
                 )
-                group_limit = min(
-                    self._payload_limit_bytes, available, group_limit
-                )
+                group_limit = min(self._payload_limit_bytes, available, group_limit)
                 if group_limit <= 0:
                     raise GPUSortCapacityError(
                         "GPU sort cannot reserve run-sort workspace while "
@@ -940,11 +1135,7 @@ def lazy_load_backend() -> type[Any]:
                     remaining_bytes = self._table_bytes(remaining)
                     piece_rows = max(
                         1,
-                        int(
-                            (rows - start)
-                            * piece_limit
-                            / max(1, remaining_bytes)
-                        ),
+                        int((rows - start) * piece_limit / max(1, remaining_bytes)),
                     )
                     end = min(rows, start + piece_rows)
                     piece = self._slice_table(table, start, end)

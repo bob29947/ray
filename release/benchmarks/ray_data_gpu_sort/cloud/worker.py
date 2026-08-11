@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -50,6 +51,17 @@ SPILL_FIELDS = (
     "spill_time_total_s",
     "restore_time_total_s",
 )
+SAMPLING_MODE = "cpu_sampled_arrow"
+SAMPLING_SCHEME = "deterministic_stratified_random"
+SAMPLING_SCHEME_VERSION = 1
+MIN_SAMPLE_ROWS = 65_536
+MAX_PLANNING_H2D_BYTES = 1 << 20
+SAMPLING_SUBPHASES = (
+    "cpu_sample_construction",
+    "boundary_sort",
+    "orchestration_remainder",
+)
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _refs(dataset: Any) -> list[Any]:
@@ -128,10 +140,7 @@ def _spill_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[st
             {
                 "node_id": current["node_id"],
                 "node_ip": current["node_ip"],
-                **{
-                    name: current[name] - prior.get(name, 0)
-                    for name in SPILL_FIELDS
-                },
+                **{name: current[name] - prior.get(name, 0) for name in SPILL_FIELDS},
             }
         )
     return {
@@ -262,7 +271,8 @@ def _materialize(
             "locations": _locations(ray, dataset),
             "placement_digest": digest(placements),
             "planned_blocks_per_node": {
-                node_id: placements.count(node_id) for node_id in sorted(set(placements))
+                node_id: placements.count(node_id)
+                for node_id in sorted(set(placements))
             },
         }
     )
@@ -348,16 +358,34 @@ def _monitor_actor_class(ray: Any) -> Any:
             return {
                 "node_id": first["node_id"],
                 "samples": len(self.samples),
-                "peak_host_memory_used_bytes": max(item["host_memory_used_bytes"] for item in self.samples),
-                "minimum_host_memory_available_bytes": min(item["host_memory_available_bytes"] for item in self.samples),
-                "disk_read_bytes_delta": None if first["disk_read_bytes"] is None else last["disk_read_bytes"] - first["disk_read_bytes"],
-                "disk_write_bytes_delta": None if first["disk_write_bytes"] is None else last["disk_write_bytes"] - first["disk_write_bytes"],
-                "network_recv_bytes_delta": last["network_recv_bytes"] - first["network_recv_bytes"],
-                "network_sent_bytes_delta": last["network_sent_bytes"] - first["network_sent_bytes"],
-                "peak_spill_directory_bytes": max(item["spill_directory_bytes"] for item in self.samples),
-                "gpu_peak_memory_used_bytes": max((item["memory_used_bytes"] for item in gpu_values), default=None),
-                "gpu_total_memory_bytes": max((item["memory_total_bytes"] for item in gpu_values), default=None),
-                "gpu_peak_utilization_percent": max((item["utilization_percent"] for item in gpu_values), default=None),
+                "peak_host_memory_used_bytes": max(
+                    item["host_memory_used_bytes"] for item in self.samples
+                ),
+                "minimum_host_memory_available_bytes": min(
+                    item["host_memory_available_bytes"] for item in self.samples
+                ),
+                "disk_read_bytes_delta": None
+                if first["disk_read_bytes"] is None
+                else last["disk_read_bytes"] - first["disk_read_bytes"],
+                "disk_write_bytes_delta": None
+                if first["disk_write_bytes"] is None
+                else last["disk_write_bytes"] - first["disk_write_bytes"],
+                "network_recv_bytes_delta": last["network_recv_bytes"]
+                - first["network_recv_bytes"],
+                "network_sent_bytes_delta": last["network_sent_bytes"]
+                - first["network_sent_bytes"],
+                "peak_spill_directory_bytes": max(
+                    item["spill_directory_bytes"] for item in self.samples
+                ),
+                "gpu_peak_memory_used_bytes": max(
+                    (item["memory_used_bytes"] for item in gpu_values), default=None
+                ),
+                "gpu_total_memory_bytes": max(
+                    (item["memory_total_bytes"] for item in gpu_values), default=None
+                ),
+                "gpu_peak_utilization_percent": max(
+                    (item["utilization_percent"] for item in gpu_values), default=None
+                ),
             }
 
     return ray.remote(num_cpus=0)(Monitor)
@@ -416,6 +444,107 @@ def _configure_gpu_sort(backend: str, wave_fraction: float) -> None:
     context.set_config("gpu_sort_auto_wave_fraction", float(wave_fraction))
 
 
+def _sampling_telemetry_reasons(
+    stats: Mapping[str, Any],
+    *,
+    input_rows: int | None = None,
+    input_blocks: int | None = None,
+) -> list[str]:
+    """Validate proof that the production stratified CPU planner ran."""
+
+    reasons = []
+    exact = {
+        "sampling_mode": SAMPLING_MODE,
+        "sampling_scheme": SAMPLING_SCHEME,
+        "sampling_scheme_version": SAMPLING_SCHEME_VERSION,
+    }
+    for name, expected in exact.items():
+        if stats.get(name) != expected:
+            reasons.append(
+                f"GPU planner telemetry {name}={stats.get(name)!r}, expected {expected!r}"
+            )
+
+    seed = stats.get("sample_seed")
+    if seed != 0 or isinstance(seed, bool):
+        reasons.append("GPU planner telemetry sample_seed is not the fixed seed 0")
+    for name in ("sample_target_rows", "sample_rows"):
+        raw = stats.get(name)
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw < MIN_SAMPLE_ROWS:
+            reasons.append(f"GPU planner telemetry {name} is below {MIN_SAMPLE_ROWS:,}")
+    raw_bytes = stats.get("sample_bytes")
+    if not isinstance(raw_bytes, int) or isinstance(raw_bytes, bool) or raw_bytes <= 0:
+        reasons.append("GPU planner telemetry sample_bytes is not positive")
+    planning_bytes = stats.get("planning_sample_bytes")
+    if (
+        not isinstance(planning_bytes, int)
+        or isinstance(planning_bytes, bool)
+        or planning_bytes <= 0
+        or (isinstance(raw_bytes, int) and planning_bytes > raw_bytes)
+    ):
+        reasons.append("GPU planner telemetry planning_sample_bytes is invalid")
+    sampled_blocks = stats.get("sampled_block_count")
+    if (
+        not isinstance(sampled_blocks, int)
+        or isinstance(sampled_blocks, bool)
+        or sampled_blocks <= 0
+    ):
+        reasons.append("GPU planner telemetry sampled_block_count is not positive")
+
+    target = stats.get("sample_target_rows")
+    actual = stats.get("sample_rows")
+    if isinstance(target, int) and isinstance(actual, int) and target != actual:
+        reasons.append("GPU planner telemetry target and actual sample rows differ")
+    if input_rows is not None and input_blocks is not None:
+        expected_target = min(int(input_rows), max(MIN_SAMPLE_ROWS, int(input_blocks)))
+        if target != expected_target:
+            reasons.append(
+                "GPU planner telemetry sample target differs from the exact global budget"
+            )
+        if sampled_blocks != int(input_blocks):
+            reasons.append(
+                "GPU planner telemetry sampled block count differs from input blocks"
+            )
+
+    quotas = stats.get("sample_quota_rows")
+    if not isinstance(quotas, Mapping) or set(quotas) != {"min", "median", "max"}:
+        reasons.append("GPU planner telemetry sample_quota_rows is incomplete")
+    elif (
+        any(
+            not isinstance(quotas[name], (int, float))
+            or isinstance(quotas[name], bool)
+            or quotas[name] <= 0
+            for name in ("min", "median", "max")
+        )
+        or not quotas["min"] <= quotas["median"] <= quotas["max"]
+    ):
+        reasons.append("GPU planner telemetry sample_quota_rows is invalid")
+
+    for name in ("sample_plan_digest", "sample_index_digest", "boundary_digest"):
+        raw = stats.get(name)
+        if not isinstance(raw, str) or SHA256.fullmatch(raw) is None:
+            reasons.append(f"GPU planner telemetry {name} is not a SHA-256 digest")
+
+    planning_h2d = stats.get("planning_h2d_bytes")
+    if (
+        not isinstance(planning_h2d, int)
+        or isinstance(planning_h2d, bool)
+        or planning_h2d < 0
+        or planning_h2d > MAX_PLANNING_H2D_BYTES
+    ):
+        reasons.append(
+            "GPU planner telemetry planning_h2d_bytes exceeds the 1 MiB gate"
+        )
+    subphases = stats.get("sampling_subphases_s")
+    if not isinstance(subphases, Mapping):
+        reasons.append("GPU planner telemetry sampling_subphases_s is missing")
+    else:
+        for name in SAMPLING_SUBPHASES:
+            raw = subphases.get(name)
+            if not isinstance(raw, (int, float)) or isinstance(raw, bool) or raw < 0:
+                reasons.append(f"GPU planner telemetry subphase {name} is invalid")
+    return reasons
+
+
 def _ordered_partition(table: Any, keys: tuple[str, ...]) -> dict[str, Any]:
     import pyarrow as pa
     import pyarrow.compute as pc
@@ -432,8 +561,14 @@ def _ordered_partition(table: Any, keys: tuple[str, ...]) -> dict[str, Any]:
             left, right = column.slice(0, rows - 1), column.slice(1)
             left_null, right_null = pc.is_null(left), pc.is_null(right)
             both_null = pc.and_(left_null, right_null)
-            less = pc.if_else(left_null, False, pc.if_else(right_null, True, pc.less(left, right)))
-            equal = pc.if_else(both_null, True, pc.if_else(pc.or_(left_null, right_null), False, pc.equal(left, right)))
+            less = pc.if_else(
+                left_null, False, pc.if_else(right_null, True, pc.less(left, right))
+            )
+            equal = pc.if_else(
+                both_null,
+                True,
+                pc.if_else(pc.or_(left_null, right_null), False, pc.equal(left, right)),
+            )
             less_any = pc.or_(less_any, pc.and_(prefix, less))
             prefix = pc.and_(prefix, equal)
         ordered = bool(pc.all(pc.or_(less_any, prefix)).as_py())
@@ -467,7 +602,9 @@ def _validate_order(ray: Any, output: Any, keys: tuple[str, ...]) -> dict[str, A
     check = ray.remote(num_cpus=1)(_ordered_partition)
     parts = ray.get([check.remote(ref, keys) for ref in _refs(output)])
     boundaries = all(
-        left["last"] is None or right["first"] is None or _tuple_leq(left["last"], right["first"])
+        left["last"] is None
+        or right["first"] is None
+        or _tuple_leq(left["last"], right["first"])
         for left, right in zip(parts, parts[1:])
     )
     rows = sum(item["rows"] for item in parts)
@@ -522,7 +659,11 @@ def _identity(args: argparse.Namespace, plan: Mapping[str, Any]) -> dict[str, An
     for path in sorted((root / "python/ray/data").rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
-        overlay.update(str(path.relative_to(root)).encode() + b"\0" + bytes.fromhex(file_sha256(path)))
+        overlay.update(
+            str(path.relative_to(root)).encode()
+            + b"\0"
+            + bytes.fromhex(file_sha256(path))
+        )
         overlay_count += 1
     value = {
         "trial": {
@@ -539,12 +680,20 @@ def _identity(args: argparse.Namespace, plan: Mapping[str, Any]) -> dict[str, An
         "dataset_manifest_sha256": file_sha256(args.dataset_root / "manifest.json"),
         "wheel_sha256": RAY_WHEEL_SHA256,
         "harness_files": files,
-        "ray_data_overlay": {"file_count": overlay_count, "sha256": overlay.hexdigest()},
+        "ray_data_overlay": {
+            "file_count": overlay_count,
+            "sha256": overlay.hexdigest(),
+        },
     }
     return {**value, "digest": digest(value)}
 
 
-def _run_smoke(ray: Any, args: argparse.Namespace, manifest: dict[str, Any], nodes: list[dict[str, Any]]) -> dict[str, Any]:
+def _run_smoke(
+    ray: Any,
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
     _configure_gpu_sort("gpu", args.wave_fraction)
     slices = smoke_slices(manifest)
     plan = plan_dict(slices, kind="smoke")
@@ -559,12 +708,32 @@ def _run_smoke(ray: Any, args: argparse.Namespace, manifest: dict[str, Any], nod
     cpu_table, gpu_table = _exact_table(ray, cpu), _exact_table(ray, gpu)
     gpu_stats = get_last_run_stats(gpu)
     reasons = []
-    if not cpu_table.schema.equals(gpu_table.schema, check_metadata=True):
+    exact_schema = cpu_table.schema.equals(gpu_table.schema, check_metadata=True)
+    exact_values = cpu_table.equals(gpu_table)
+    if not exact_schema:
         reasons.append("CPU and GPU smoke schemas differ")
-    if not cpu_table.equals(gpu_table):
+    if not exact_values:
         reasons.append("CPU and GPU smoke rows/values differ")
-    if len(rank_stats(gpu_stats)) != 16:
+    ranks = rank_stats(gpu_stats)
+    if len(ranks) != 16:
         reasons.append("smoke did not use all 16 GPU ranks")
+    if len({str(item.get("node_id", "")) for item in ranks}) != 16:
+        reasons.append("smoke GPU ranks do not cover 16 distinct Ray nodes")
+    for field, label in (
+        ("cpu_sort_rows", "CPU sorting"),
+        ("cpu_merge_rows", "CPU merging"),
+        ("fallback_count", "output fallback"),
+        ("mpf_host_spill_bytes", "MPF host spill"),
+    ):
+        if int(value(gpu_stats, field, default=-1)) != 0:
+            reasons.append(f"smoke GPU backend used {label}")
+    reasons.extend(
+        _sampling_telemetry_reasons(
+            gpu_stats,
+            input_rows=int(input_stats["rows"]),
+            input_blocks=int(input_stats["blocks"]),
+        )
+    )
     identity = _identity(args, plan)
     return {
         "valid": not reasons,
@@ -584,7 +753,10 @@ def _run_smoke(ray: Any, args: argparse.Namespace, manifest: dict[str, Any], nod
         "gpu_stats": gpu_stats,
         "resources": resources,
         "ray_object_store_io": _spill_delta(before, after),
-        "validation": {"exact_every_row_value": not reasons, "rows": cpu_table.num_rows},
+        "validation": {
+            "exact_every_row_value": exact_schema and exact_values,
+            "rows": cpu_table.num_rows,
+        },
         "rejection_reasons": reasons,
         "plan": {key: value for key, value in plan.items() if key != "slices"},
         "artifact_identity": identity,
@@ -593,7 +765,12 @@ def _run_smoke(ray: Any, args: argparse.Namespace, manifest: dict[str, Any], nod
     }
 
 
-def _run_performance(ray: Any, args: argparse.Namespace, manifest: dict[str, Any], nodes: list[dict[str, Any]]) -> dict[str, Any]:
+def _run_performance(
+    ray: Any,
+    args: argparse.Namespace,
+    manifest: dict[str, Any],
+    nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
     _configure_gpu_sort(args.backend, args.wave_fraction)
     cell = cell_by_name(manifest, args.cell)
     slices = (
@@ -628,8 +805,9 @@ def _run_performance(ray: Any, args: argparse.Namespace, manifest: dict[str, Any
         )
     if not input_stats["locations"]["all_locatable"]:
         reasons.append("one or more materialized input ObjectRefs are not locatable")
-    if len(input_stats["locations"]["objects_by_node"]) != 16:
-        reasons.append("materialized input does not occupy all 16 Ray nodes")
+    planned = input_stats.get("planned_blocks_per_node") or {}
+    if len(planned) != 16 or any(int(count) <= 0 for count in planned.values()):
+        reasons.append("input placement receipts do not cover all 16 Ray nodes")
     gpu_stats: dict[str, Any] = {}
     output_stats: dict[str, Any] = {}
     validation: dict[str, Any] = {}
@@ -671,6 +849,13 @@ def _run_performance(ray: Any, args: argparse.Namespace, manifest: dict[str, Any
                 reasons.append("GPU backend used an output-conversion fallback")
             if int(value(gpu_stats, "mpf_host_spill_bytes", default=-1)) != 0:
                 reasons.append("GPU backend used MPF host spill")
+            reasons.extend(
+                _sampling_telemetry_reasons(
+                    gpu_stats,
+                    input_rows=int(input_stats["rows"]),
+                    input_blocks=int(input_stats["blocks"]),
+                )
+            )
     if args.kind == "trend" and (
         input_stats["rows"] != EXPECTED_ROWS or input_stats["blocks"] != EXPECTED_BLOCKS
     ):
@@ -700,12 +885,16 @@ def _run_performance(ray: Any, args: argparse.Namespace, manifest: dict[str, Any
         "input": {**input_stats, "ray_object_store_io": input_io},
         "output": output_stats,
         "throughput_rows_s": None if elapsed is None else input_stats["rows"] / elapsed,
-        "throughput_gib_s": None if elapsed is None else input_stats["decoded_bytes"] / GIB / elapsed,
+        "throughput_gib_s": None
+        if elapsed is None
+        else input_stats["decoded_bytes"] / GIB / elapsed,
         "gpu_stats": gpu_stats,
         "gpu_peak_device_bytes": peak_device_bytes(gpu_stats),
         "resources": resources,
         "ray_object_store_io": _spill_delta(before_sort, after_sort),
-        "object_store_memory_bytes": int(ray.cluster_resources().get("object_store_memory", 0)),
+        "object_store_memory_bytes": int(
+            ray.cluster_resources().get("object_store_memory", 0)
+        ),
         "ray_disk_spill_directory": str(args.spill_directory),
         "validation": validation,
         "rejection_reasons": reasons,
@@ -738,7 +927,9 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.selected_wave is not None:
-        args.wave_fraction = float(read_json(args.selected_wave)["selected_wave_fraction"])
+        args.wave_fraction = float(
+            read_json(args.selected_wave)["selected_wave_fraction"]
+        )
     os.environ.pop("RAY_DATA_GPU_SORT_MEMORY_BUDGET_BYTES", None)
     import ray
 

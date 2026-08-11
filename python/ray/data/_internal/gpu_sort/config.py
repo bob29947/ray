@@ -78,6 +78,12 @@ class GPUSortConfig:
         )
         if self.sample_size < 1:
             raise ValueError("GPU sort sample_size must be positive.")
+        if (
+            not isinstance(self.sample_seed, int)
+            or isinstance(self.sample_seed, bool)
+            or not 0 <= self.sample_seed < 1 << 64
+        ):
+            raise ValueError("GPU sort sample_seed must be an unsigned 64-bit integer.")
         if not 0 < self.rmm_initial_fraction <= self.rmm_max_fraction < 1:
             raise ValueError(
                 "GPU sort requires 0 < rmm_initial_fraction <= " "rmm_max_fraction < 1."

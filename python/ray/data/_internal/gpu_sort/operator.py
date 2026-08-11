@@ -9,6 +9,7 @@ longer has to fit in aggregate VRAM before range boundaries can be selected.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import math
 import os
@@ -103,6 +104,95 @@ class _InputBlock:
     value: Any
     size_bytes: int
     num_rows: int
+    ordinal: int = -1
+
+
+def _allocate_stratified_sample_quotas(
+    blocks: Sequence[_InputBlock], configured_sample_rows: int
+) -> Tuple[List[int], int]:
+    """Globally allocate an exact sample budget across logical input blocks."""
+
+    configured_sample_rows = int(configured_sample_rows)
+    if configured_sample_rows < 1:
+        raise ValueError("GPU sort sample size must be positive.")
+    nonempty = [block for block in blocks if int(block.num_rows) > 0]
+    ordinals = [int(block.ordinal) for block in blocks]
+    if any(ordinal < 0 for ordinal in ordinals) or len(set(ordinals)) != len(ordinals):
+        raise ValueError("GPU sort requires unique nonnegative logical block ordinals.")
+    total_rows = sum(int(block.num_rows) for block in nonempty)
+    if total_rows == 0:
+        return [0] * len(blocks), 0
+
+    target = min(total_rows, max(configured_sample_rows, len(nonempty)))
+    quotas = {int(block.ordinal): 1 for block in nonempty}
+    remaining = target - len(nonempty)
+    capacities = {int(block.ordinal): int(block.num_rows) - 1 for block in nonempty}
+    total_capacity = sum(capacities.values())
+    if remaining and total_capacity:
+        remainders = []
+        assigned = 0
+        for block in nonempty:
+            ordinal = int(block.ordinal)
+            numerator = remaining * capacities[ordinal]
+            extra, remainder = divmod(numerator, total_capacity)
+            quotas[ordinal] += extra
+            assigned += extra
+            remainders.append((remainder, ordinal))
+        leftover = remaining - assigned
+        for _, ordinal in sorted(remainders, key=lambda item: (-item[0], item[1]))[
+            :leftover
+        ]:
+            quotas[ordinal] += 1
+
+    result = [quotas.get(int(block.ordinal), 0) for block in blocks]
+    if sum(result) != target or any(
+        quota < 0 or quota > int(block.num_rows) for block, quota in zip(blocks, result)
+    ):
+        raise RuntimeError("GPU sort could not allocate its exact sample budget.")
+    return result, target
+
+
+def _sampling_plan_digest(
+    blocks: Sequence[_InputBlock],
+    quotas: Sequence[int],
+    *,
+    seed: int,
+    target_rows: int,
+) -> str:
+    """Hash the scheduling-independent logical sampling plan."""
+
+    if len(blocks) != len(quotas):
+        raise ValueError("GPU sort blocks and sample quotas must have equal length.")
+    payload = {
+        "scheme": "deterministic_stratified_random",
+        "version": 1,
+        "seed": int(seed),
+        "target_rows": int(target_rows),
+        "blocks": sorted(
+            [
+                [int(block.ordinal), int(block.num_rows), int(quota)]
+                for block, quota in zip(blocks, quotas)
+            ]
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sample_quota_summary(quotas: Sequence[int]) -> Dict[str, Any]:
+    """Return compact distribution telemetry over sampled nonempty blocks."""
+
+    positive = sorted(int(quota) for quota in quotas if int(quota) > 0)
+    if not positive:
+        return {"min": 0, "median": 0, "max": 0}
+    middle = len(positive) // 2
+    median: Any
+    if len(positive) % 2:
+        median = positive[middle]
+    else:
+        total = positive[middle - 1] + positive[middle]
+        median = total // 2 if total % 2 == 0 else total / 2
+    return {"min": positive[0], "median": median, "max": positive[-1]}
 
 
 def _underlying_object_ref(block: _InputBlock) -> Any:
@@ -420,8 +510,20 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._run_started_at: Optional[float] = None
         self._controller_phases: Dict[str, float] = {}
         self._sample_manifests: List[Dict[str, Any]] = []
+        self._sample_quotas: List[int] = []
+        self._sample_target_rows = 0
         self._sample_rows = 0
         self._sample_bytes = 0
+        self._planning_sample_bytes = 0
+        self._sampled_block_count = 0
+        self._sample_quota_rows: Dict[str, Any] = {
+            "min": 0,
+            "median": 0,
+            "max": 0,
+        }
+        self._sample_plan_digest = hashlib.sha256(b"").hexdigest()
+        self._sample_index_digest = hashlib.sha256(b"").hexdigest()
+        self._boundary_digest = hashlib.sha256(b"").hexdigest()
         self._sampling_subphases = {
             "cpu_sample_construction": 0.0,
             "boundary_sort": 0.0,
@@ -432,6 +534,11 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
     def start(self, options: ExecutionOptions) -> None:
         # Actor creation happens after all Plasma refs are collected, but before
         # sampling.  It remains inside the measured Dataset.sort boundary.
+        if not options.preserve_order:
+            raise RuntimeError(
+                "GPU sort requires preserve_order=True so logical block "
+                "ordinals remain reproducible."
+            )
         super().start(options)
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
@@ -444,6 +551,11 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
 
         for (block_ref, metadata), block_slice in zip(bundle.blocks, bundle.slices):
             if block_slice is None:
+                if metadata.num_rows is None:
+                    raise ValueError(
+                        "GPU sort deterministic sampling requires exact block "
+                        "row metadata."
+                    )
                 value: Any = block_ref
                 rows = int(metadata.num_rows or 0)
                 size_bytes = int(metadata.size_bytes or 0)
@@ -463,7 +575,12 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             # Actor placement and communicator rank order are not known until
             # MPF bootstrap, so assignment is deliberately deferred.
             self._input_blocks.append(
-                _InputBlock(value=value, size_bytes=size_bytes, num_rows=rows)
+                _InputBlock(
+                    value=value,
+                    size_bytes=size_bytes,
+                    num_rows=rows,
+                    ordinal=len(self._input_blocks),
+                )
             )
             self._input_bytes += size_bytes
             self._input_rows += rows
@@ -491,22 +608,38 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             self._assigned_blocks,
             self._local_bytes,
             self._local_blocks,
-        ) = _assign_blocks_by_locality(
-            self._input_blocks, actor_node_ids, locations
+        ) = _assign_blocks_by_locality(self._input_blocks, actor_node_ids, locations)
+
+    def _prepare_sampling_plan(self) -> None:
+        self._sample_quotas, self._sample_target_rows = (
+            _allocate_stratified_sample_quotas(
+                self._input_blocks, int(self._config["sample_size"])
+            )
+        )
+        self._sampled_block_count = sum(1 for quota in self._sample_quotas if quota > 0)
+        self._sample_quota_rows = _sample_quota_summary(self._sample_quotas)
+        self._sample_plan_digest = _sampling_plan_digest(
+            self._input_blocks,
+            self._sample_quotas,
+            seed=int(self._config["sample_seed"]),
+            target_rows=self._sample_target_rows,
         )
 
     def _sample(self) -> Tuple[Any, Any]:
-        target = self._config["sample_size"]
-        per_rank = max(1, math.ceil(target / self._rank_pool.nranks))
         seed = self._config["sample_seed"]
+        quotas_by_ordinal = {
+            block.ordinal: quota
+            for block, quota in zip(self._input_blocks, self._sample_quotas)
+        }
         construction_started = time.perf_counter()
         refs = [
             actor.sample_blocks.remote(
-                [block.value for block in blocks], per_rank, seed + rank
+                [block.value for block in blocks],
+                [block.ordinal for block in blocks],
+                [quotas_by_ordinal[block.ordinal] for block in blocks],
+                seed,
             )
-            for rank, (actor, blocks) in enumerate(
-                zip(self._rank_pool.actors, self._blocks_by_rank)
-            )
+            for actor, blocks in zip(self._rank_pool.actors, self._blocks_by_rank)
         ]
         manifests = ray.get(refs, timeout=self._config["setup_timeout_s"])
         self._sampling_subphases["cpu_sample_construction"] = (
@@ -536,6 +669,14 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         )
         self._sample_rows = int(result.get("sample_rows", 0) or 0)
         self._sample_bytes = int(result.get("sample_bytes", 0) or 0)
+        self._planning_sample_bytes = int(result.get("planning_sample_bytes", 0) or 0)
+        if self._sample_rows != self._sample_target_rows:
+            raise RuntimeError(
+                "GPU sort sampling did not produce its exact global target: "
+                f"expected {self._sample_target_rows}, got {self._sample_rows}."
+            )
+        self._sample_index_digest = str(result["sample_index_digest"])
+        self._boundary_digest = str(result["boundary_digest"])
         self._sampling_subphases["boundary_sort"] = float(
             result.get("boundary_sort_s", 0.0) or 0.0
         )
@@ -572,10 +713,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             self._controller_phases["startup"] = time.perf_counter() - started
 
             started = time.perf_counter()
+            self._prepare_sampling_plan()
             self._assign_input_blocks()
-            self._controller_phases["input_assignment"] = (
-                time.perf_counter() - started
-            )
+            self._controller_phases["input_assignment"] = time.perf_counter() - started
 
             started = time.perf_counter()
             schema, boundaries = self._sample()
@@ -779,8 +919,18 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         LAST_RUN_STATS = {
             "mode": "external" if externalized_bytes else "resident",
             "sampling_mode": "cpu_sampled_arrow",
+            "sampling_scheme": "deterministic_stratified_random",
+            "sampling_scheme_version": 1,
+            "sample_seed": int(self._config["sample_seed"]),
+            "sample_target_rows": self._sample_target_rows,
             "sample_rows": self._sample_rows,
             "sample_bytes": self._sample_bytes,
+            "planning_sample_bytes": self._planning_sample_bytes,
+            "sampled_block_count": self._sampled_block_count,
+            "sample_quota_rows": dict(self._sample_quota_rows),
+            "sample_plan_digest": self._sample_plan_digest,
+            "sample_index_digest": self._sample_index_digest,
+            "boundary_digest": self._boundary_digest,
             "planning_h2d_bytes": total("planning_h2d_bytes"),
             "sampling_subphases_s": dict(self._sampling_subphases),
             "memory_budget_bytes": max(budgets, default=0) or configured_budget,

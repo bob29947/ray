@@ -8,6 +8,10 @@ from release.benchmarks.ray_data_gpu_sort.cloud.report import (
     _classification,
     build,
 )
+from release.benchmarks.ray_data_gpu_sort.cloud.gpu_only_report import (
+    _repeat_digests,
+    _sampling_comparison,
+)
 
 
 def _result(
@@ -90,6 +94,39 @@ def _write(root: Path, name: str, value: dict[str, Any]) -> None:
     (root / name).write_text(json.dumps(value), encoding="utf-8")
 
 
+def test_gpu_only_report_requires_repeatable_sampling_digests() -> None:
+    first = _result("gpu")
+    second = _result("gpu", repetition=2)
+    sampling = {
+        "sample_plan_digest": "a" * 64,
+        "sample_index_digest": "b" * 64,
+        "boundary_digest": "c" * 64,
+    }
+    first["gpu_stats"].update(sampling)
+    second["gpu_stats"].update(sampling)
+    assert _repeat_digests([first, second])["identical"] is True
+
+    second["gpu_stats"]["boundary_digest"] = "d" * 64
+    assert _repeat_digests([first, second])["identical"] is False
+
+
+def test_gpu_only_report_compares_old_and_new_sampling() -> None:
+    old = [_result("gpu"), _result("gpu", repetition=2)]
+    new = [_result("gpu"), _result("gpu", repetition=2)]
+    for value in new:
+        value["gpu_stats"]["phases_s"]["sampling"] = 0.5
+        value["gpu_stats"]["planning_h2d_bytes"] = 4096
+        value["gpu_stats"]["sampling_subphases_s"] = {
+            "cpu_sample_construction": 0.3,
+            "boundary_sort": 0.1,
+            "orchestration_remainder": 0.1,
+        }
+    comparison = _sampling_comparison(new, old)
+    assert comparison["archived_fixed_stride_median_s"] == 1.0
+    assert comparison["stratified_median_s"] == 0.5
+    assert comparison["stratified_planning_h2d_mib"] == 4096 / (1 << 20)
+
+
 def test_classification_preserves_location_warning_but_not_oom() -> None:
     warning = _result("gpu", valid=False, reasons=[LOCATION_WARNING])
     assert _classification(warning) == "telemetry-warning"
@@ -105,9 +142,7 @@ def test_classification_preserves_location_warning_but_not_oom() -> None:
 
 
 def test_classification_accepts_only_completed_location_metadata_warnings() -> None:
-    output_only = _result(
-        "pyarrow", valid=False, reasons=[OUTPUT_LOCATION_WARNING]
-    )
+    output_only = _result("pyarrow", valid=False, reasons=[OUTPUT_LOCATION_WARNING])
     both = _result(
         "pyarrow",
         valid=False,
