@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "status": "historical_instrumented_candidate",
+    "note": "These measurements predate the cleaned production-PR port and are not claimed for its exact head.",
+    "bundle_sha256": "203ae1f8853a8044b489f6a575fb14a7ab5e7fe60daa02b72210607f7b9dab33"
+  },
+  "hardware": {
+    "instances": 16,
+    "instance_type": "g6.4xlarge",
+    "gpu": "NVIDIA L4 24 GB",
+    "aggregate_vcpus": 256,
+    "aggregate_default_object_store_gib": 289.038,
+    "archived_cpu_comparison": {
+      "instances": 16,
+      "instance_type": "m5dn.4xlarge",
+      "ray_policy": "default",
+      "comparison": "cross-campaign directional"
+    },
+    "filesystem_spill_tier": "local NVMe",
+    "swap_bytes": 0
+  },
+  "software": {
+    "ray": "2.55.1",
+    "ray_commit": "237c2455ebb1ea15a32dd9e1fdeb2d617badc37f",
+    "pyarrow": "24.0.0",
+    "cudf": "26.2.1",
+    "rmm": "26.2.0",
+    "rapids_mpf": "26.2.0",
+    "ucxx": "0.48.0",
+    "exchange_batch_bytes": 536870912,
+    "wave_fraction": 0.375
+  },
+  "smoke": {
+    "rows": 160000,
+    "cpu_sort_s": 1.003876239,
+    "gpu_sort_s": 2.930181149,
+    "gpu_ranks": 16,
+    "exact_schema_and_every_row_value": true
+  },
+  "trend": [
+    {
+      "cell": "narrow",
+      "columns": 5,
+      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
+      "gpu_runs_s": [5.51878496, 5.369039348],
+      "gpu_median_s": 5.443912154,
+      "archived_cpu_s": 69.060354022,
+      "directional_speedup": 12.685795081,
+      "input_gib": 2.857365569,
+      "output_balance": 1.069808661
+    },
+    {
+      "cell": "core",
+      "columns": 57,
+      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
+      "gpu_runs_s": [19.002863193, 17.493820816],
+      "gpu_median_s": 18.248342005,
+      "archived_cpu_s": 115.685597809,
+      "directional_speedup": 6.339512805,
+      "input_gib": 35.107883625,
+      "output_balance": 1.070827627
+    },
+    {
+      "cell": "full",
+      "columns": 110,
+      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
+      "gpu_runs_s": [31.531258089, 29.957716503],
+      "gpu_median_s": 30.744487296,
+      "archived_cpu_s": 118.931498415,
+      "directional_speedup": 3.86838451,
+      "input_gib": 63.8807415,
+      "output_balance": 1.070854481
+    },
+    {
+      "cell": "origin-string",
+      "columns": 110,
+      "keys": ["Origin"],
+      "gpu_runs_s": [32.200098735, 32.677273831],
+      "gpu_median_s": 32.438686283,
+      "archived_cpu_s": 82.643108981,
+      "directional_speedup": 2.547671267,
+      "input_gib": 63.8807415,
+      "output_balance": 2.104693656
+    },
+    {
+      "cell": "origin-integer",
+      "columns": 110,
+      "keys": ["OriginAirportID"],
+      "gpu_runs_s": [32.480864087, 32.15791596],
+      "gpu_median_s": 32.319390024,
+      "archived_cpu_s": 59.01210554,
+      "directional_speedup": 1.825904062,
+      "input_gib": 63.8807415,
+      "output_balance": 2.104804375
+    },
+    {
+      "cell": "route",
+      "columns": 110,
+      "keys": ["Origin", "Dest"],
+      "gpu_runs_s": [30.257975651, 29.579216727],
+      "gpu_median_s": 29.918596189,
+      "archived_cpu_s": 122.76029441,
+      "directional_speedup": 4.103143531,
+      "input_gib": 63.8807415,
+      "output_balance": 1.064658267
+    }
+  ],
+  "natural_spill": [
+    {
+      "scale": "1x",
+      "rows": 80738761,
+      "blocks": 627,
+      "input_gib": 63.8807415,
+      "gpu_runs_s": [31.531258089, 29.957716503],
+      "gpu_median_s": 30.744487296,
+      "archived_cpu_s": 118.931498415,
+      "directional_speedup": 3.86838451,
+      "externalized_gib": 0.0,
+      "initial_runs": [0, 0],
+      "merge_passes": [0, 0],
+      "output_blocks": [16, 16],
+      "ray_nvme_write_gib": 0.0,
+      "ray_nvme_restore_gib": 0.0,
+      "h2d_amplification": 1.000000105,
+      "d2h_amplification": 1.000283676,
+      "plasma_read_amplification": 0.0,
+      "plasma_write_amplification": 1.000283676
+    },
+    {
+      "scale": "2x",
+      "rows": 161477522,
+      "blocks": 1254,
+      "input_gib": 127.761483001,
+      "gpu_runs_s": [98.82175816, 96.942566387],
+      "gpu_median_s": 97.882162274,
+      "archived_cpu_s": 499.945776287,
+      "directional_speedup": 5.107629058,
+      "externalized_gib": 127.770929997,
+      "initial_runs": [49, 49],
+      "merge_passes": [1, 1],
+      "output_blocks": [190, 188],
+      "ray_nvme_write_gib": 383.348767788,
+      "ray_nvme_restore_gib": 14.454941375,
+      "h2d_amplification": 2.000073995,
+      "d2h_amplification": 2.000124037,
+      "plasma_read_amplification": 1.000073942,
+      "plasma_write_amplification": 2.000124037
+    },
+    {
+      "scale": "2.45x",
+      "rows": 197809964,
+      "blocks": 1543,
+      "input_gib": 156.505241037,
+      "gpu_runs_s": [96.823575519, 82.745090932],
+      "gpu_median_s": 89.784333226,
+      "archived_cpu_s": null,
+      "directional_speedup": null,
+      "externalized_gib": 156.516288638,
+      "initial_runs": [51, 50],
+      "merge_passes": [1, 1],
+      "output_blocks": [207, 209],
+      "ray_nvme_write_gib": 316.872436018,
+      "ray_nvme_restore_gib": 103.202955372,
+      "h2d_amplification": 2.000070632,
+      "d2h_amplification": 2.000112619,
+      "plasma_read_amplification": 1.000070589,
+      "plasma_write_amplification": 2.000112619
+    }
+  ],
+  "phase_medians_s": {
+    "1x": {
+      "planning": 0.633195302,
+      "partition_and_mpf": 20.548444772,
+      "sort_and_merge": 0.170026109,
+      "arrow_and_plasma_seal": 4.462559925,
+      "orchestration": 3.687864922,
+      "unattributed": 1.242396267,
+      "official_cold": 30.744487296
+    },
+    "2x": {
+      "planning": 1.169595124,
+      "partition_and_mpf": 39.499036834,
+      "sort_and_merge": 1.14912479,
+      "arrow_and_plasma_seal": 23.438672098,
+      "orchestration": 31.138058294,
+      "unattributed": 1.487675134,
+      "official_cold": 97.882162274
+    },
+    "2.45x": {
+      "planning": 1.358366697,
+      "partition_and_mpf": 44.146198399,
+      "sort_and_merge": 1.484967534,
+      "arrow_and_plasma_seal": 27.940675386,
+      "orchestration": 13.319320631,
+      "unattributed": 1.534804578,
+      "official_cold": 89.784333226
+    }
+  },
+  "optimizations": [
+    {
+      "candidate": "direct final merge",
+      "net_production_lines": 64,
+      "before_s": 133.395853649,
+      "after_s": 116.290630646,
+      "improvement_pct": 12.822904562,
+      "decision": "accepted"
+    },
+    {
+      "candidate": "bounded adjacent-block batching (512 MiB)",
+      "net_production_lines": 64,
+      "before_s": 116.290630646,
+      "after_s": 96.030164914,
+      "improvement_pct": 17.422268346,
+      "decision": "accepted"
+    },
+    {
+      "candidate": "1 GiB batch target",
+      "net_production_lines": 0,
+      "before_s": 96.030164914,
+      "after_s": 91.144577455,
+      "improvement_pct": 5.087555003,
+      "decision": "rejected: reproducible 2.45x RMM/MPF OOM"
+    },
+    {
+      "candidate": "batched external-run restore",
+      "net_production_lines": 8,
+      "before_s": 91.144577455,
+      "after_s": 95.650627176,
+      "improvement_pct": -4.943848386,
+      "decision": "rejected: cold-time regression"
+    }
+  ],
+  "validation": {
+    "authoritative_gpu_observations": 16,
+    "fresh_ray_runtime_per_observation": true,
+    "correct_rows_schema_checksum_and_global_order": true,
+    "all_16_ranks_on_distinct_nodes": true,
+    "cpu_dataset_sort_or_merge_in_gpu_backend": false,
+    "fallback": false,
+    "mpf_host_spill": false,
+    "pre_timer_ray_spill": false
+  }
+}
