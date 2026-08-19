@@ -45,6 +45,10 @@ python -m release.benchmarks.ray_data_gpu_sort.worker \
   --wave-fraction 0.375
 ```
 
+The example selects GPU sort. For the two CPU modes, `--backend pyarrow` uses
+the default pull-based shuffle; add `--shuffle-strategy push` to select the
+configured push-based shuffle.
+
 For a 2x natural-spill observation, add `--kind natural
 --scale-numerator 2`.  For the 2.45x point use `--scale-numerator 245
 --scale-denominator 100`.  Run the exact 160,000-row CPU/GPU smoke first with
@@ -70,10 +74,14 @@ python -m pytest -q release/benchmarks/ray_data_gpu_sort/test_benchmark.py
 
 ## Result provenance
 
-[RESULTS.md](RESULTS.md) and [RESULTS.json](RESULTS.json) describe the final
-August 2026 AWS campaign.  Those measurements came from the instrumented Ray
-2.55.1 candidate from which the production implementation was distilled.  They
-are historical algorithm evidence, not a claim that the cleaned PR head was
-benchmarked byte-for-byte.  The benchmark branch inherits the current
-production code from its parent commit; rerunning this worker produces receipts
-for that exact checkout.
+- [RESULTS.md](RESULTS.md) ([JSON](RESULTS.json)) contains the original payload,
+  key, natural-spill, and optimization results through 156.5 GiB.
+- [AWS_255G_SCALING.md](AWS_255G_SCALING.md)
+  ([JSON](AWS_255G_SCALING.json)) contains the 255.5 GiB, 2-16 node comparison
+  of GPU sort, default pull-based PyArrow, and configured push-based PyArrow.
+
+Those measurements came from the instrumented Ray 2.55.1 candidate from which
+the production implementation was distilled. They are historical algorithm
+evidence, not a claim that the cleaned PR head was benchmarked byte-for-byte.
+The benchmark branch inherits the current production code from its parent
+commit; rerunning this worker produces receipts for that exact checkout.

@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "kind": "ray_data_gpu_sort_255g_scaling",
+  "campaign": "bts-scale-255g-20260819-a",
+  "dataset": {
+    "name": "normalized_us_dot_bts_flights",
+    "copies": 4,
+    "rows": 322955044,
+    "blocks": 2508,
+    "columns": 110,
+    "decoded_bytes": 274365695588,
+    "decoded_gib": 255.5229660011828,
+    "sort_keys": [
+      "Origin",
+      "Dest",
+      "FlightDate",
+      "CRSDepTime"
+    ],
+    "row_id": "contiguous int64 values 0 through 322955043"
+  },
+  "source": {
+    "stock_ray_version": "2.55.1",
+    "stock_ray_commit": "237c2455ebb1ea15a32dd9e1fdeb2d617badc37f",
+    "ray_data_overlay_file_count": 551,
+    "ray_data_overlay_sha256": "df1e614913bfd6c61151e617a05c70c7c2d42fe4e5feea004b77e197090df817",
+    "input_plan_sha256": "1d6b93af0b77485775ab7766d4e64771b260ffa07b5132c2fe9e31ec6593574d",
+    "wheel_sha256": "bb49fbbe53a1d931e1f92d17f9271338f0b738885f8f70b7f531aa33f019d8af",
+    "accepted_source_bundle_sha256": "203ae1f8853a8044b489f6a575fb14a7ab5e7fe60daa02b72210607f7b9dab33",
+    "dataset_publication_sha256": "6237bf4b169c31084c6ea7358620df8e241114d4ca1e034e973263c819040347",
+    "provenance_note": "Historical measurements from the instrumented candidate used to develop the production implementation; not a byte-for-byte benchmark of the cleaned production branch."
+  },
+  "method": {
+    "timing_boundary": "Materialized projected input, including naturally spilled ObjectRefs, through sorted output sealed and Ray-locatable.",
+    "retained_fleet_nodes": 16,
+    "active_node_counts": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "ray_restarted_between_observations": true,
+    "inactive_nodes_required_isolated": true,
+    "gpu_repetitions_per_point": 2,
+    "cpu_repetitions_per_variant_per_point": 1,
+    "default_cpu_strategy": "default_pull_based",
+    "configured_cpu_strategy": "sort_shuffle_push_based",
+    "final_gpu_wave_fraction": 0.25,
+    "gpu_exchange_batch_bytes": 536870912,
+    "speedup_definition": "configured_push_cpu_cold_sort_s / gpu_pair_median_s",
+    "logical_cost_saving_definition": "1 - gpu_logical_cost_usd / configured_push_cpu_logical_cost_usd",
+    "comparison_denominator": "configured_push_cpu",
+    "default_pull_excluded_from_speedup_and_cost_comparisons": true
+  },
+  "hardware": {
+    "gpu": {
+      "instance_type": "g6.4xlarge",
+      "accelerator": "1 NVIDIA L4 24 GB per node",
+      "ray_spill_storage": "local NVMe"
+    },
+    "cpu": {
+      "instance_type": "m5dn.4xlarge",
+      "ray_spill_storage": "local NVMe"
+    }
+  },
+  "results_by_active_nodes": [
+    {
+      "nodes": 2,
+      "default_pull_cpu": {
+        "status": "capacity_failure",
+        "display": "Failed: head-memory/OOM pressure",
+        "certified": true,
+        "correctness": "NOT COMPLETED",
+        "spill": {
+          "atomic_telemetry_available": true,
+          "pre_timer_spilled_bytes": 260638749224,
+          "timed_spilled_bytes": 251179702106,
+          "timed_restored_bytes": 2183869854674,
+          "peak_spill_directory_bytes": 510377585442
+        }
+      },
+      "configured_push_cpu": {
+        "status": "completed",
+        "cold_sort_s": 8761.104520045,
+        "gib_per_s": 0.02916561095881896,
+        "rows_per_s": 36862.36629880329,
+        "strong_scaling_speedup_from_2": 1.0,
+        "parallel_efficiency_from_2": 1.0,
+        "logical_cost_usd": 5.295600954338312,
+        "correctness": {
+          "overall": "PASS",
+          "rows_exact": true,
+          "schema_exact": true,
+          "checksum_exact": true,
+          "globally_ordered": true,
+          "output_locatable": true,
+          "inactive_nodes_isolated": true
+        },
+        "spill": {
+          "pre_timer_spilled_bytes": 260133638718,
+          "timed_spilled_bytes": 575704600485,
+          "timed_restored_bytes": 790563726877,
+          "peak_spill_directory_bytes": 822365663517,
+          "peak_head_memory_bytes": 54750269440
+        }
+      },
+      "gpu": {
+        "status": "completed_pair",
+        "cold_sort_runs_s": [
+          2307.552285372,
+          2345.752379031
+        ],
+        "median_s": 2326.6523322015,
+        "gib_per_s": 0.10982430097727777,
+        "rows_per_s": 138806.74801740446,
+        "strong_scaling_speedup_from_2": 1.0,
+        "parallel_efficiency_from_2": 1.0,
+        "logical_cost_usd": 1.7103479810939026,
+        "correctness": "2/2 PASS",
+        "telemetry": {
+          "input_per_gpu_gib": 127.7614830005914,
+          "waves_median": 28,
+          "first_externalize_wave_median": 1,
+          "first_externalize_s_median": 190.26864003650053,
+          "pre_timer_spilled_bytes_median": 253140429270.5,
+          "timed_spilled_bytes_median": 1093394519000.0,
+          "timed_restored_bytes_median": 1343561432210.0,
+          "peak_spill_directory_bytes_median": 818980917110.0,
+          "gpu_externalized_bytes_median": 274386483056.0,
+          "initial_runs_median": 82.5,
+          "replacement_runs_median": 26.5,
+          "merge_passes_median": 3,
+          "peak_rmm_bytes_max": 18274582528,
+          "peak_nvml_bytes_max": 18768330752
+        }
+      },
+      "gpu_vs_configured_push": {
+        "speedup": 3.7655409013151364,
+        "logical_cost_saving_fraction": 0.6770247615253684
+      }
+    },
+    {
+      "nodes": 4,
+      "default_pull_cpu": {
+        "status": "capacity_failure",
+        "display": "Failed: head-memory/OOM pressure",
+        "certified": true,
+        "correctness": "NOT COMPLETED",
+        "spill": {
+          "atomic_telemetry_available": false,
+          "pre_timer_spilled_bytes": null,
+          "timed_spilled_bytes": null,
+          "timed_restored_bytes": null,
+          "peak_spill_directory_bytes": null
+        }
+      },
+      "configured_push_cpu": {
+        "status": "completed",
+        "cold_sort_s": 4409.707109958,
+        "gib_per_s": 0.05794556409974732,
+        "rows_per_s": 73237.3003346873,
+        "strong_scaling_speedup_from_2": 1.9867769676268694,
+        "parallel_efficiency_from_2": 0.9933884838134347,
+        "logical_cost_usd": 5.33084592848256,
+        "correctness": {
+          "overall": "PASS",
+          "rows_exact": true,
+          "schema_exact": true,
+          "checksum_exact": true,
+          "globally_ordered": true,
+          "output_locatable": true,
+          "inactive_nodes_isolated": true
+        },
+        "spill": {
+          "pre_timer_spilled_bytes": 268313017964,
+          "timed_spilled_bytes": 572587148647,
+          "timed_restored_bytes": 736792113803,
+          "peak_spill_directory_bytes": 831194823897,
+          "peak_head_memory_bytes": 53562466304
+        }
+      },
+      "gpu": {
+        "status": "completed_pair",
+        "cold_sort_runs_s": [
+          1287.896165181,
+          1262.433059634
+        ],
+        "median_s": 1275.1646124075,
+        "gib_per_s": 0.2003842982426854,
+        "rows_per_s": 253265.37519753125,
+        "strong_scaling_speedup_from_2": 1.8245897898694037,
+        "parallel_efficiency_from_2": 0.9122948949347018,
+        "logical_cost_usd": 1.8747753501528932,
+        "correctness": "2/2 PASS",
+        "telemetry": {
+          "input_per_gpu_gib": 63.8807415002957,
+          "waves_median": 14,
+          "first_externalize_wave_median": 1,
+          "first_externalize_s_median": 119.70437099149967,
+          "pre_timer_spilled_bytes_median": 262193689196.5,
+          "timed_spilled_bytes_median": 1073076419558.0,
+          "timed_restored_bytes_median": 1317727225693.0,
+          "peak_spill_directory_bytes_median": 832603768309.5,
+          "gpu_externalized_bytes_median": 274388896426.5,
+          "initial_runs_median": 83.5,
+          "replacement_runs_median": 27.5,
+          "merge_passes_median": 3,
+          "peak_rmm_bytes_max": 18272485376,
+          "peak_nvml_bytes_max": 18766233600
+        }
+      },
+      "gpu_vs_configured_push": {
+        "speedup": 3.4581473380385845,
+        "logical_cost_saving_fraction": 0.6483156003185121
+      }
+    },
+    {
+      "nodes": 8,
+      "default_pull_cpu": {
+        "status": "capacity_failure",
+        "display": "Failed: head-memory/OOM pressure",
+        "certified": true,
+        "correctness": "NOT COMPLETED",
+        "spill": {
+          "atomic_telemetry_available": false,
+          "pre_timer_spilled_bytes": null,
+          "timed_spilled_bytes": null,
+          "timed_restored_bytes": null,
+          "peak_spill_directory_bytes": null
+        }
+      },
+      "configured_push_cpu": {
+        "status": "completed",
+        "cold_sort_s": 2280.617327908,
+        "gib_per_s": 0.11204114029755832,
+        "rows_per_s": 141608.60748008313,
+        "strong_scaling_speedup_from_2": 3.8415495720544763,
+        "parallel_efficiency_from_2": 0.9603873930136191,
+        "logical_cost_usd": 5.514025895030898,
+        "correctness": {
+          "overall": "PASS",
+          "rows_exact": true,
+          "schema_exact": true,
+          "checksum_exact": true,
+          "globally_ordered": true,
+          "output_locatable": true,
+          "inactive_nodes_isolated": true
+        },
+        "spill": {
+          "pre_timer_spilled_bytes": 274434931712,
+          "timed_spilled_bytes": 567380595997,
+          "timed_restored_bytes": 658723789559,
+          "peak_spill_directory_bytes": 747184192020,
+          "peak_head_memory_bytes": 51508715520
+        }
+      },
+      "gpu": {
+        "status": "completed_pair",
+        "cold_sort_runs_s": [
+          500.565846097,
+          511.94195853
+        ],
+        "median_s": 506.2539023135,
+        "gib_per_s": 0.5047328323465426,
+        "rows_per_s": 637930.9720362582,
+        "strong_scaling_speedup_from_2": 4.595821032823783,
+        "parallel_efficiency_from_2": 1.1489552582059457,
+        "logical_cost_usd": 1.4886114745360515,
+        "correctness": "2/2 PASS",
+        "telemetry": {
+          "input_per_gpu_gib": 31.94037075014785,
+          "waves_median": 7,
+          "first_externalize_wave_median": 1,
+          "first_externalize_s_median": 72.56720654599849,
+          "pre_timer_spilled_bytes_median": 274434931712.0,
+          "timed_spilled_bytes_median": 778784543857.0,
+          "timed_restored_bytes_median": 927527970233.5,
+          "peak_spill_directory_bytes_median": 822308618157.5,
+          "gpu_externalized_bytes_median": 274391770207.5,
+          "initial_runs_median": 89.0,
+          "replacement_runs_median": 24.0,
+          "merge_passes_median": 2,
+          "peak_rmm_bytes_max": 18272485376,
+          "peak_nvml_bytes_max": 18766233600
+        }
+      },
+      "gpu_vs_configured_push": {
+        "speedup": 4.504888391943135,
+        "logical_cost_saving_fraction": 0.7300318310297471
+      }
+    },
+    {
+      "nodes": 16,
+      "default_pull_cpu": {
+        "status": "capacity_failure",
+        "display": "Failed: head-memory/OOM pressure",
+        "certified": true,
+        "correctness": "NOT COMPLETED",
+        "spill": {
+          "atomic_telemetry_available": false,
+          "pre_timer_spilled_bytes": null,
+          "timed_spilled_bytes": null,
+          "timed_restored_bytes": null,
+          "peak_spill_directory_bytes": null
+        }
+      },
+      "configured_push_cpu": {
+        "status": "completed",
+        "cold_sort_s": 1354.90248347,
+        "gib_per_s": 0.18859140721830445,
+        "rows_per_s": 238360.36020311184,
+        "strong_scaling_speedup_from_2": 6.466225154158105,
+        "parallel_efficiency_from_2": 0.8082781442697631,
+        "logical_cost_usd": 6.551706231179379,
+        "correctness": {
+          "overall": "PASS",
+          "rows_exact": true,
+          "schema_exact": true,
+          "checksum_exact": true,
+          "globally_ordered": true,
+          "output_locatable": true,
+          "inactive_nodes_isolated": true
+        },
+        "spill": {
+          "pre_timer_spilled_bytes": 274434931712,
+          "timed_spilled_bytes": 451104025265,
+          "timed_restored_bytes": 450322616591,
+          "peak_spill_directory_bytes": 691049429310,
+          "peak_head_memory_bytes": 47603486720
+        }
+      },
+      "gpu": {
+        "status": "completed_pair",
+        "cold_sort_runs_s": [
+          212.445591211,
+          210.666210164
+        ],
+        "median_s": 211.5559006875,
+        "gib_per_s": 1.2078271755635348,
+        "rows_per_s": 1526570.7217358751,
+        "strong_scaling_speedup_from_2": 10.997813460369118,
+        "parallel_efficiency_from_2": 1.3747266825461397,
+        "logical_cost_usd": 1.2441367457319998,
+        "correctness": "2/2 PASS",
+        "telemetry": {
+          "input_per_gpu_gib": 15.970185375073925,
+          "waves_median": 4,
+          "first_externalize_wave_median": 1,
+          "first_externalize_s_median": 53.73438245850048,
+          "pre_timer_spilled_bytes_median": 274434931712.0,
+          "timed_spilled_bytes_median": 669236202529.0,
+          "timed_restored_bytes_median": 400076227477.0,
+          "peak_spill_directory_bytes_median": 816096933347.5,
+          "gpu_externalized_bytes_median": 274386888119.0,
+          "initial_runs_median": 81.5,
+          "replacement_runs_median": 17.5,
+          "merge_passes_median": 2,
+          "peak_rmm_bytes_max": 18270388224,
+          "peak_nvml_bytes_max": 18764136448
+        }
+      },
+      "gpu_vs_configured_push": {
+        "speedup": 6.40446557655414,
+        "logical_cost_saving_fraction": 0.8101049250634607
+      }
+    }
+  ],
+  "wave_fraction_resolution": {
+    "initial_wave_fraction": 0.375,
+    "accepted_2_gpu_reference": {
+      "cold_sort_s": 2200.46957237,
+      "gib_per_s": 0.11612201741375301,
+      "peak_rmm_bytes": 19826475008,
+      "peak_nvml_bytes": 20320223232,
+      "correctness": "PASS"
+    },
+    "confirmed_mpf_rmm_transient_ooms": [
+      {
+        "nodes": 2,
+        "requested_mib": 236.113037,
+        "pool_current_gib": 18.727129,
+        "pool_max_gib": 18.729156
+      },
+      {
+        "nodes": 4,
+        "requested_mib": 117.130127,
+        "pool_current_gib": 18.622275,
+        "pool_max_gib": 18.729156
+      },
+      {
+        "nodes": 4,
+        "requested_mib": 127.179688,
+        "pool_current_gib": 18.608656,
+        "pool_max_gib": 18.729156
+      }
+    ],
+    "excluded_infrastructure_preflight_failures": 1,
+    "final_wave_fraction": 0.25,
+    "final_observations": 8,
+    "complete_pairs_at_nodes": [
+      2,
+      4,
+      8,
+      16
+    ],
+    "all_final_observations_passed": true,
+    "two_gpu_relative_slowdown_vs_accepted_0_375": [
+      0.04866357360564044,
+      0.06602354719430381
+    ]
+  },
+  "cost_basis": {
+    "logical_per_sort_formula": "active_nodes * cold_sort_s / 3600 * node_hour_usd",
+    "cpu_node_hour_usd": 1.088,
+    "gpu_node_hour_usd": 1.3232,
+    "logical_cost_uses_active_nodes_only": true,
+    "retained_campaign": {
+      "cpu_fleet_nodes": 16,
+      "cpu_fleet_hour_usd": 17.408,
+      "cpu_fleet_hours": 10.806736111111114,
+      "cpu_cost_usd": 188.1236622222223,
+      "gpu_fleet_nodes": 16,
+      "gpu_fleet_hour_usd": 21.1712,
+      "gpu_fleet_hours_upper_bound": 5.6379286111111115,
+      "gpu_cost_usd_upper_bound": 119.36171421155557,
+      "combined_cost_usd_upper_bound": 307.48537643377784,
+      "gpu_cost_is_estimated_upper_bound": true
+    }
+  },
+  "validation": {
+    "all_default_pull_points_terminal_capacity_failures": true,
+    "all_configured_push_points_complete": true,
+    "all_gpu_pairs_complete": true,
+    "all_completed_outputs_rows_exact": true,
+    "all_completed_outputs_schema_exact": true,
+    "all_completed_outputs_checksum_exact": true,
+    "all_completed_outputs_globally_ordered": true,
+    "all_completed_outputs_locatable": true,
+    "all_completed_outputs_inactive_nodes_isolated": true,
+    "missing_expected_artifacts": 0,
+    "invalid_cpu_artifacts": 0,
+    "invalid_configured_push_cpu_artifacts": 0,
+    "invalid_gpu_artifacts": 0,
+    "artifact_discovery_errors": 0
+  },
+  "caveats": [
+    "GPU medians contain two observations; each CPU point contains one observation.",
+    "Default pull did not complete, so no pull completion time, logical cost, speedup, or cost-saving claim is made.",
+    "Atomic pull memory and spill telemetry is unavailable at 4, 8, and 16 nodes because no atomic worker result survived those failures.",
+    "Dashboard summary requests failed, so peak and final Ray task and object counts are unavailable.",
+    "GPU retained-fleet cost is a conservative upper bound because per-instance termination records were no longer queryable.",
+    "Strong-scaling results should not be extrapolated beyond the measured 2-16 node range."
+  ]
+}

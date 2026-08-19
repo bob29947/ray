@@ -308,6 +308,32 @@ def _configure_gpu_sort(wave_fraction: float, actors: int) -> None:
     context.set_config("gpu_sort_auto_wave_fraction", wave_fraction)
 
 
+def _effective_shuffle_strategy(args: argparse.Namespace) -> str:
+    if args.backend == "gpu":
+        if args.shuffle_strategy is not None:
+            raise ValueError("--shuffle-strategy is only valid with --backend pyarrow")
+        return "gpu_shuffle"
+    return f"sort_shuffle_{args.shuffle_strategy or 'pull'}_based"
+
+
+def _configure_shuffle_strategy(args: argparse.Namespace) -> str:
+    """Configure an explicit CPU sort scheduler before Dataset construction."""
+
+    effective = _effective_shuffle_strategy(args)
+    if args.backend == "gpu" or args.shuffle_strategy is None:
+        return effective
+
+    from ray.data import DataContext
+    from ray.data.context import ShuffleStrategy
+
+    strategies = {
+        "pull": ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+        "push": ShuffleStrategy.SORT_SHUFFLE_PUSH_BASED,
+    }
+    DataContext.get_current().shuffle_strategy = strategies[args.shuffle_strategy]
+    return effective
+
+
 def _sort(dataset: Any, keys: tuple[str, ...], backend: str) -> tuple[Any, float]:
     kwargs: dict[str, Any] = {"key": list(keys), "descending": [False] * len(keys)}
     if backend == "gpu":
@@ -406,6 +432,7 @@ def _artifact_identity(
     value = {
         "kind": args.kind,
         "backend": args.backend,
+        "shuffle_strategy": _effective_shuffle_strategy(args),
         "cell": args.cell,
         "repetition": args.repetition,
         "scale": [args.scale_numerator, args.scale_denominator],
@@ -439,6 +466,7 @@ def _run_smoke(
     return {
         "valid": exact,
         "kind": "smoke",
+        "shuffle_strategy": _effective_shuffle_strategy(args),
         "cpu_sort_s": cpu_s,
         "gpu_sort_s": gpu_s,
         "input": input_stats,
@@ -511,6 +539,7 @@ def _run_observation(
         "valid": not reasons,
         "kind": args.kind,
         "backend": args.backend,
+        "shuffle_strategy": _effective_shuffle_strategy(args),
         "cell": cell.to_dict(),
         "repetition": args.repetition,
         "scale": [args.scale_numerator, args.scale_denominator],
@@ -541,6 +570,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--spill-directory", type=Path, required=True)
     parser.add_argument("--kind", choices=("smoke", "trend", "natural"), required=True)
     parser.add_argument("--backend", choices=("gpu", "pyarrow"), default="gpu")
+    parser.add_argument(
+        "--shuffle-strategy",
+        choices=("pull", "push"),
+        help="PyArrow sort shuffle strategy (default: pull)",
+    )
     parser.add_argument("--cell", default="full")
     parser.add_argument("--repetition", type=int, default=1)
     parser.add_argument("--scale-numerator", type=int, default=1)
@@ -555,13 +589,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.dataset_root = args.dataset_root.expanduser().resolve()
     args.spill_directory = args.spill_directory.expanduser().resolve()
     ray = None
+    shuffle_strategy = None
     try:
+        shuffle_strategy = _effective_shuffle_strategy(args)
         if args.spill_directory.is_relative_to(Path("/dev/shm")):
             raise ValueError("Ray filesystem spill must use local disk, not /dev/shm")
         import ray as ray_module
 
         ray = ray_module
         ray.init(address="auto", logging_level="ERROR")
+        shuffle_strategy = _configure_shuffle_strategy(args)
         nodes = _alive_nodes(ray)
         if len(nodes) != args.nodes:
             raise RuntimeError(f"Expected {args.nodes} Ray nodes, found {len(nodes)}")
@@ -587,6 +624,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "valid": False,
             "kind": args.kind,
             "backend": args.backend,
+            "shuffle_strategy": shuffle_strategy,
+            "requested_shuffle_strategy": args.shuffle_strategy,
             "cell": args.cell,
             "repetition": args.repetition,
             "rejection_reasons": [f"{type(error).__name__}: {error}"],
