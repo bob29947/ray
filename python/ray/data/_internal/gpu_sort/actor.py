@@ -40,6 +40,13 @@ def _resolve_blocks(entries: List[Any]) -> List[Any]:
     return result
 
 
+def _iter_resolved_blocks(entries: List[Any]) -> Iterator[Any]:
+    """Resolve sampling inputs one at a time to keep host memory bounded."""
+
+    for entry in entries:
+        yield _resolve_blocks([entry])[0]
+
+
 @ray.remote(num_gpus=1)
 class GPUSortActor:
     """One communicator rank; importing this module remains CPU safe."""
@@ -95,7 +102,7 @@ class GPUSortActor:
         seed: int,
     ) -> Dict[str, Any]:
         return self._backend.sample_blocks(
-            _resolve_blocks(blocks),
+            _iter_resolved_blocks(blocks),
             block_ordinals=block_ordinals,
             sample_quotas=sample_quotas,
             seed=seed,
@@ -107,8 +114,22 @@ class GPUSortActor:
     def install_plan(self, schema: Any, boundaries: Any) -> Dict[str, Any]:
         return self._backend.install_plan(schema, boundaries)
 
-    def process_wave(self, wave_id: int, blocks: List[Any]) -> Dict[str, Any]:
-        return self._backend.process_wave(wave_id, _resolve_blocks(blocks))
+    def prepare_wave(self, wave_id: int, blocks: List[Any]) -> Dict[str, Any]:
+        return self._backend.prepare_wave(wave_id, _resolve_blocks(blocks))
+
+    def prepare_more(self, wave_id: int) -> Dict[str, Any]:
+        return self._backend.prepare_more(wave_id)
+
+    def exchange_prepared_round(
+        self,
+        wave_id: int,
+        exchange_id: int,
+        batch_ids: List[int],
+        final_subround: bool,
+    ) -> Dict[str, Any]:
+        return self._backend.exchange_prepared_round(
+            wave_id, exchange_id, batch_ids, final_subround
+        )
 
     def finish_and_extract(self) -> Iterator[Any]:
         try:

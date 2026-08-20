@@ -7,6 +7,14 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Optional
 
 
+# The observed MPF progress-thread failure requested 16.762 MiB. Ninety-six
+# MiB preserves that allocation plus more than the selected 64 MiB margin.
+MPF_PROGRESS_RESERVE_BYTES = 96 << 20
+# PackedData send owners move into MPF. Keep room for the receive buffer and
+# its unpack handoff in addition to the separately reserved progress memory.
+MPF_RECEIVE_BUFFER_OWNERS = 2
+
+
 def _positive_bytes(value: Any) -> Optional[int]:
     if value is None or value == "":
         return None
@@ -48,7 +56,9 @@ class GPUSortConfig:
 
     sample_size: int = 1 << 16
     sample_seed: int = 0
-    rmm_initial_fraction: float = 0.50
+    # Preallocate the bounded pool as one arena. Growing from a smaller pool
+    # can leave enough total bytes but no contiguous segment for run sorting.
+    rmm_initial_fraction: float = 0.85
     rmm_max_fraction: float = 0.85
     residency_budget_bytes: Optional[int] = None
     # Fraction of the smallest actor-reported usable memory budget assigned to

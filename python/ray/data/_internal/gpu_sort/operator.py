@@ -32,12 +32,19 @@ from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
 from ray.data._internal.execution.operators.sub_progress import SubProgressBarMixin
-from ray.data._internal.gpu_sort.config import GPUSortConfig
+from ray.data._internal.gpu_sort.config import (
+    MPF_PROGRESS_RESERVE_BYTES,
+    MPF_RECEIVE_BUFFER_OWNERS,
+    GPUSortCapacityError,
+    GPUSortConfig,
+)
 from ray.data.block import BlockStats, to_stats
 from ray.data.context import DataContext
 
 GPU_SORT_PARTITION_ID_KEY = b"ray-data-gpu-sort-partition"
 GPU_SORT_DIAGNOSTICS_KEY = b"ray-data-gpu-sort-diagnostics"
+_MPF_PROGRESS_RESERVE_BYTES = MPF_PROGRESS_RESERVE_BYTES
+_MPF_RECEIVE_BUFFER_OWNERS = MPF_RECEIVE_BUFFER_OWNERS
 
 # Driver-local benchmark hook.  A JSON round trip in the accessor prevents a
 # caller from mutating the record while another Dataset is being constructed.
@@ -105,6 +112,16 @@ class _InputBlock:
     size_bytes: int
     num_rows: int
     ordinal: int = -1
+
+
+@dataclass(frozen=True)
+class _ExchangeRound:
+    """A deterministic set of prepared batches safe for one MPF exchange."""
+
+    batch_ids_by_rank: Tuple[Tuple[int, ...], ...]
+    outgoing_bytes: Tuple[int, ...]
+    incoming_bytes: Tuple[int, ...]
+    modeled_headroom_bytes: Tuple[int, ...]
 
 
 def _allocate_stratified_sample_quotas(
@@ -302,6 +319,88 @@ def _make_waves(
     ]
 
 
+def _plan_exchange_round(
+    batches_by_rank: Sequence[Sequence[Mapping[str, Any]]],
+    *,
+    current_allocated_bytes: Sequence[int],
+    pool_max_bytes: Sequence[int],
+) -> _ExchangeRound:
+    """Select the largest deterministic MPF round that preserves headroom.
+
+    Prepared packed buffers are already included in ``current_allocated_bytes``
+    and move into MPF without another full-payload send allocation. Conservatively
+    reserve two incoming owners. Exact destination sizes therefore let balanced
+    traffic stay together while an all-to-one exchange is split before MPF starts
+    its C++ progress thread.
+    """
+
+    ranks = len(batches_by_rank)
+    if (
+        ranks == 0
+        or len(current_allocated_bytes) != ranks
+        or len(pool_max_bytes) != ranks
+    ):
+        raise ValueError("GPU sort exchange admission requires one budget per rank.")
+    current = [int(value) for value in current_allocated_bytes]
+    maximum = [int(value) for value in pool_max_bytes]
+    if any(value < 0 for value in current) or any(value <= 0 for value in maximum):
+        raise ValueError("GPU sort exchange memory measurements must be positive.")
+
+    selected: List[List[int]] = [[] for _ in range(ranks)]
+    outgoing = [0] * ranks
+    incoming = [0] * ranks
+    # Interleave source ranks at each batch ordinal so a hot destination does
+    # not let the first rank monopolize a bounded round.
+    candidates = sorted(
+        (
+            int(batch["batch_id"]),
+            source,
+            batch,
+        )
+        for source, batches in enumerate(batches_by_rank)
+        for batch in batches
+    )
+    for batch_id, source, batch in candidates:
+        destinations = [int(value) for value in batch["destination_bytes"]]
+        if len(destinations) != ranks or any(value < 0 for value in destinations):
+            raise ValueError(
+                "Every prepared GPU batch needs nonnegative bytes for every rank."
+            )
+        source_bytes = sum(destinations)
+        candidate_outgoing = list(outgoing)
+        candidate_incoming = list(incoming)
+        candidate_outgoing[source] += source_bytes
+        for destination, value in enumerate(destinations):
+            candidate_incoming[destination] += value
+        required = [
+            current[rank]
+            + _MPF_RECEIVE_BUFFER_OWNERS * candidate_incoming[rank]
+            + _MPF_PROGRESS_RESERVE_BYTES
+            for rank in range(ranks)
+        ]
+        if all(required[rank] <= maximum[rank] for rank in range(ranks)):
+            selected[source].append(batch_id)
+            outgoing = candidate_outgoing
+            incoming = candidate_incoming
+
+    if candidates and not any(selected):
+        smallest = min(maximum[rank] - current[rank] for rank in range(ranks))
+        raise GPUSortCapacityError(
+            "No prepared GPU shuffle batch fits with the required MPF transport "
+            f"reserve; smallest measured headroom is {smallest} bytes."
+        )
+    modeled_headroom = tuple(
+        maximum[rank] - current[rank] - _MPF_RECEIVE_BUFFER_OWNERS * incoming[rank]
+        for rank in range(ranks)
+    )
+    return _ExchangeRound(
+        batch_ids_by_rank=tuple(tuple(values) for values in selected),
+        outgoing_bytes=tuple(outgoing),
+        incoming_bytes=tuple(incoming),
+        modeled_headroom_bytes=modeled_headroom,
+    )
+
+
 def _wave_target_bytes(
     blocks_by_rank: Sequence[Sequence[_InputBlock]],
     *,
@@ -318,12 +417,18 @@ def _wave_target_bytes(
     budgets = [int(value) for value in actor_usable_budgets if int(value) > 0]
     if not budgets:
         raise RuntimeError("GPU sort actors did not report usable memory budgets.")
-    target = max(256 << 20, int(min(budgets) * float(auto_wave_fraction)))
+    smallest_budget = min(budgets)
+    requested = max(256 << 20, int(smallest_budget * float(auto_wave_fraction)))
+    # Four copies is the balanced-case MPF ownership ceiling. Actor admission
+    # later subtracts its measured allocator baseline before applying the same
+    # transport reserve.
+    balanced_target = max(1, (smallest_budget - _MPF_PROGRESS_RESERVE_BYTES) // 4)
+    resident_target = min(requested, balanced_target)
     largest_rank_input = max(
         (sum(block.size_bytes for block in blocks) for blocks in blocks_by_rank),
         default=0,
     )
-    return None if largest_rank_input <= target else target
+    return None if largest_rank_input <= resident_target else resident_target
 
 
 def _derive_num_ranks(data_context: DataContext) -> int:
@@ -497,6 +602,14 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._local_blocks = [0] * nranks
         self._wave_target_bytes: Optional[int] = None
         self._wave_count = 0
+        self._exchange_subround_count = 0
+        self._exchange_rounds_per_wave: List[int] = []
+        self._exchange_plan_s = 0.0
+        self._prepared_batch_count = 0
+        self._prepared_bytes = 0
+        self._minimum_modeled_mpf_headroom_bytes: Optional[int] = None
+        self._maximum_exchange_destination_bytes = 0
+        self._next_exchange_id = 0
         self._input_bundles: List[RefBundle] = []
         self._input_rows = 0
         self._input_bytes = 0
@@ -737,14 +850,132 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             )
             waves = self._plan_waves()
             for wave_id, blocks_for_ranks in enumerate(waves):
-                ray.get(
+                prepared = ray.get(
                     [
-                        actor.process_wave.remote(wave_id, blocks)
+                        actor.prepare_wave.remote(wave_id, blocks)
                         for actor, blocks in zip(
                             self._rank_pool.actors, blocks_for_ranks
                         )
                     ]
                 )
+                rounds_for_wave = 0
+                while True:
+                    prepared_by_rank: List[Optional[Dict[str, Any]]] = [None] * len(
+                        self._rank_pool.actors
+                    )
+                    for item in prepared:
+                        rank = int(item["rank"])
+                        if (
+                            not 0 <= rank < len(prepared_by_rank)
+                            or prepared_by_rank[rank] is not None
+                        ):
+                            raise RuntimeError(
+                                f"GPU sort received an invalid prepared rank {rank}."
+                            )
+                        prepared_by_rank[rank] = dict(item)
+                    if any(item is None for item in prepared_by_rank):
+                        raise RuntimeError(
+                            "GPU sort prepared-wave ranks are incomplete."
+                        )
+                    manifests = [item for item in prepared_by_rank if item is not None]
+                    pending = [list(item.get("batches", ())) for item in manifests]
+                    allocated = [
+                        int(item.get("current_allocated_bytes", 0))
+                        for item in manifests
+                    ]
+                    pool_max = [
+                        int(item.get("pool_max_bytes", 0)) for item in manifests
+                    ]
+                    source_complete = [
+                        bool(item.get("source_complete", False)) for item in manifests
+                    ]
+                    self._prepared_batch_count += sum(len(items) for items in pending)
+                    self._prepared_bytes += sum(
+                        sum(int(value) for value in batch["destination_bytes"])
+                        for items in pending
+                        for batch in items
+                    )
+                    if not any(pending):
+                        if not all(source_complete):
+                            raise GPUSortCapacityError(
+                                "GPU sort could not prepare one bounded source batch."
+                            )
+                        ray.get(
+                            [
+                                actor.exchange_prepared_round.remote(
+                                    wave_id, self._next_exchange_id, [], True
+                                )
+                                for actor in self._rank_pool.actors
+                            ]
+                        )
+                        self._next_exchange_id += 1
+                        rounds_for_wave += 1
+                    while any(pending):
+                        plan_started = time.perf_counter()
+                        plan = _plan_exchange_round(
+                            pending,
+                            current_allocated_bytes=allocated,
+                            pool_max_bytes=pool_max,
+                        )
+                        self._exchange_plan_s += time.perf_counter() - plan_started
+                        selected = [set(values) for values in plan.batch_ids_by_rank]
+                        remaining = [
+                            [
+                                batch
+                                for batch in items
+                                if int(batch["batch_id"]) not in selected[rank]
+                            ]
+                            for rank, items in enumerate(pending)
+                        ]
+                        final_subround = not any(remaining) and all(source_complete)
+                        receipts = ray.get(
+                            [
+                                actor.exchange_prepared_round.remote(
+                                    wave_id,
+                                    self._next_exchange_id,
+                                    list(plan.batch_ids_by_rank[rank]),
+                                    final_subround,
+                                )
+                                for rank, actor in enumerate(self._rank_pool.actors)
+                            ]
+                        )
+                        self._next_exchange_id += 1
+                        rounds_for_wave += 1
+                        receipts_by_rank = {
+                            int(item["rank"]): dict(item) for item in receipts
+                        }
+                        if len(receipts_by_rank) != len(self._rank_pool.actors):
+                            raise RuntimeError(
+                                "GPU sort exchange receipts are incomplete or "
+                                "duplicated."
+                            )
+                        allocated = [
+                            int(receipts_by_rank[rank]["current_allocated_bytes"])
+                            for rank in range(len(self._rank_pool.actors))
+                        ]
+                        pending = remaining
+                        self._minimum_modeled_mpf_headroom_bytes = min(
+                            plan.modeled_headroom_bytes
+                            if self._minimum_modeled_mpf_headroom_bytes is None
+                            else (
+                                self._minimum_modeled_mpf_headroom_bytes,
+                                *plan.modeled_headroom_bytes,
+                            )
+                        )
+                        self._maximum_exchange_destination_bytes = max(
+                            self._maximum_exchange_destination_bytes,
+                            max(plan.incoming_bytes, default=0),
+                        )
+                    if all(source_complete):
+                        break
+                    prepared = ray.get(
+                        [
+                            actor.prepare_more.remote(wave_id)
+                            for actor in self._rank_pool.actors
+                        ]
+                    )
+                self._exchange_subround_count += rounds_for_wave
+                self._exchange_rounds_per_wave.append(rounds_for_wave)
             self._controller_phases["partition_and_exchange"] = (
                 time.perf_counter() - started
             )
@@ -863,6 +1094,15 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "initial_run_count",
                 "merge_pass_count",
                 "replacement_run_count",
+                "direct_final_merge_count",
+                "resident_final_fallback_count",
+                "concat_oom_fallback_count",
+                "run_sort_oom_retry_count",
+                "prepared_batch_count",
+                "prepared_bytes",
+                "preparation_retry_count",
+                "exchange_subround_count",
+                "forced_subround_run_count",
                 "h2d_bytes",
                 "planning_h2d_bytes",
                 "d2h_bytes",
@@ -942,6 +1182,29 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "auto_wave_fraction": float(self._config["auto_wave_fraction"]),
             "wave_target_bytes": self._wave_target_bytes,
             "wave_count": self._wave_count,
+            "exchange_subround_count": self._exchange_subround_count,
+            "exchange_rounds_per_wave": {
+                "min": min(self._exchange_rounds_per_wave, default=0),
+                "median": (
+                    sorted(self._exchange_rounds_per_wave)[
+                        len(self._exchange_rounds_per_wave) // 2
+                    ]
+                    if self._exchange_rounds_per_wave
+                    else 0
+                ),
+                "max": max(self._exchange_rounds_per_wave, default=0),
+            },
+            "exchange_plan_s": self._exchange_plan_s,
+            "prepared_batch_count": self._prepared_batch_count,
+            "prepared_bytes": self._prepared_bytes,
+            "preparation_retry_count": total("preparation_retry_count"),
+            "minimum_modeled_mpf_headroom_bytes": (
+                self._minimum_modeled_mpf_headroom_bytes
+            ),
+            "maximum_exchange_destination_bytes": (
+                self._maximum_exchange_destination_bytes
+            ),
+            "forced_subround_run_count": total("forced_subround_run_count"),
             "ranks": ranks,
             "externalized_bytes": externalized_bytes,
             "externalized_rows": total("externalized_rows"),
@@ -952,6 +1215,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 (int(item["merge_pass_count"]) for item in ranks), default=0
             ),
             "replacement_run_count": total("replacement_run_count"),
+            "direct_final_merge_count": total("direct_final_merge_count"),
+            "resident_final_fallback_count": total("resident_final_fallback_count"),
+            "concat_oom_fallback_count": total("concat_oom_fallback_count"),
+            "run_sort_oom_retry_count": total("run_sort_oom_retry_count"),
             "h2d_bytes": total("h2d_bytes"),
             "d2h_bytes": total("d2h_bytes"),
             "plasma_read_bytes": total("plasma_read_bytes"),
