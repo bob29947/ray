@@ -3,7 +3,8 @@
   "provenance": {
     "status": "historical_instrumented_candidate",
     "note": "These measurements predate the cleaned production-PR port and are not claimed for its exact head.",
-    "bundle_sha256": "203ae1f8853a8044b489f6a575fb14a7ab5e7fe60daa02b72210607f7b9dab33"
+    "bundle_sha256": "203ae1f8853a8044b489f6a575fb14a7ab5e7fe60daa02b72210607f7b9dab33",
+    "source_report_sha256": "96a08625bc6709a68e085f1c090614d18ad229635e5bfd1ba1b51412912cf534"
   },
   "hardware": {
     "instances": 16,
@@ -42,8 +43,16 @@
     {
       "cell": "narrow",
       "columns": 5,
-      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
-      "gpu_runs_s": [5.51878496, 5.369039348],
+      "keys": [
+        "Origin",
+        "Dest",
+        "FlightDate",
+        "CRSDepTime"
+      ],
+      "gpu_runs_s": [
+        5.51878496,
+        5.369039348
+      ],
       "gpu_median_s": 5.443912154,
       "archived_cpu_s": 69.060354022,
       "directional_speedup": 12.685795081,
@@ -53,8 +62,16 @@
     {
       "cell": "core",
       "columns": 57,
-      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
-      "gpu_runs_s": [19.002863193, 17.493820816],
+      "keys": [
+        "Origin",
+        "Dest",
+        "FlightDate",
+        "CRSDepTime"
+      ],
+      "gpu_runs_s": [
+        19.002863193,
+        17.493820816
+      ],
       "gpu_median_s": 18.248342005,
       "archived_cpu_s": 115.685597809,
       "directional_speedup": 6.339512805,
@@ -64,8 +81,16 @@
     {
       "cell": "full",
       "columns": 110,
-      "keys": ["Origin", "Dest", "FlightDate", "CRSDepTime"],
-      "gpu_runs_s": [31.531258089, 29.957716503],
+      "keys": [
+        "Origin",
+        "Dest",
+        "FlightDate",
+        "CRSDepTime"
+      ],
+      "gpu_runs_s": [
+        31.531258089,
+        29.957716503
+      ],
       "gpu_median_s": 30.744487296,
       "archived_cpu_s": 118.931498415,
       "directional_speedup": 3.86838451,
@@ -75,8 +100,13 @@
     {
       "cell": "origin-string",
       "columns": 110,
-      "keys": ["Origin"],
-      "gpu_runs_s": [32.200098735, 32.677273831],
+      "keys": [
+        "Origin"
+      ],
+      "gpu_runs_s": [
+        32.200098735,
+        32.677273831
+      ],
       "gpu_median_s": 32.438686283,
       "archived_cpu_s": 82.643108981,
       "directional_speedup": 2.547671267,
@@ -86,8 +116,13 @@
     {
       "cell": "origin-integer",
       "columns": 110,
-      "keys": ["OriginAirportID"],
-      "gpu_runs_s": [32.480864087, 32.15791596],
+      "keys": [
+        "OriginAirportID"
+      ],
+      "gpu_runs_s": [
+        32.480864087,
+        32.15791596
+      ],
       "gpu_median_s": 32.319390024,
       "archived_cpu_s": 59.01210554,
       "directional_speedup": 1.825904062,
@@ -97,8 +132,14 @@
     {
       "cell": "route",
       "columns": 110,
-      "keys": ["Origin", "Dest"],
-      "gpu_runs_s": [30.257975651, 29.579216727],
+      "keys": [
+        "Origin",
+        "Dest"
+      ],
+      "gpu_runs_s": [
+        30.257975651,
+        29.579216727
+      ],
       "gpu_median_s": 29.918596189,
       "archived_cpu_s": 122.76029441,
       "directional_speedup": 4.103143531,
@@ -112,19 +153,31 @@
       "rows": 80738761,
       "blocks": 627,
       "input_gib": 63.8807415,
-      "gpu_runs_s": [31.531258089, 29.957716503],
+      "gpu_runs_s": [
+        31.531258089,
+        29.957716503
+      ],
       "gpu_median_s": 30.744487296,
       "archived_cpu_s": 118.931498415,
       "directional_speedup": 3.86838451,
-      "externalized_gib": 0.0,
-      "initial_runs": [0, 0],
-      "merge_passes": [0, 0],
-      "output_blocks": [16, 16],
-      "ray_nvme_write_gib": 0.0,
-      "ray_nvme_restore_gib": 0.0,
+      "externalized_gib": 0,
+      "initial_runs": [
+        0,
+        0
+      ],
+      "merge_passes": [
+        0,
+        0
+      ],
+      "output_blocks": [
+        16,
+        16
+      ],
+      "ray_nvme_write_gib": 0,
+      "ray_nvme_restore_gib": 0,
       "h2d_amplification": 1.000000105,
       "d2h_amplification": 1.000283676,
-      "plasma_read_amplification": 0.0,
+      "plasma_read_amplification": 0,
       "plasma_write_amplification": 1.000283676
     },
     {
@@ -132,34 +185,61 @@
       "rows": 161477522,
       "blocks": 1254,
       "input_gib": 127.761483001,
-      "gpu_runs_s": [98.82175816, 96.942566387],
+      "gpu_runs_s": [
+        98.82175816,
+        96.942566387
+      ],
       "gpu_median_s": 97.882162274,
       "archived_cpu_s": 499.945776287,
       "directional_speedup": 5.107629058,
       "externalized_gib": 127.770929997,
-      "initial_runs": [49, 49],
-      "merge_passes": [1, 1],
-      "output_blocks": [190, 188],
+      "initial_runs": [
+        49,
+        49
+      ],
+      "merge_passes": [
+        1,
+        1
+      ],
+      "output_blocks": [
+        190,
+        188
+      ],
       "ray_nvme_write_gib": 383.348767788,
       "ray_nvme_restore_gib": 14.454941375,
       "h2d_amplification": 2.000073995,
       "d2h_amplification": 2.000124037,
       "plasma_read_amplification": 1.000073942,
-      "plasma_write_amplification": 2.000124037
+      "plasma_write_amplification": 2.000124037,
+      "archived_cpu_ray_nvme_write_gib": 269.23976857122034,
+      "archived_cpu_ray_nvme_restore_gib": 4.383449203334749,
+      "archived_cpu_spill_comparison": "cross-campaign directional, one observation"
     },
     {
       "scale": "2.45x",
       "rows": 197809964,
       "blocks": 1543,
       "input_gib": 156.505241037,
-      "gpu_runs_s": [96.823575519, 82.745090932],
+      "gpu_runs_s": [
+        96.823575519,
+        82.745090932
+      ],
       "gpu_median_s": 89.784333226,
       "archived_cpu_s": null,
       "directional_speedup": null,
       "externalized_gib": 156.516288638,
-      "initial_runs": [51, 50],
-      "merge_passes": [1, 1],
-      "output_blocks": [207, 209],
+      "initial_runs": [
+        51,
+        50
+      ],
+      "merge_passes": [
+        1,
+        1
+      ],
+      "output_blocks": [
+        207,
+        209
+      ],
       "ray_nvme_write_gib": 316.872436018,
       "ray_nvme_restore_gib": 103.202955372,
       "h2d_amplification": 2.000070632,
