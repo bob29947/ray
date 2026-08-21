@@ -491,6 +491,66 @@ def _operator_config(data_context: DataContext) -> Dict[str, Any]:
     ).to_actor_dict()
 
 
+def _communication_environment(data_context: DataContext) -> Dict[str, str]:
+    """Resolve the transport environment before any rank imports UCXX.
+
+    Ray installs this mapping as an actor ``runtime_env``.  In particular,
+    RAPIDS-MPF must use non-threaded polling on the 16-GPU DGX so lazy
+    endpoint creation stays inline while MPF advances the worker explicitly.
+    """
+
+    def resolve(
+        context_name: str,
+        environment_names: Sequence[str],
+        default: str,
+    ) -> str:
+        value = data_context.get_config(context_name, None)
+        if value is None:
+            value = next(
+                (
+                    os.environ[name]
+                    for name in environment_names
+                    if os.environ.get(name) is not None
+                ),
+                default,
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{context_name} must be a nonempty string.")
+        return value
+
+    return {
+        "UCX_TLS": resolve(
+            "gpu_sort_ucx_tls",
+            ("RAY_DATA_GPU_SORT_UCX_TLS", "UCX_TLS"),
+            "cuda_copy,cuda_ipc,sm,tcp",
+        ),
+        "UCX_SOCKADDR_TLS_PRIORITY": resolve(
+            "gpu_sort_ucx_sockaddr_tls_priority",
+            (
+                "RAY_DATA_GPU_SORT_UCX_SOCKADDR_TLS_PRIORITY",
+                "UCX_SOCKADDR_TLS_PRIORITY",
+            ),
+            "tcp",
+        ),
+        "UCX_MEMTYPE_CACHE": "n",
+        "UCX_LOG_LEVEL": "warn",
+        "RAPIDSMPF_LOG": "WARN",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE": resolve(
+            "gpu_sort_ucxx_progress_mode",
+            (
+                "RAY_DATA_GPU_SORT_UCXX_PROGRESS_MODE",
+                "RAPIDSMPF_UCXX_PROGRESS_MODE",
+            ),
+            # MPF's progress loop advances UCXX explicitly in non-threaded
+            # modes.  Keeping endpoint creation inline avoids depending on a
+            # separate UCXX progress thread to service its own creation
+            # callback before the UCXX deadline.
+            "polling",
+        ),
+        "CUDF_SPILL": "0",
+    }
+
+
 class _RankPool:
     """Fresh, non-detached one-actor-per-GPU rank pool."""
 
@@ -500,11 +560,13 @@ class _RankPool:
         key_columns: List[str],
         ascending: List[bool],
         config: Dict[str, Any],
+        communication_environment: Dict[str, str],
     ) -> None:
         self.nranks = nranks
         self.key_columns = key_columns
         self.ascending = ascending
         self.config = config
+        self.communication_environment = dict(communication_environment)
         self.actors: List[ActorHandle] = []
         self.rank_infos: List[Dict[str, Any]] = []
         self._shutdown_lock = threading.Lock()
@@ -517,6 +579,7 @@ class _RankPool:
                 num_gpus=1,
                 num_cpus=1,
                 scheduling_strategy="SPREAD",
+                runtime_env={"env_vars": self.communication_environment},
             ).remote(
                 nranks=self.nranks,
                 index=rank,
@@ -524,6 +587,7 @@ class _RankPool:
                 ascending=self.ascending,
                 num_partitions=self.nranks,
                 config=self.config,
+                communication_environment=self.communication_environment,
             )
             for rank in range(self.nranks)
         ]
@@ -601,6 +665,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         nranks = _derive_num_ranks(data_context)
         descending = list(sort_key.get_descending())
         config = _operator_config(data_context)
+        communication_environment = _communication_environment(data_context)
         super().__init__(
             name=f"GPUSort(keys={key_columns}, ranks={nranks})",
             input_dependencies=[input_op],
@@ -610,7 +675,11 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._key_columns = key_columns
         self._config = config
         self._rank_pool = _RankPool(
-            nranks, key_columns, [not value for value in descending], config
+            nranks,
+            key_columns,
+            [not value for value in descending],
+            config,
+            communication_environment,
         )
         self._input_blocks: List[_InputBlock] = []
         self._blocks_by_rank: List[List[_InputBlock]] = [[] for _ in range(nranks)]

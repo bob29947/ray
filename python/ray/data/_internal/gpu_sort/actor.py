@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterator, List
 
 import ray
@@ -60,7 +61,17 @@ class GPUSortActor:
         ascending: List[bool],
         num_partitions: int,
         config: Dict[str, Any],
+        communication_environment: Dict[str, str],
     ) -> None:
+        self._communication_environment = {
+            name: os.environ.get(name) for name in communication_environment
+        }
+        if self._communication_environment != communication_environment:
+            raise RuntimeError(
+                "GPU sort actor communication environment differs from its "
+                f"requested runtime_env: requested={communication_environment!r}, "
+                f"effective={self._communication_environment!r}"
+            )
         try:
             from ray.data._internal.gpu_sort.backend import get_backend_class
 
@@ -89,6 +100,7 @@ class GPUSortActor:
         result["usable_memory_budget_bytes"] = int(
             result.get("memory_budget_bytes", 0) or 0
         )
+        result["communication_environment"] = dict(self._communication_environment)
         return result
 
     def is_ready(self) -> bool:
@@ -146,6 +158,7 @@ class GPUSortActor:
         result["usable_memory_budget_bytes"] = int(
             result.get("memory_budget_bytes", 0) or 0
         )
+        result["communication_environment"] = dict(self._communication_environment)
         return result
 
     def release(self) -> None:

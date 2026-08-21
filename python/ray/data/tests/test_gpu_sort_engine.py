@@ -28,8 +28,10 @@ from ray.data._internal.gpu_sort.config import GPUSortCapacityError, GPUSortConf
 from ray.data._internal.gpu_sort.operator import (
     _MPF_PROGRESS_RESERVE_BYTES,
     _InputBlock,
+    _RankPool,
     _allocate_stratified_sample_quotas,
     _assign_blocks_by_locality,
+    _communication_environment,
     _make_waves,
     _operator_config,
     _plan_exchange_round,
@@ -290,6 +292,196 @@ def test_gpu_sort_operator_config_wires_local_run_store_controls():
     assert config["external_run_min_free_bytes"] == 4 << 40
     assert config["external_run_max_live_bytes"] == 1 << 40
     assert config["merge_fan_in"] == 7
+
+
+def test_gpu_sort_communication_environment_has_actor_native_defaults(monkeypatch):
+    names = (
+        "RAY_DATA_GPU_SORT_UCX_TLS",
+        "UCX_TLS",
+        "RAY_DATA_GPU_SORT_UCX_SOCKADDR_TLS_PRIORITY",
+        "UCX_SOCKADDR_TLS_PRIORITY",
+        "RAY_DATA_GPU_SORT_UCXX_PROGRESS_MODE",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE",
+        "UCX_MEMTYPE_CACHE",
+        "UCX_LOG_LEVEL",
+        "RAPIDSMPF_LOG",
+        "CUDF_SPILL",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    context = types.SimpleNamespace(get_config=lambda _name, default: default)
+
+    assert _communication_environment(context) == {
+        "UCX_TLS": "cuda_copy,cuda_ipc,sm,tcp",
+        "UCX_SOCKADDR_TLS_PRIORITY": "tcp",
+        "UCX_MEMTYPE_CACHE": "n",
+        "UCX_LOG_LEVEL": "warn",
+        "RAPIDSMPF_LOG": "WARN",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE": "polling",
+        "CUDF_SPILL": "0",
+    }
+
+
+def test_gpu_sort_communication_environment_honors_safe_overrides(monkeypatch):
+    monkeypatch.setenv("UCX_TLS", "cuda_copy,sm,tcp")
+    monkeypatch.setenv("UCX_SOCKADDR_TLS_PRIORITY", "sockcm")
+    monkeypatch.setenv("RAPIDSMPF_UCXX_PROGRESS_MODE", "thread-blocking")
+    # These settings are intentionally fixed for allocator and benchmark safety.
+    monkeypatch.setenv("UCX_MEMTYPE_CACHE", "try")
+    monkeypatch.setenv("UCX_LOG_LEVEL", "debug")
+    monkeypatch.setenv("RAPIDSMPF_LOG", "TRACE")
+    monkeypatch.setenv("CUDF_SPILL", "1")
+    inherited_context = types.SimpleNamespace(get_config=lambda _name, default: default)
+
+    inherited = _communication_environment(inherited_context)
+
+    assert inherited["UCX_TLS"] == "cuda_copy,sm,tcp"
+    assert inherited["UCX_SOCKADDR_TLS_PRIORITY"] == "sockcm"
+    assert inherited["RAPIDSMPF_UCXX_PROGRESS_MODE"] == "thread-blocking"
+    assert inherited["UCX_MEMTYPE_CACHE"] == "n"
+    assert inherited["UCX_LOG_LEVEL"] == "warn"
+    assert inherited["RAPIDSMPF_LOG"] == "WARN"
+    assert inherited["CUDF_SPILL"] == "0"
+
+    values = {
+        "gpu_sort_ucx_tls": "cuda_copy,cuda_ipc,sm,tcp",
+        "gpu_sort_ucx_sockaddr_tls_priority": "tcp",
+        "gpu_sort_ucxx_progress_mode": "thread-polling",
+    }
+    context = types.SimpleNamespace(
+        get_config=lambda name, default: values.get(name, default)
+    )
+
+    environment = _communication_environment(context)
+
+    assert environment == {
+        "UCX_TLS": "cuda_copy,cuda_ipc,sm,tcp",
+        "UCX_SOCKADDR_TLS_PRIORITY": "tcp",
+        "UCX_MEMTYPE_CACHE": "n",
+        "UCX_LOG_LEVEL": "warn",
+        "RAPIDSMPF_LOG": "WARN",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE": "thread-polling",
+        "CUDF_SPILL": "0",
+    }
+
+
+def test_gpu_sort_rank_pool_installs_actor_scoped_communication_environment(
+    monkeypatch,
+):
+    environment = {
+        "UCX_TLS": "cuda_copy,cuda_ipc,sm,tcp",
+        "UCX_SOCKADDR_TLS_PRIORITY": "tcp",
+        "UCX_MEMTYPE_CACHE": "n",
+        "UCX_LOG_LEVEL": "warn",
+        "RAPIDSMPF_LOG": "WARN",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE": "thread-polling",
+        "CUDF_SPILL": "0",
+    }
+    option_calls = []
+    constructor_calls = []
+
+    class RemoteMethod:
+        def __init__(self, function):
+            self._function = function
+
+        def remote(self, *args):
+            return self._function(*args)
+
+    class Actor:
+        def __init__(self, index):
+            self.setup_root = RemoteMethod(lambda: (0, b"root"))
+            self.setup_worker = RemoteMethod(
+                lambda _address: {
+                    "rank": index,
+                    "memory_budget_bytes": 1,
+                    "communication_environment": dict(environment),
+                }
+            )
+            self.is_ready = RemoteMethod(lambda: True)
+
+    class ActorFactory:
+        @classmethod
+        def options(cls, **options):
+            option_calls.append(options)
+            return cls()
+
+        def remote(self, **arguments):
+            constructor_calls.append(arguments)
+            return Actor(arguments["index"])
+
+    monkeypatch.setattr(gpu_sort_actor, "GPUSortActor", ActorFactory)
+    monkeypatch.setattr(ray, "get", lambda value, timeout=None: value)
+    pool = _RankPool(
+        2,
+        ["Origin"],
+        [True],
+        {"setup_timeout_s": 1.0},
+        environment,
+    )
+
+    pool.start()
+
+    assert len(pool.actors) == 2
+    assert all(
+        options["runtime_env"] == {"env_vars": environment} for options in option_calls
+    )
+    assert all(
+        arguments["communication_environment"] == environment
+        for arguments in constructor_calls
+    )
+    assert all(
+        info["communication_environment"] == environment for info in pool.rank_infos
+    )
+
+
+def test_gpu_sort_actor_reports_effective_communication_environment(monkeypatch):
+    environment = {
+        "UCX_TLS": "cuda_copy,cuda_ipc,sm,tcp",
+        "UCX_SOCKADDR_TLS_PRIORITY": "tcp",
+        "UCX_MEMTYPE_CACHE": "n",
+        "UCX_LOG_LEVEL": "warn",
+        "RAPIDSMPF_LOG": "WARN",
+        "RAPIDSMPF_UCXX_PROGRESS_MODE": "thread-polling",
+        "CUDF_SPILL": "0",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    class Backend:
+        def __init__(self, **_arguments):
+            pass
+
+        def setup_worker(self, _address):
+            return {"rank": 0, "memory_budget_bytes": 123}
+
+        def diagnostics(self):
+            return {"rank": 0, "memory_budget_bytes": 123}
+
+    from ray.data._internal.gpu_sort import backend as gpu_sort_backend
+
+    monkeypatch.setattr(gpu_sort_backend, "get_backend_class", lambda: Backend)
+    monkeypatch.setattr(
+        ray,
+        "get_runtime_context",
+        lambda: types.SimpleNamespace(get_node_id=lambda: "node-1"),
+    )
+    actor_class = gpu_sort_actor.GPUSortActor.__ray_metadata__.modified_class
+    actor = actor_class(
+        nranks=1,
+        index=0,
+        key_columns=["Origin"],
+        ascending=[True],
+        num_partitions=1,
+        config={},
+        communication_environment=environment,
+    )
+
+    setup = actor.setup_worker(b"root")
+    diagnostics = actor.diagnostics()
+
+    assert setup["communication_environment"] == environment
+    assert diagnostics["communication_environment"] == environment
+    assert setup["node_id"] == diagnostics["node_id"] == "node-1"
 
 
 def test_gpu_sort_bounded_input_batching_preserves_order_and_chunks():
