@@ -1,0 +1,848 @@
+{
+  "benchmark_label": "wide synthetic tabular transform",
+  "pairs": [
+    {
+      "batch_size": 125000,
+      "complete_artifacts": [
+        "smoke-1m-125k-isolated",
+        "smoke-1m-125k-isolated-b",
+        "smoke2-1m-125k-fused",
+        "smoke2-1m-125k-isolated"
+      ],
+      "reasons": [
+        "expected one eligible isolated observation, found 2",
+        "expected one eligible fused observation, found 0"
+      ],
+      "rows": 1000000,
+      "status": "disqualified"
+    },
+    {
+      "batch_size": 125000,
+      "comparison": {
+        "cost_savings_fraction": 0.703213,
+        "dollars_saved": 0.41525268,
+        "speedup": 3.369418
+      },
+      "complete_artifacts": [
+        "8m-125k-fused2",
+        "8m-125k-isolated2"
+      ],
+      "fused": {
+        "accepted_with_default_spill": false,
+        "actor_startup_seconds": 2.355883406,
+        "artifact": "8m-125k-fused2",
+        "cost_per_million_rows_usd": 0.0219069,
+        "digest": "xxh64-row-sum-v1:0297cf6055b49266:365ac86f70373a2a",
+        "elapsed_seconds": 59.60159107,
+        "execution_cost_usd": 0.17525517,
+        "gpu_slots": 8,
+        "mode": "fused",
+        "normalized_cost_per_billion_rows_usd": 21.90689592,
+        "output": {
+          "blocks": 192,
+          "bytes": 24160000000,
+          "materialized": true,
+          "rows": 8000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 1,
+        "rows_per_second": 134224.604686,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 0,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 0,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 64,
+          "CategoricalVocabularyLookup": 64,
+          "NumericFillNulls": 64,
+          "NumericLog1p": 64,
+          "NumericStandardize": 64
+        },
+        "stage_rows": {
+          "CategoricalToString": 8000000,
+          "CategoricalVocabularyLookup": 8000000,
+          "NumericFillNulls": 8000000,
+          "NumericLog1p": 8000000,
+          "NumericStandardize": 8000000
+        },
+        "tail_seconds": 0.531703849,
+        "vram": {
+          "peak_fraction": 0.075405,
+          "peak_node_bytes": 1821245440,
+          "peak_process_bytes": 1327497216,
+          "peak_process_fraction": 0.056109
+        }
+      },
+      "isolated": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.430096468,
+        "artifact": "8m-125k-isolated2",
+        "cost_per_million_rows_usd": 0.07381348,
+        "digest": "xxh64-row-sum-v1:0297cf6055b49266:365ac86f70373a2a",
+        "elapsed_seconds": 200.8226502,
+        "execution_cost_usd": 0.59050785,
+        "gpu_slots": 8,
+        "mode": "isolated",
+        "normalized_cost_per_billion_rows_usd": 73.81348076,
+        "output": {
+          "blocks": 192,
+          "bytes": 24160000000,
+          "materialized": true,
+          "rows": 8000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p)",
+          "MapBatches(NumericStandardize)",
+          "MapBatches(NumericFillNulls)",
+          "MapBatches(CategoricalToString)",
+          "MapBatches(CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 5,
+        "rows_per_second": 39836.143941,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 18623202276,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 18623202276,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 64,
+          "CategoricalVocabularyLookup": 64,
+          "NumericFillNulls": 64,
+          "NumericLog1p": 64,
+          "NumericStandardize": 64
+        },
+        "stage_rows": {
+          "CategoricalToString": 8000000,
+          "CategoricalVocabularyLookup": 8000000,
+          "NumericFillNulls": 8000000,
+          "NumericLog1p": 8000000,
+          "NumericStandardize": 8000000
+        },
+        "tail_seconds": 0.2653856,
+        "vram": {
+          "peak_fraction": 0.06047,
+          "peak_node_bytes": 1460535296,
+          "peak_process_bytes": 966787072,
+          "peak_process_fraction": 0.040863
+        }
+      },
+      "reasons": [],
+      "rows": 8000000,
+      "status": "qualified"
+    },
+    {
+      "batch_size": 250000,
+      "comparison": {
+        "cost_savings_fraction": 0.7148,
+        "dollars_saved": 0.28492495,
+        "speedup": 3.506306
+      },
+      "complete_artifacts": [
+        "8m-250k-fused2",
+        "8m-250k-isolated2"
+      ],
+      "fused": {
+        "accepted_with_default_spill": false,
+        "actor_startup_seconds": 2.78027313,
+        "artifact": "8m-250k-fused2",
+        "cost_per_million_rows_usd": 0.0142104,
+        "digest": "xxh64-row-sum-v1:0297cf6055b49266:365ac86f70373a2a",
+        "elapsed_seconds": 38.661914988,
+        "execution_cost_usd": 0.11368321,
+        "gpu_slots": 8,
+        "mode": "fused",
+        "normalized_cost_per_billion_rows_usd": 14.21040164,
+        "output": {
+          "blocks": 192,
+          "bytes": 24160000000,
+          "materialized": true,
+          "rows": 8000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 1,
+        "rows_per_second": 206921.980002,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 0,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 0,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 32,
+          "CategoricalVocabularyLookup": 32,
+          "NumericFillNulls": 32,
+          "NumericLog1p": 32,
+          "NumericStandardize": 32
+        },
+        "stage_rows": {
+          "CategoricalToString": 8000000,
+          "CategoricalVocabularyLookup": 8000000,
+          "NumericFillNulls": 8000000,
+          "NumericLog1p": 8000000,
+          "NumericStandardize": 8000000
+        },
+        "tail_seconds": 0.97897567,
+        "vram": {
+          "peak_fraction": 0.121424,
+          "peak_node_bytes": 2932736000,
+          "peak_process_bytes": 2438987776,
+          "peak_process_fraction": 0.103089
+        }
+      },
+      "isolated": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.933854234,
+        "artifact": "8m-250k-isolated2",
+        "cost_per_million_rows_usd": 0.04982602,
+        "digest": "xxh64-row-sum-v1:0297cf6055b49266:365ac86f70373a2a",
+        "elapsed_seconds": 135.560514973,
+        "execution_cost_usd": 0.39860816,
+        "gpu_slots": 8,
+        "mode": "isolated",
+        "normalized_cost_per_billion_rows_usd": 49.82602039,
+        "output": {
+          "blocks": 192,
+          "bytes": 24160000000,
+          "materialized": true,
+          "rows": 8000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p)",
+          "MapBatches(NumericStandardize)",
+          "MapBatches(NumericFillNulls)",
+          "MapBatches(CategoricalToString)",
+          "MapBatches(CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 5,
+        "rows_per_second": 59014.234356,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 21941877281,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 21941877281,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 32,
+          "CategoricalVocabularyLookup": 32,
+          "NumericFillNulls": 32,
+          "NumericLog1p": 32,
+          "NumericStandardize": 32
+        },
+        "stage_rows": {
+          "CategoricalToString": 8000000,
+          "CategoricalVocabularyLookup": 8000000,
+          "NumericFillNulls": 8000000,
+          "NumericLog1p": 8000000,
+          "NumericStandardize": 8000000
+        },
+        "tail_seconds": 0.42055737,
+        "vram": {
+          "peak_fraction": 0.091642,
+          "peak_node_bytes": 2213412864,
+          "peak_process_bytes": 1719664640,
+          "peak_process_fraction": 0.072685
+        }
+      },
+      "reasons": [],
+      "rows": 8000000,
+      "status": "qualified"
+    },
+    {
+      "batch_size": 400000,
+      "complete_artifacts": [
+        "8m-400k-fused2",
+        "8m-400k-isolated2"
+      ],
+      "reasons": [
+        "expected one eligible isolated observation, found 0"
+      ],
+      "rows": 8000000,
+      "status": "disqualified"
+    },
+    {
+      "batch_size": 125000,
+      "comparison": {
+        "cost_savings_fraction": 0.710844,
+        "dollars_saved": 0.81936771,
+        "speedup": 3.458337
+      },
+      "complete_artifacts": [
+        "16m-125k-fused2",
+        "16m-125k-isolated2"
+      ],
+      "fused": {
+        "accepted_with_default_spill": false,
+        "actor_startup_seconds": 2.318557804,
+        "artifact": "16m-125k-fused2",
+        "cost_per_million_rows_usd": 0.02083135,
+        "digest": "xxh64-row-sum-v1:e4bd16fe2bbc6820:1ca6203bebd4fb2f",
+        "elapsed_seconds": 113.350771813,
+        "execution_cost_usd": 0.33330165,
+        "gpu_slots": 8,
+        "mode": "fused",
+        "normalized_cost_per_billion_rows_usd": 20.83135295,
+        "output": {
+          "blocks": 384,
+          "bytes": 48320000000,
+          "materialized": true,
+          "rows": 16000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 1,
+        "rows_per_second": 141154.751257,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 0,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 0,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 128,
+          "CategoricalVocabularyLookup": 128,
+          "NumericFillNulls": 128,
+          "NumericLog1p": 128,
+          "NumericStandardize": 128
+        },
+        "stage_rows": {
+          "CategoricalToString": 16000000,
+          "CategoricalVocabularyLookup": 16000000,
+          "NumericFillNulls": 16000000,
+          "NumericLog1p": 16000000,
+          "NumericStandardize": 16000000
+        },
+        "tail_seconds": 0.728386872,
+        "vram": {
+          "peak_fraction": 0.075405,
+          "peak_node_bytes": 1821245440,
+          "peak_process_bytes": 1327497216,
+          "peak_process_fraction": 0.056109
+        }
+      },
+      "isolated": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.306986158,
+        "artifact": "16m-125k-isolated2",
+        "cost_per_million_rows_usd": 0.07204183,
+        "digest": "xxh64-row-sum-v1:e4bd16fe2bbc6820:1ca6203bebd4fb2f",
+        "elapsed_seconds": 392.005147638,
+        "execution_cost_usd": 1.15266936,
+        "gpu_slots": 8,
+        "mode": "isolated",
+        "normalized_cost_per_billion_rows_usd": 72.04183491,
+        "output": {
+          "blocks": 384,
+          "bytes": 48320000000,
+          "materialized": true,
+          "rows": 16000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p)",
+          "MapBatches(NumericStandardize)",
+          "MapBatches(NumericFillNulls)",
+          "MapBatches(CategoricalToString)",
+          "MapBatches(CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 5,
+        "rows_per_second": 40815.790549,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 37247370160,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 37247370160,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 128,
+          "CategoricalVocabularyLookup": 128,
+          "NumericFillNulls": 128,
+          "NumericLog1p": 128,
+          "NumericStandardize": 128
+        },
+        "stage_rows": {
+          "CategoricalToString": 16000000,
+          "CategoricalVocabularyLookup": 16000000,
+          "NumericFillNulls": 16000000,
+          "NumericLog1p": 16000000,
+          "NumericStandardize": 16000000
+        },
+        "tail_seconds": 0.262887576,
+        "vram": {
+          "peak_fraction": 0.06047,
+          "peak_node_bytes": 1460535296,
+          "peak_process_bytes": 966787072,
+          "peak_process_fraction": 0.040863
+        }
+      },
+      "reasons": [],
+      "rows": 16000000,
+      "status": "qualified"
+    },
+    {
+      "batch_size": 250000,
+      "comparison": {
+        "cost_savings_fraction": 0.732001,
+        "dollars_saved": 0.55356506,
+        "speedup": 3.73136
+      },
+      "complete_artifacts": [
+        "16m-250k-fused2",
+        "16m-250k-isolated2"
+      ],
+      "fused": {
+        "accepted_with_default_spill": false,
+        "actor_startup_seconds": 2.860729582,
+        "artifact": "16m-250k-fused2",
+        "cost_per_million_rows_usd": 0.01266688,
+        "digest": "xxh64-row-sum-v1:e4bd16fe2bbc6820:1ca6203bebd4fb2f",
+        "elapsed_seconds": 68.924988164,
+        "execution_cost_usd": 0.2026701,
+        "gpu_slots": 8,
+        "mode": "fused",
+        "normalized_cost_per_billion_rows_usd": 12.66688116,
+        "output": {
+          "blocks": 384,
+          "bytes": 48320000000,
+          "materialized": true,
+          "rows": 16000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 1,
+        "rows_per_second": 232136.419986,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 0,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 0,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 64,
+          "CategoricalVocabularyLookup": 64,
+          "NumericFillNulls": 64,
+          "NumericLog1p": 64,
+          "NumericStandardize": 64
+        },
+        "stage_rows": {
+          "CategoricalToString": 16000000,
+          "CategoricalVocabularyLookup": 16000000,
+          "NumericFillNulls": 16000000,
+          "NumericLog1p": 16000000,
+          "NumericStandardize": 16000000
+        },
+        "tail_seconds": 0.989786758,
+        "vram": {
+          "peak_fraction": 0.121424,
+          "peak_node_bytes": 2932736000,
+          "peak_process_bytes": 2438987776,
+          "peak_process_fraction": 0.103089
+        }
+      },
+      "isolated": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.835127832,
+        "artifact": "16m-250k-isolated2",
+        "cost_per_million_rows_usd": 0.0472647,
+        "digest": "xxh64-row-sum-v1:e4bd16fe2bbc6820:1ca6203bebd4fb2f",
+        "elapsed_seconds": 257.183965205,
+        "execution_cost_usd": 0.75623516,
+        "gpu_slots": 8,
+        "mode": "isolated",
+        "normalized_cost_per_billion_rows_usd": 47.26469761,
+        "output": {
+          "blocks": 384,
+          "bytes": 48320000000,
+          "materialized": true,
+          "rows": 16000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p)",
+          "MapBatches(NumericStandardize)",
+          "MapBatches(NumericFillNulls)",
+          "MapBatches(CategoricalToString)",
+          "MapBatches(CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 5,
+        "rows_per_second": 62212.276676,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 43967917286,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 43967917286,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 64,
+          "CategoricalVocabularyLookup": 64,
+          "NumericFillNulls": 64,
+          "NumericLog1p": 64,
+          "NumericStandardize": 64
+        },
+        "stage_rows": {
+          "CategoricalToString": 16000000,
+          "CategoricalVocabularyLookup": 16000000,
+          "NumericFillNulls": 16000000,
+          "NumericLog1p": 16000000,
+          "NumericStandardize": 16000000
+        },
+        "tail_seconds": 3.303723505,
+        "vram": {
+          "peak_fraction": 0.091642,
+          "peak_node_bytes": 2213412864,
+          "peak_process_bytes": 1719664640,
+          "peak_process_fraction": 0.072685
+        }
+      },
+      "reasons": [],
+      "rows": 16000000,
+      "status": "qualified"
+    },
+    {
+      "batch_size": 400000,
+      "complete_artifacts": [
+        "16m-400k-fused2",
+        "16m-400k-isolated2"
+      ],
+      "reasons": [
+        "expected one eligible isolated observation, found 0"
+      ],
+      "rows": 16000000,
+      "status": "disqualified"
+    },
+    {
+      "batch_size": 250000,
+      "comparison": {
+        "cost_savings_fraction": 0.752783,
+        "dollars_saved": 0.90080436,
+        "speedup": 4.045027
+      },
+      "complete_artifacts": [
+        "24m-250k-fused2",
+        "24m-250k-isolated2"
+      ],
+      "fused": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.769928182,
+        "artifact": "24m-250k-fused2",
+        "cost_per_million_rows_usd": 0.01232617,
+        "digest": "xxh64-row-sum-v1:4b2d522ba357b0b4:be7fb1550e6e2896",
+        "elapsed_seconds": 100.606582506,
+        "execution_cost_usd": 0.29582807,
+        "gpu_slots": 8,
+        "mode": "fused",
+        "normalized_cost_per_billion_rows_usd": 12.32616944,
+        "output": {
+          "blocks": 576,
+          "bytes": 72480000000,
+          "materialized": true,
+          "rows": 24000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 1,
+        "rows_per_second": 238552.97936,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 144494669038,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 144494669038,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 96,
+          "CategoricalVocabularyLookup": 96,
+          "NumericFillNulls": 96,
+          "NumericLog1p": 96,
+          "NumericStandardize": 96
+        },
+        "stage_rows": {
+          "CategoricalToString": 24000000,
+          "CategoricalVocabularyLookup": 24000000,
+          "NumericFillNulls": 24000000,
+          "NumericLog1p": 24000000,
+          "NumericStandardize": 24000000
+        },
+        "tail_seconds": 3.071225526,
+        "vram": {
+          "peak_fraction": 0.121424,
+          "peak_node_bytes": 2932736000,
+          "peak_process_bytes": 2438987776,
+          "peak_process_fraction": 0.103089
+        }
+      },
+      "isolated": {
+        "accepted_with_default_spill": true,
+        "actor_startup_seconds": 2.780121102,
+        "artifact": "24m-250k-isolated2",
+        "cost_per_million_rows_usd": 0.04985968,
+        "digest": "xxh64-row-sum-v1:4b2d522ba357b0b4:be7fb1550e6e2896",
+        "elapsed_seconds": 406.956312917,
+        "execution_cost_usd": 1.19663243,
+        "gpu_slots": 8,
+        "mode": "isolated",
+        "normalized_cost_per_billion_rows_usd": 49.85968456,
+        "output": {
+          "blocks": 576,
+          "bytes": 72480000000,
+          "materialized": true,
+          "rows": 24000000,
+          "schema_columns": 755
+        },
+        "physical_map_names": [
+          "MapBatches(NumericLog1p)",
+          "MapBatches(NumericStandardize)",
+          "MapBatches(NumericFillNulls)",
+          "MapBatches(CategoricalToString)",
+          "MapBatches(CategoricalVocabularyLookup)"
+        ],
+        "physical_maps": 5,
+        "rows_per_second": 58974.389236,
+        "spill_restore": {
+          "object_store_restored_bytes": 0,
+          "object_store_spilled_bytes": 81120439761,
+          "ray_data_dataset_spilled_bytes": 0,
+          "ray_data_global_restored_bytes": 0,
+          "ray_data_global_spilled_bytes": 81120439761,
+          "ray_data_operator_spilled_bytes": 0
+        },
+        "stage_invocations": {
+          "CategoricalToString": 96,
+          "CategoricalVocabularyLookup": 96,
+          "NumericFillNulls": 96,
+          "NumericLog1p": 96,
+          "NumericStandardize": 96
+        },
+        "stage_rows": {
+          "CategoricalToString": 24000000,
+          "CategoricalVocabularyLookup": 24000000,
+          "NumericFillNulls": 24000000,
+          "NumericLog1p": 24000000,
+          "NumericStandardize": 24000000
+        },
+        "tail_seconds": 17.43008376,
+        "vram": {
+          "peak_fraction": 0.091642,
+          "peak_node_bytes": 2213412864,
+          "peak_process_bytes": 1719664640,
+          "peak_process_fraction": 0.072685
+        }
+      },
+      "reasons": [],
+      "rows": 24000000,
+      "status": "qualified"
+    }
+  ],
+  "pricing": {
+    "cluster_hourly_price_usd": 10.5856,
+    "node_count": 8,
+    "node_hourly_price_usd": 1.3232
+  },
+  "scan": {
+    "complete_artifacts": 18,
+    "disqualified_observations": [
+      {
+        "artifact": "smoke2-1m-125k-fused",
+        "batch_size": 125000,
+        "mode": "fused",
+        "reasons": [
+          "benchmark rejection: fused run used fewer than seven GPUs: 4",
+          "fused execution used fewer than seven GPU slots"
+        ],
+        "rows": 1000000
+      },
+      {
+        "artifact": "smoke-1m-125k-isolated",
+        "batch_size": 125000,
+        "mode": "isolated",
+        "reasons": [
+          "benchmark rejection: numeric null/NaN-to-zero counts do not match the source contract"
+        ],
+        "rows": 1000000
+      },
+      {
+        "artifact": "8m-400k-isolated2",
+        "batch_size": 400000,
+        "mode": "isolated",
+        "reasons": [
+          "benchmark rejection: stage batch totals differ: {'NumericLog1p': 37, 'NumericStandardize': 36, 'NumericFillNulls': 35, 'CategoricalToString': 34, 'CategoricalVocabularyLookup': 34}"
+        ],
+        "rows": 8000000
+      },
+      {
+        "artifact": "16m-400k-isolated2",
+        "batch_size": 400000,
+        "mode": "isolated",
+        "reasons": [
+          "benchmark rejection: stage batch totals differ: {'NumericLog1p': 73, 'NumericStandardize': 72, 'NumericFillNulls': 71, 'CategoricalToString': 70, 'CategoricalVocabularyLookup': 70}"
+        ],
+        "rows": 16000000
+      }
+    ],
+    "eligible_observations": 14,
+    "ignored_incomplete": [
+      {
+        "name": "smoke-1m-125k-fused",
+        "reason": "missing observation-result.json"
+      }
+    ]
+  },
+  "schema_version": 1,
+  "summary": {
+    "fastest_fused": {
+      "accepted_with_default_spill": false,
+      "actor_startup_seconds": 2.78027313,
+      "artifact": "8m-250k-fused2",
+      "batch_size": 250000,
+      "cost_per_million_rows_usd": 0.0142104,
+      "digest": "xxh64-row-sum-v1:0297cf6055b49266:365ac86f70373a2a",
+      "elapsed_seconds": 38.661914988,
+      "execution_cost_usd": 0.11368321,
+      "gpu_slots": 8,
+      "mode": "fused",
+      "normalized_cost_per_billion_rows_usd": 14.21040164,
+      "output": {
+        "blocks": 192,
+        "bytes": 24160000000,
+        "materialized": true,
+        "rows": 8000000,
+        "schema_columns": 755
+      },
+      "physical_map_names": [
+        "MapBatches(NumericLog1p->NumericStandardize->NumericFillNulls->CategoricalToString->CategoricalVocabularyLookup)"
+      ],
+      "physical_maps": 1,
+      "rows": 8000000,
+      "rows_per_second": 206921.980002,
+      "spill_restore": {
+        "object_store_restored_bytes": 0,
+        "object_store_spilled_bytes": 0,
+        "ray_data_dataset_spilled_bytes": 0,
+        "ray_data_global_restored_bytes": 0,
+        "ray_data_global_spilled_bytes": 0,
+        "ray_data_operator_spilled_bytes": 0
+      },
+      "stage_invocations": {
+        "CategoricalToString": 32,
+        "CategoricalVocabularyLookup": 32,
+        "NumericFillNulls": 32,
+        "NumericLog1p": 32,
+        "NumericStandardize": 32
+      },
+      "stage_rows": {
+        "CategoricalToString": 8000000,
+        "CategoricalVocabularyLookup": 8000000,
+        "NumericFillNulls": 8000000,
+        "NumericLog1p": 8000000,
+        "NumericStandardize": 8000000
+      },
+      "tail_seconds": 0.97897567,
+      "vram": {
+        "peak_fraction": 0.121424,
+        "peak_node_bytes": 2932736000,
+        "peak_process_bytes": 2438987776,
+        "peak_process_fraction": 0.103089
+      }
+    },
+    "fastest_isolated": {
+      "accepted_with_default_spill": false,
+      "actor_startup_seconds": 2.372483369,
+      "artifact": "smoke2-1m-125k-isolated",
+      "batch_size": 125000,
+      "cost_per_million_rows_usd": 0.09899297,
+      "digest": "xxh64-row-sum-v1:ecde5c6b2850abb8:84c5fa2fbd849006",
+      "elapsed_seconds": 33.665987325,
+      "execution_cost_usd": 0.09899297,
+      "gpu_slots": 7,
+      "mode": "isolated",
+      "normalized_cost_per_billion_rows_usd": 98.9929654,
+      "output": {
+        "blocks": 24,
+        "bytes": 3020000000,
+        "materialized": true,
+        "rows": 1000000,
+        "schema_columns": 755
+      },
+      "physical_map_names": [
+        "MapBatches(NumericLog1p)",
+        "MapBatches(NumericStandardize)",
+        "MapBatches(NumericFillNulls)",
+        "MapBatches(CategoricalToString)",
+        "MapBatches(CategoricalVocabularyLookup)"
+      ],
+      "physical_maps": 5,
+      "rows": 1000000,
+      "rows_per_second": 29703.569669,
+      "spill_restore": {
+        "object_store_restored_bytes": 0,
+        "object_store_spilled_bytes": 0,
+        "ray_data_dataset_spilled_bytes": 0,
+        "ray_data_global_restored_bytes": 0,
+        "ray_data_global_spilled_bytes": 0,
+        "ray_data_operator_spilled_bytes": 0
+      },
+      "stage_invocations": {
+        "CategoricalToString": 8,
+        "CategoricalVocabularyLookup": 8,
+        "NumericFillNulls": 8,
+        "NumericLog1p": 8,
+        "NumericStandardize": 8
+      },
+      "stage_rows": {
+        "CategoricalToString": 1000000,
+        "CategoricalVocabularyLookup": 1000000,
+        "NumericFillNulls": 1000000,
+        "NumericLog1p": 1000000,
+        "NumericStandardize": 1000000
+      },
+      "tail_seconds": 0.467005797,
+      "vram": {
+        "peak_fraction": 0.060297,
+        "peak_node_bytes": 1456340992,
+        "peak_process_bytes": 966787072,
+        "peak_process_fraction": 0.040863
+      }
+    },
+    "maximum_same_setting": {
+      "batch_size": 250000,
+      "cost_savings_fraction": 0.752783,
+      "dollars_saved": 0.90080436,
+      "rows": 24000000,
+      "speedup": 4.045027
+    },
+    "qualified_pairs": 5
+  }
+}
