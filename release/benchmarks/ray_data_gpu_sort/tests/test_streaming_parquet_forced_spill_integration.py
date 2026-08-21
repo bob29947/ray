@@ -46,7 +46,7 @@ from ray.data.context import ShuffleStrategy
 from ray.data.datasource import Datasource, ReadTask
 
 from release.benchmarks.ray_data_gpu_sort.streaming_parquet_e2e_worker import (
-    _origin_frequency_digest,
+    _frequency_digest,
     _validate_durable_parquet,
 )
 from release.benchmarks.ray_data_gpu_sort.streaming_parquet_sink import (
@@ -346,10 +346,15 @@ def test_cpu_push_sort_forces_ray_spill_and_commits_sorted_parquet() -> None:
             output,
             result,
             _SCHEMA,
+            sort_key="Origin",
             expected_rows=_TOTAL_ROWS,
             expected_row_id_sum=_TOTAL_ROWS * (_TOTAL_ROWS - 1) // 2,
-            expected_origin_cardinality=len(_ORIGINS),
-            expected_origin_frequency_digest=_origin_frequency_digest(expected),
+            expected_sort_key_stats={
+                "arrow_type": "string",
+                "null_rows": 0,
+                "cardinality": len(_ORIGINS),
+                "frequency_digest": _frequency_digest(expected),
+            },
         )
         assert validation["valid"], validation["rejection_reasons"]
         assert result["telemetry"]["transaction_committed"] is True

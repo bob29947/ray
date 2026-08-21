@@ -18,7 +18,10 @@ from release.benchmarks.ray_data_gpu_sort.streaming_parquet_e2e import (
     GATE_SCHEMA_VERSION,
     GATE_SEQUENCE,
     IMPLEMENTATION_BRANCH,
+    ORIGIN_AIRPORT_ID_KEY,
     RUN_SEQUENCE,
+    SMOKE_SEQUENCE,
+    SORT_KEY_STATS,
     TARGET_BLOCKS,
     TARGET_DECODED_BYTES,
     TARGET_PLAN_DIGEST,
@@ -30,31 +33,54 @@ from release.benchmarks.ray_data_gpu_sort.streaming_parquet_e2e import (
     _safe_campaign_root,
     _validate_prerequisite_gates,
     _wait_for_worker,
+    _worker_command,
     summarize,
 )
 from release.benchmarks.ray_data_gpu_sort.streaming_parquet_e2e_worker import (
     _capacity_failure,
-    _origin_frequency_digest,
+    _configure_context,
+    _frequency_digest,
     _safe_runtime,
     _timed_pipeline_capacity_failure,
     _timeline,
     _validate_durable_parquet,
 )
 
+GPU_ORIGIN_ID_SPEC = next(
+    item
+    for item in RUN_SEQUENCE
+    if item.backend == "gpu" and item.sort_key == ORIGIN_AIRPORT_ID_KEY
+)
+CPU_ORIGIN_ID_SPEC = next(
+    item
+    for item in RUN_SEQUENCE
+    if item.backend == "pyarrow" and item.sort_key == ORIGIN_AIRPORT_ID_KEY
+)
 
-def _artifact(name: str, backend: str, seconds: float) -> dict:
+
+def _artifact(
+    name: str, backend: str, seconds: float, sort_key: str = ORIGIN_AIRPORT_ID_KEY
+) -> dict:
     return {
         "valid": True,
         "status": "accepted",
         "trial_name": name,
         "backend": backend,
         "workload": "full",
+        "sort_key": sort_key,
         "timings_s": {"e2e": seconds},
     }
 
 
+def _accepted_matrix(*, gpu_s: float = 100.0, cpu_s: float = 250.0) -> list[dict]:
+    return [
+        _artifact(GPU_ORIGIN_ID_SPEC.name, "gpu", gpu_s),
+        _artifact(CPU_ORIGIN_ID_SPEC.name, "pyarrow", cpu_s),
+    ]
+
+
 def test_frozen_contract_and_unprefixed_branch_name():
-    assert IMPLEMENTATION_BRANCH == "streaming-parquet-gpu-sort-e2e"
+    assert IMPLEMENTATION_BRANCH == "origin-airport-id-1tb-parquet-e2e"
     assert "codex" not in IMPLEMENTATION_BRANCH
     assert TARGET_ROWS == 1_177_097_812
     assert TARGET_BLOCKS == 9_151
@@ -62,6 +88,13 @@ def test_frozen_contract_and_unprefixed_branch_name():
     assert TARGET_PLAN_DIGEST == (
         "e80163bbc681bc8b04b34d273a4bcdb58b52ef4cbe794b92f07f01bb4d00226c"
     )
+    assert [item.backend for item in RUN_SEQUENCE] == ["gpu", "pyarrow"]
+    assert [item.backend for item in SMOKE_SEQUENCE] == ["gpu", "pyarrow"]
+    assert {item.sort_key for item in (*SMOKE_SEQUENCE, *RUN_SEQUENCE)} == {
+        ORIGIN_AIRPORT_ID_KEY,
+    }
+    assert tuple(SORT_KEY_STATS) == (ORIGIN_AIRPORT_ID_KEY,)
+    assert SORT_KEY_STATS[ORIGIN_AIRPORT_ID_KEY]["cardinality"] == 401
 
 
 def test_controller_has_separate_gate_smoke_and_full_commands():
@@ -69,6 +102,41 @@ def test_controller_has_separate_gate_smoke_and_full_commands():
     assert parser.parse_args(["gates"]).command == "gates"
     assert parser.parse_args(["smoke"]).command == "smoke"
     assert parser.parse_args(["run"]).command == "run"
+
+
+def test_cpu_context_overrides_only_push_shuffle(tmp_path):
+    from ray.data import DataContext
+    from ray.data.context import ShuffleStrategy
+
+    context = DataContext.get_current()
+    old_preserve_order = context.execution_options.preserve_order
+    old_target_max_block_size = context.target_max_block_size
+    old_shuffle_strategy = context.shuffle_strategy
+    old_use_polars = context.use_polars
+    old_use_polars_sort = context.use_polars_sort
+    try:
+        context.execution_options.preserve_order = False
+        context.target_max_block_size = 128 << 20
+        context.shuffle_strategy = ShuffleStrategy.HASH_SHUFFLE
+        context.use_polars = False
+        context.use_polars_sort = False
+        configured = _configure_context("pyarrow", tmp_path)
+        assert configured == {
+            "backend": "pyarrow",
+            "shuffle_strategy": ShuffleStrategy.SORT_SHUFFLE_PUSH_BASED.value,
+            "preserve_order": False,
+            "target_max_block_size": 128 << 20,
+            "use_polars": False,
+            "use_polars_sort": False,
+            "pre_override_shuffle_strategy": ShuffleStrategy.HASH_SHUFFLE.value,
+            "cpu_sort_overrides": ["shuffle_strategy"],
+        }
+    finally:
+        context.execution_options.preserve_order = old_preserve_order
+        context.target_max_block_size = old_target_max_block_size
+        context.shuffle_strategy = old_shuffle_strategy
+        context.use_polars = old_use_polars
+        context.use_polars_sort = old_use_polars_sort
 
 
 def test_gate_command_preserves_virtualenv_invocation_symlink(tmp_path):
@@ -80,6 +148,18 @@ def test_gate_command_preserves_virtualenv_invocation_symlink(tmp_path):
 
     assert command[0] == str(python.absolute())
     assert command[0] != str(python.resolve())
+
+
+def test_worker_command_binds_the_sort_key(tmp_path):
+    command, _, _ = _worker_command(
+        python=tmp_path / "venv" / "bin" / "python",
+        dataset_root=tmp_path / "dataset",
+        campaign_root=tmp_path / "campaign",
+        spec=GPU_ORIGIN_ID_SPEC,
+        expected_head="a" * 40,
+        expected_dataset_identity={"identity_digest": "b" * 64},
+    )
+    assert command[command.index("--sort-key") + 1] == ORIGIN_AIRPORT_ID_KEY
 
 
 def test_dataset_identity_binds_and_verifies_selected_parquet_bytes(
@@ -171,25 +251,48 @@ def test_worker_runtime_rejects_broad_or_out_of_scope_paths(value):
 
 
 def test_directional_summary_reports_cpu_over_gpu():
-    result = summarize(
-        [
-            _artifact(RUN_SEQUENCE[0].name, "gpu", 100.0),
-            _artifact(RUN_SEQUENCE[1].name, "pyarrow", 250.0),
-        ]
+    artifacts = _accepted_matrix()
+    gpu = next(
+        item for item in artifacts if item["trial_name"] == GPU_ORIGIN_ID_SPEC.name
     )
+    gpu["gpu_stats"] = {
+        "ranks": [{"rank": rank} for rank in range(16)],
+        "input_object_refs_received": 9_166,
+        "initial_run_count": 144,
+        "source_run_count": 128,
+    }
+    cpu = next(
+        item for item in artifacts if item["trial_name"] == CPU_ORIGIN_ID_SPEC.name
+    )
+    cpu["cpu_stats"] = {"blocking_all_to_all": {"input_blocks_received": 9_166}}
+    result = summarize(artifacts)
     assert result["valid"]
-    assert result["observations_per_arm"] == 1
-    assert result["cpu_over_gpu"] == 2.5
-    assert result["gpu_reached_2x"] is True
+    assert result["observations_per_backend_per_key"] == 1
+    assert result["cpu_over_gpu"][ORIGIN_AIRPORT_ID_KEY] == 2.5
+    assert result["results_by_sort_key"][ORIGIN_AIRPORT_ID_KEY]["gpu_reached_2x"]
+    geometry = result["results_by_sort_key"][ORIGIN_AIRPORT_ID_KEY][
+        "execution_geometry"
+    ]
+    assert geometry == {
+        "planned_source_slices": TARGET_BLOCKS,
+        "gpu": {
+            "ranks": 16,
+            "input_object_refs_received": 9_166,
+            "initial_run_count": 144,
+            "source_run_count": 128,
+        },
+        "cpu": {"input_blocks_received": 9_166},
+    }
 
 
 def test_directional_summary_retains_cpu_capacity_result():
     cpu = {
         "valid": False,
         "status": "capacity-failure",
-        "trial_name": RUN_SEQUENCE[1].name,
+        "trial_name": CPU_ORIGIN_ID_SPEC.name,
         "backend": "pyarrow",
         "workload": "full",
+        "sort_key": ORIGIN_AIRPORT_ID_KEY,
         "timed_pipeline_started": True,
         "last_durable_phase": {
             "phase": "pipeline-finished",
@@ -201,10 +304,60 @@ def test_directional_summary_retains_cpu_capacity_result():
         "controller": {"returncode": 2, "timed_out": False},
         "timings_s": {},
     }
-    result = summarize([_artifact(RUN_SEQUENCE[0].name, "gpu", 100.0), cpu])
+    artifacts = [
+        item for item in _accepted_matrix() if item["trial_name"] != cpu["trial_name"]
+    ]
+    result = summarize([*artifacts, cpu])
     assert result["valid"]
-    assert result["cpu_capacity_result"] == "capacity-failure"
-    assert result["cpu_over_gpu"] is None
+    origin_id = result["results_by_sort_key"][ORIGIN_AIRPORT_ID_KEY]
+    assert origin_id["cpu_capacity_result"] == "capacity-failure"
+    assert origin_id["cpu_over_gpu"] is None
+
+
+def test_directional_summary_never_uses_invalid_capacity_elapsed_time():
+    artifacts = _accepted_matrix()
+    cpu = next(
+        item for item in artifacts if item["trial_name"] == CPU_ORIGIN_ID_SPEC.name
+    )
+    cpu.update(
+        {
+            "valid": False,
+            "status": "capacity-failure",
+            "timed_pipeline_started": True,
+            "last_durable_phase": {
+                "phase": "pipeline-finished",
+                "timed_pipeline_started": True,
+                "timed_pipeline_finished": True,
+                "pipeline_succeeded": False,
+                "pipeline_failure_is_capacity": True,
+            },
+            "controller": {"returncode": 2, "timed_out": False},
+            "timings_s": {"e2e": 999.0},
+        }
+    )
+    result = summarize(artifacts)
+    origin_id = result["results_by_sort_key"][ORIGIN_AIRPORT_ID_KEY]
+    assert result["valid"]
+    assert origin_id["cpu_e2e_s"] is None
+    assert origin_id["cpu_over_gpu"] is None
+
+
+def test_directional_summary_rejects_mislabeled_artifact():
+    artifacts = _accepted_matrix()
+    gpu = next(
+        item for item in artifacts if item["trial_name"] == GPU_ORIGIN_ID_SPEC.name
+    )
+    gpu["sort_key"] = "unexpected_key"
+
+    result = summarize(artifacts)
+
+    assert not result["valid"]
+    assert any(
+        "GPU artifact identity mismatch" in item for item in result["rejection_reasons"]
+    )
+    origin_id = result["results_by_sort_key"][ORIGIN_AIRPORT_ID_KEY]
+    assert origin_id["gpu_e2e_s"] is None
+    assert origin_id["cpu_over_gpu"] is None
 
 
 def test_capacity_classification_is_conservative():
@@ -267,10 +420,10 @@ def test_controller_capacity_acceptance_requires_phase_specific_proof():
 
 
 def test_persisted_e2e_deadline_is_enforced_after_phase_flip():
-    artifact = _artifact(RUN_SEQUENCE[1].name, "pyarrow", TRIAL_TIMEOUT_S + 0.25)
+    artifact = _artifact(CPU_ORIGIN_ID_SPEC.name, "pyarrow", TRIAL_TIMEOUT_S + 0.25)
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=0,
         timed_out=False,
         timeout_phase=None,
@@ -288,10 +441,10 @@ def test_persisted_e2e_deadline_is_enforced_after_phase_flip():
         "persisted-e2e-deadline"
     )
 
-    gpu = _artifact(RUN_SEQUENCE[0].name, "gpu", TRIAL_TIMEOUT_S + 0.25)
+    gpu = _artifact(GPU_ORIGIN_ID_SPEC.name, "gpu", TRIAL_TIMEOUT_S + 0.25)
     _apply_controller_outcome(
         gpu,
-        spec=RUN_SEQUENCE[0],
+        spec=GPU_ORIGIN_ID_SPEC,
         returncode=0,
         timed_out=False,
         timeout_phase=None,
@@ -360,7 +513,7 @@ def test_sigkill_needs_running_phase_and_kernel_oom_delta():
     }
     _apply_controller_outcome(
         proved,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=-9,
         timed_out=False,
         timeout_phase=None,
@@ -393,7 +546,7 @@ def test_sigkill_needs_running_phase_and_kernel_oom_delta():
     }
     _apply_controller_outcome(
         unexplained,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=-9,
         timed_out=False,
         timeout_phase=None,
@@ -443,7 +596,7 @@ def test_ray_child_oom_requires_session_cgroup_and_terminal_failure_phase():
     }
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=1,
         timed_out=False,
         timeout_phase=None,
@@ -484,7 +637,7 @@ def test_ray_child_oom_requires_session_cgroup_and_terminal_failure_phase():
     }
     _apply_controller_outcome(
         host_only,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=1,
         timed_out=False,
         timeout_phase=None,
@@ -534,7 +687,7 @@ def test_post_timer_oom_cannot_validate_an_earlier_ray_child_crash():
     }
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=1,
         timed_out=False,
         timeout_phase=None,
@@ -576,7 +729,7 @@ def test_sigkill_before_timed_pipeline_is_never_capacity_oom():
     phase["kernel_oom_baseline"]["session_cgroup"] = before
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=-9,
         timed_out=False,
         timeout_phase=None,
@@ -618,7 +771,7 @@ def test_prelaunch_oom_increment_cannot_prove_timed_pipeline_oom():
     }
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=-9,
         timed_out=False,
         timeout_phase=None,
@@ -648,7 +801,7 @@ def test_post_pipeline_timeout_is_not_a_cpu_capacity_result():
     }
     _apply_controller_outcome(
         artifact,
-        spec=RUN_SEQUENCE[1],
+        spec=CPU_ORIGIN_ID_SPEC,
         returncode=-15,
         timed_out=True,
         timeout_phase="post-pipeline",
@@ -781,7 +934,7 @@ def test_bounded_durable_validator_reopens_committed_parquet(tmp_path):
     output = tmp_path / "output"
     table = pa.table(
         {
-            "Origin": pa.array(["ATL", "ATL", "BOS"]),
+            ORIGIN_AIRPORT_ID_KEY: pa.array([10135, 10135, 10257], type=pa.int64()),
             "row_id": pa.array([2, 0, 1], type=pa.int64()),
         }
     )
@@ -796,14 +949,58 @@ def test_bounded_durable_validator_reopens_committed_parquet(tmp_path):
         output,
         sink.result,
         table.schema,
+        sort_key=ORIGIN_AIRPORT_ID_KEY,
         expected_rows=3,
         expected_row_id_sum=3,
-        expected_origin_cardinality=2,
-        expected_origin_frequency_digest=_origin_frequency_digest({"ATL": 2, "BOS": 1}),
+        expected_sort_key_stats={
+            "null_rows": 0,
+            "cardinality": 2,
+            "min": 10135,
+            "max": 10257,
+            "frequency_digest": _frequency_digest({"10135": 2, "10257": 1}),
+        },
     )
     assert validation["valid"], validation["rejection_reasons"]
     assert validation["file_count"] == 1
     assert validation["row_group_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("values", "valid"),
+    (([1, 2, None], True), ([1, None, 2], False)),
+)
+def test_durable_validator_enforces_numeric_nulls_last(tmp_path, values, valid):
+    output = tmp_path / "output"
+    table = pa.table(
+        {
+            ORIGIN_AIRPORT_ID_KEY: pa.array(values, type=pa.int64()),
+            "row_id": pa.array([0, 1, 2], type=pa.int64()),
+        }
+    )
+    sink = StreamingParquetDatasink(output)
+    sink.on_write_start(table.schema)
+    receipt = sink.write([table], TaskContext(task_idx=0, op_name="test"))
+    sink.on_write_complete(
+        WriteResult(num_rows=3, size_bytes=table.nbytes, write_returns=[receipt])
+    )
+    assert sink.result is not None
+    validation = _validate_durable_parquet(
+        output,
+        sink.result,
+        table.schema,
+        sort_key=ORIGIN_AIRPORT_ID_KEY,
+        expected_rows=3,
+        expected_row_id_sum=3,
+        expected_sort_key_stats={
+            "null_rows": 1,
+            "cardinality": 2,
+            "min": 1,
+            "max": 2,
+            "frequency_digest": _frequency_digest({"1": 1, "2": 1}),
+        },
+    )
+    assert validation["valid"] is valid
+    assert validation["nulls_last"] is valid
 
 
 def test_worker_contains_no_intermediate_dataset_actions():

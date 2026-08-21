@@ -18,8 +18,9 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
+from .backend_stats import value as stat_value
 from .data import plan_dict, smoke_slices
 from .streaming_parquet_common import (
     EXPECTED_CPUS,
@@ -29,10 +30,11 @@ from .streaming_parquet_common import (
     MIN_CAMPAIGN_FREE_BYTES,
     MIN_HOST_AVAILABLE_BYTES,
     OBJECT_STORE_BYTES,
+    ORIGIN_AIRPORT_ID_KEY,
+    SORT_KEY_STATS,
+    SUPPORTED_SORT_KEYS,
     TARGET_BLOCKS,
     TARGET_DECODED_BYTES,
-    TARGET_ORIGIN_CARDINALITY,
-    TARGET_ORIGIN_FREQUENCY_DIGEST,
     TARGET_PLAN_DIGEST,
     TARGET_ROWS,
     TARGET_ROW_ID_SUM,
@@ -56,7 +58,7 @@ from .spec import (
 )
 
 PACKAGE = "release.benchmarks.ray_data_gpu_sort.streaming_parquet_e2e_worker"
-IMPLEMENTATION_BRANCH = "streaming-parquet-gpu-sort-e2e"
+IMPLEMENTATION_BRANCH = "origin-airport-id-1tb-parquet-e2e"
 STREAMING_SORT_BASE_COMMIT = "1442fad4af1b7e58e5ceba27a3a8a8dfdc6f95fc"
 RAID_ROOT = Path("/raid")
 TRIAL_TIMEOUT_S = 24 * 60 * 60
@@ -131,6 +133,7 @@ class TrialSpec:
     name: str
     backend: str
     workload: str
+    sort_key: str
 
     @property
     def is_gpu(self) -> bool:
@@ -138,12 +141,22 @@ class TrialSpec:
 
 
 SMOKE_SEQUENCE = (
-    TrialSpec("smoke-gpu-local", "gpu", "smoke"),
-    TrialSpec("smoke-cpu-push", "pyarrow", "smoke"),
+    TrialSpec("smoke-gpu-origin-airport-id", "gpu", "smoke", ORIGIN_AIRPORT_ID_KEY),
+    TrialSpec(
+        "smoke-cpu-push-origin-airport-id",
+        "pyarrow",
+        "smoke",
+        ORIGIN_AIRPORT_ID_KEY,
+    ),
 )
 RUN_SEQUENCE = (
-    TrialSpec("gpu-streaming-local-1tb", "gpu", "full"),
-    TrialSpec("cpu-streaming-push-1tb", "pyarrow", "full"),
+    TrialSpec("gpu-origin-airport-id-1tb", "gpu", "full", ORIGIN_AIRPORT_ID_KEY),
+    TrialSpec(
+        "cpu-push-origin-airport-id-1tb",
+        "pyarrow",
+        "full",
+        ORIGIN_AIRPORT_ID_KEY,
+    ),
 )
 
 
@@ -289,27 +302,40 @@ def frozen_campaign(dataset_root: Path) -> dict[str, Any]:
         "schema_version": 1,
         "question": (
             "Streaming GPU local-RunStore sort versus streaming CPU push-based "
-            "PyArrow for one identical Parquet-to-Parquet pipeline"
+            "PyArrow for identical Origin Airport ID Parquet-to-Parquet pipelines"
         ),
         "workload": {
             "rows": TARGET_ROWS,
             "planned_input_blocks": TARGET_BLOCKS,
             "decoded_input_bytes": TARGET_DECODED_BYTES,
             "columns": 110,
-            "key": "Origin",
+            "sort_keys": {
+                key: {
+                    name: value
+                    for name, value in SORT_KEY_STATS[key].items()
+                    if name != "smoke"
+                }
+                for key in SUPPORTED_SORT_KEYS
+            },
             "descending": False,
             "nulls": "last",
             "plan_digest": plan["digest"],
             "row_id_sum": TARGET_ROW_ID_SUM,
-            "origin_cardinality": TARGET_ORIGIN_CARDINALITY,
-            "origin_frequency_digest": TARGET_ORIGIN_FREQUENCY_DIGEST,
         },
         "dataset_identity": _dataset_identity(dataset_root, verify_parquet_files=False),
         "resources": {
             "logical_cpus": EXPECTED_CPUS,
             "gpu_arm_v100s": EXPECTED_GPUS,
             "object_store_bytes": OBJECT_STORE_BYTES,
-            "ray_target_max_block_size_bytes": 512 << 20,
+            "object_store_configuration": "Ray default, asserted after startup",
+            "ray_target_max_block_size_bytes": 128 << 20,
+            "ray_target_max_block_size_configuration": "DataContext default",
+            "max_direct_call_object_size_bytes": 100 << 10,
+            "max_direct_call_object_size_configuration": (
+                "expected Ray default; no private system override"
+            ),
+            "cpu_preserve_order": False,
+            "cpu_sort_override": "SORT_SHUFFLE_PUSH_BASED only",
             "gpu_input_buffer_budget_bytes": INPUT_BUFFER_BUDGET_BYTES,
             "gpu_exchange_chunk_bytes": 512 << 20,
             "gpu_run_chunk_bytes": 512 << 20,
@@ -503,6 +529,8 @@ def _worker_command(
         spec.backend,
         "--workload",
         spec.workload,
+        "--sort-key",
+        spec.sort_key,
         "--expected-plan-digest",
         expected_digest,
         "--expected-git-head",
@@ -1062,6 +1090,22 @@ def _apply_controller_outcome(
     return artifact
 
 
+def _artifact_spec_mismatches(
+    artifact: Mapping[str, Any], spec: TrialSpec
+) -> list[str]:
+    expected = {
+        "trial_name": spec.name,
+        "backend": spec.backend,
+        "workload": spec.workload,
+        "sort_key": spec.sort_key,
+    }
+    return [
+        f"{field}={artifact.get(field)!r} (expected {value!r})"
+        for field, value in expected.items()
+        if artifact.get(field) != value
+    ]
+
+
 def _run_worker(
     *,
     root: Path,
@@ -1121,6 +1165,7 @@ def _run_worker(
             "trial_name": spec.name,
             "backend": spec.backend,
             "workload": spec.workload,
+            "sort_key": spec.sort_key,
             "dataset_identity": dict(expected_dataset_identity),
             "timed_pipeline_started": bool(last_phase.get("timed_pipeline_started")),
             "last_durable_phase": last_phase,
@@ -1148,6 +1193,13 @@ def _run_worker(
         cgroup_oom_before=oom_before_snapshot.get("session_cgroup"),
         cgroup_oom_after=oom_after_snapshot.get("session_cgroup"),
     )
+    identity_mismatches = _artifact_spec_mismatches(artifact, spec)
+    if identity_mismatches:
+        _mark_rejected(
+            artifact,
+            "worker artifact identity differs from its frozen trial: "
+            + ", ".join(identity_mismatches),
+        )
     if artifact.get("dataset_identity") != dict(expected_dataset_identity):
         _mark_rejected(
             artifact,
@@ -1669,42 +1721,137 @@ def _accepted_capacity_result(artifact: Mapping[str, Any]) -> bool:
     return False
 
 
+def _execution_geometry(
+    gpu: Mapping[str, Any] | None, cpu: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    gpu_geometry = None
+    if gpu is not None:
+        stats = dict(gpu.get("gpu_stats") or {})
+        ranks = stat_value(stats, "ranks", "per_rank", "backend.ranks", default=[])
+        if isinstance(ranks, (list, tuple, dict)):
+            rank_count: int | None = len(ranks)
+        else:
+            rank_count = None
+        gpu_geometry = {
+            "ranks": rank_count,
+            "input_object_refs_received": stat_value(
+                stats, "input_object_refs_received", default=None
+            ),
+            "initial_run_count": stat_value(stats, "initial_run_count", default=None),
+            "source_run_count": stat_value(stats, "source_run_count", default=None),
+        }
+
+    cpu_geometry = None
+    if cpu is not None:
+        stats = cpu.get("cpu_stats") or {}
+        blocking = stats.get("blocking_all_to_all", {})
+        cpu_geometry = {
+            "input_blocks_received": blocking.get("input_blocks_received"),
+        }
+    return {
+        "planned_source_slices": TARGET_BLOCKS,
+        "gpu": gpu_geometry,
+        "cpu": cpu_geometry,
+    }
+
+
 def summarize(artifacts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     by_name = {str(item.get("trial_name")): item for item in artifacts}
-    gpu = by_name.get(RUN_SEQUENCE[0].name)
-    cpu = by_name.get(RUN_SEQUENCE[1].name)
     reasons: list[str] = []
-    if gpu is None or not gpu.get("valid"):
-        reasons.append("the one GPU performance observation is missing or rejected")
-    if cpu is None:
-        reasons.append("the one CPU performance observation is missing")
-    elif not cpu.get("valid") and not _accepted_capacity_result(cpu):
-        reasons.append("the CPU observation failed for a non-capacity reason")
+    results: dict[str, Any] = {}
+    ratios: dict[str, Optional[float]] = {}
+    for sort_key in SUPPORTED_SORT_KEYS:
+        gpu_spec = next(
+            item
+            for item in RUN_SEQUENCE
+            if item.sort_key == sort_key and item.backend == "gpu"
+        )
+        cpu_spec = next(
+            item
+            for item in RUN_SEQUENCE
+            if item.sort_key == sort_key and item.backend == "pyarrow"
+        )
+        gpu = by_name.get(gpu_spec.name)
+        cpu = by_name.get(cpu_spec.name)
+        gpu_mismatches = [] if gpu is None else _artifact_spec_mismatches(gpu, gpu_spec)
+        cpu_mismatches = [] if cpu is None else _artifact_spec_mismatches(cpu, cpu_spec)
+        if gpu is None:
+            reasons.append(f"{sort_key}: GPU observation is missing or rejected")
+        elif gpu_mismatches:
+            reasons.append(
+                f"{sort_key}: GPU artifact identity mismatch: "
+                + ", ".join(gpu_mismatches)
+            )
+        elif gpu.get("valid") is not True:
+            reasons.append(f"{sort_key}: GPU observation is missing or rejected")
+        if cpu is None:
+            reasons.append(f"{sort_key}: CPU observation is missing")
+        elif cpu_mismatches:
+            reasons.append(
+                f"{sort_key}: CPU artifact identity mismatch: "
+                + ", ".join(cpu_mismatches)
+            )
+        elif cpu.get("valid") is not True and not _accepted_capacity_result(cpu):
+            reasons.append(f"{sort_key}: CPU failed for a non-capacity reason")
 
-    gpu_s = None if gpu is None else gpu.get("timings_s", {}).get("e2e")
-    cpu_s = None if cpu is None else cpu.get("timings_s", {}).get("e2e")
-    ratio = None
-    if isinstance(gpu_s, (int, float)) and isinstance(cpu_s, (int, float)) and gpu_s:
-        ratio = float(cpu_s) / float(gpu_s)
+        accepted_gpu = (
+            gpu
+            if gpu is not None and not gpu_mismatches and gpu.get("valid") is True
+            else None
+        )
+        accepted_cpu = (
+            cpu
+            if cpu is not None and not cpu_mismatches and cpu.get("valid") is True
+            else None
+        )
+        gpu_s = (
+            None
+            if accepted_gpu is None
+            else accepted_gpu.get("timings_s", {}).get("e2e")
+        )
+        cpu_s = (
+            None
+            if accepted_cpu is None
+            else accepted_cpu.get("timings_s", {}).get("e2e")
+        )
+        ratio = None
+        if (
+            isinstance(gpu_s, (int, float))
+            and isinstance(cpu_s, (int, float))
+            and gpu_s
+        ):
+            ratio = float(cpu_s) / float(gpu_s)
+        ratios[sort_key] = ratio
+        results[sort_key] = {
+            "gpu_trial": gpu_spec.name,
+            "cpu_trial": cpu_spec.name,
+            "gpu_e2e_s": gpu_s,
+            "gpu_e2e_minutes": None if gpu_s is None else float(gpu_s) / 60,
+            "cpu_e2e_s": cpu_s,
+            "cpu_e2e_minutes": None if cpu_s is None else float(cpu_s) / 60,
+            "cpu_capacity_result": (
+                None if cpu is None or cpu.get("valid") is True else cpu.get("status")
+            ),
+            "cpu_over_gpu": ratio,
+            "gpu_reached_2x": None if ratio is None else ratio >= 2,
+            "execution_geometry": _execution_geometry(accepted_gpu, accepted_cpu),
+        }
     return {
         "valid": not reasons,
         "rejection_reasons": reasons,
         "directional": True,
-        "observations_per_arm": 1,
-        "gpu_e2e_s": gpu_s,
-        "gpu_e2e_minutes": None if gpu_s is None else float(gpu_s) / 60,
-        "cpu_e2e_s": cpu_s,
-        "cpu_e2e_minutes": None if cpu_s is None else float(cpu_s) / 60,
-        "cpu_capacity_result": (
-            None if cpu is None or cpu.get("valid") else cpu.get("status")
-        ),
-        "cpu_over_gpu": ratio,
-        "gpu_reached_2x": None if ratio is None else ratio >= 2,
-        "historical_gpu_local_ipc_s": 2829.415758983,
-        "historical_context_warning": (
-            "cross-format and cross-implementation context only; not an "
-            "apples-to-apples speedup"
-        ),
+        "observations_per_backend_per_key": 1,
+        "results_by_sort_key": results,
+        "cpu_over_gpu": ratios,
+        "historical_origin_string_e2e": {
+            "gpu_e2e_s": 4025.794674312,
+            "commit": "cd49d955733bec36443716a1e26b7eb34ce5a3da",
+            "comparison": (
+                "context only, not a key-type ratio: the separate campaign used "
+                "a 512 MiB block target, max_direct_call_object_size=0, explicit "
+                "Ray resources/object-store sizing, and preserve_order=True"
+            ),
+        },
     }
 
 
@@ -1894,15 +2041,18 @@ def run_campaign(
                     f"correctness smoke {spec.name} failed: "
                     f"{artifact.get('rejection_reasons')}"
                 )
-            if spec == RUN_SEQUENCE[0] and not artifact.get("valid"):
+            if spec.workload == "full" and spec.is_gpu and not artifact.get("valid"):
                 raise RuntimeError(
-                    f"GPU performance arm failed: {artifact.get('rejection_reasons')}"
+                    f"GPU performance arm {spec.sort_key} failed: "
+                    f"{artifact.get('rejection_reasons')}"
                 )
-            if spec == RUN_SEQUENCE[1] and not (
-                artifact.get("valid") or _accepted_capacity_result(artifact)
+            if (
+                spec.workload == "full"
+                and not spec.is_gpu
+                and not (artifact.get("valid") or _accepted_capacity_result(artifact))
             ):
                 raise RuntimeError(
-                    f"CPU arm had a harness/non-capacity failure: "
+                    f"CPU arm {spec.sort_key} had a harness/non-capacity failure: "
                     f"{artifact.get('rejection_reasons')}"
                 )
         _assert_frozen_checkout(root, expected_head)
@@ -1919,6 +2069,7 @@ def run_campaign(
                 {
                     "trial_name": item.get("trial_name"),
                     "backend": item.get("backend"),
+                    "sort_key": item.get("sort_key"),
                     "valid": item.get("valid"),
                     "e2e_s": item.get("timings_s", {}).get("e2e"),
                 }

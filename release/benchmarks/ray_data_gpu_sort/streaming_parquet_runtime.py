@@ -316,22 +316,17 @@ def _start_ray(runtime: Path, backend: str) -> tuple[Any, Path]:
             raise RuntimeError("Ray spill directory must be under /raid")
         options: dict[str, Any] = {
             "address": "local",
-            "num_cpus": EXPECTED_CPUS,
-            "num_gpus": EXPECTED_GPUS if backend == "gpu" else 0,
-            "object_store_memory": OBJECT_STORE_BYTES,
             "object_spilling_directory": str(spill),
             "include_dashboard": False,
             "log_to_driver": True,
             "_temp_dir": str(ray_root),
             "_plasma_directory": str(plasma_root),
-            "_system_config": {"max_direct_call_object_size": 0},
         }
         ray.init(**options)
         resources = ray.cluster_resources()
         if int(resources.get("CPU", 0)) != EXPECTED_CPUS:
             raise RuntimeError(f"Ray advertises {resources.get('CPU')} CPUs")
-        expected_gpus = EXPECTED_GPUS if backend == "gpu" else 0
-        if int(resources.get("GPU", 0)) != expected_gpus:
+        if int(resources.get("GPU", 0)) != EXPECTED_GPUS:
             raise RuntimeError(f"Ray advertises {resources.get('GPU', 0)} GPUs")
         if int(resources.get("object_store_memory", 0)) != OBJECT_STORE_BYTES:
             raise RuntimeError(

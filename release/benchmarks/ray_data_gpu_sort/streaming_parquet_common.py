@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .data import plan_dict, scaled_cohort_slices
-from .spec import EXPECTED_ROWS, cell_by_name, load_manifest
+from .spec import EXPECTED_ROWS, load_manifest
 
 
 PLAN_KIND = "runstore-1tb"
@@ -25,10 +25,27 @@ TARGET_BLOCKS = 9_151
 TARGET_DECODED_BYTES = 999_999_999_762
 TARGET_PLAN_DIGEST = "e80163bbc681bc8b04b34d273a4bcdb58b52ef4cbe794b92f07f01bb4d00226c"
 TARGET_ROW_ID_SUM = 692_779_628_919_044_766
-TARGET_ORIGIN_CARDINALITY = 401
-TARGET_ORIGIN_FREQUENCY_DIGEST = (
-    "7621f15fd06a9c21f763ff886e5166c5da037303913bef541d87cbf7e5b824f1"
-)
+ORIGIN_AIRPORT_ID_KEY = "OriginAirportID"
+SORT_KEY_STATS = {
+    ORIGIN_AIRPORT_ID_KEY: {
+        "arrow_type": "int64",
+        "null_rows": 0,
+        "cardinality": 401,
+        "min": 10_135,
+        "max": 16_869,
+        "frequency_digest": (
+            "b42271899ab4eb56c768e8d6843ffb893f0f5f4978861933b82ac8db8ee50132"
+        ),
+        "smoke": {
+            "null_rows": 0,
+            "cardinality": 285,
+            "frequency_digest": (
+                "a5f2889e1c5992c82de4bd8651653b2331c0bbcb9a7df446cbd9e839ccbb7ccc"
+            ),
+        },
+    },
+}
+SUPPORTED_SORT_KEYS = tuple(SORT_KEY_STATS)
 OBJECT_STORE_BYTES = 200_000_000_000
 MIN_CAMPAIGN_FREE_BYTES = 6 << 40
 LOCAL_RUN_MIN_FREE_BYTES = 4 << 40
@@ -68,9 +85,11 @@ def exact_plan(dataset_root: Path) -> tuple[dict[str, Any], tuple[Any, ...]]:
     """Regenerate and prove the frozen 1 TB row-group plan."""
 
     manifest = load_manifest(dataset_root)
-    cell = cell_by_name(manifest, "origin-string")
-    if tuple(cell.keys) != ("Origin",) or len(cell.columns) != 110:
-        raise RuntimeError("The full-payload Origin cell changed")
+    native_columns = tuple(manifest["schema_names"])
+    if len(native_columns) != 109 or not set(SUPPORTED_SORT_KEYS).issubset(
+        native_columns
+    ):
+        raise RuntimeError("The frozen full-payload integer-key schema changed")
     slices = scaled_cohort_slices(manifest, TARGET_ROWS, EXPECTED_ROWS)
     plan = plan_dict(slices, kind=PLAN_KIND)
     if (

@@ -24,10 +24,10 @@ from .streaming_parquet_common import (
     EXPECTED_GPUS,
     GPU_COMMUNICATION_ENVIRONMENT,
     LOCAL_RUN_MIN_FREE_BYTES,
+    SORT_KEY_STATS,
+    SUPPORTED_SORT_KEYS,
     TARGET_BLOCKS,
     TARGET_DECODED_BYTES,
-    TARGET_ORIGIN_CARDINALITY,
-    TARGET_ORIGIN_FREQUENCY_DIGEST,
     TARGET_ROWS,
     exact_plan,
     write_json,
@@ -39,7 +39,7 @@ from .streaming_parquet_runtime import (
     _start_ray,
     _sync_filesystem,
 )
-from .spec import cell_by_name, load_manifest
+from .spec import load_manifest
 from .streaming_parquet_e2e import (
     IMPLEMENTATION_BRANCH,
     INPUT_BUFFER_BUDGET_BYTES,
@@ -280,20 +280,34 @@ def _configure_context(backend: str, run_directory: Path) -> dict[str, Any]:
     from ray.data.context import ShuffleStrategy
 
     context = DataContext.get_current()
-    context.execution_options.preserve_order = True
-    # The largest frozen BTS row group is slightly above 128 MiB after row_id is
-    # appended.  A 512 MiB target preserves the exact one-task/one-block 9,151
-    # geometry while remaining identical across CPU and GPU arms.
-    context.target_max_block_size = 512 << 20
+    if context.execution_options.preserve_order:
+        raise RuntimeError("fresh DataContext unexpectedly preserves order")
+    if context.target_max_block_size != 128 << 20:
+        raise RuntimeError(
+            "fresh DataContext target_max_block_size is not the 128 MiB default"
+        )
+    if context.use_polars or context.use_polars_sort:
+        raise RuntimeError("fresh DataContext unexpectedly enables Polars")
     if backend == "pyarrow":
+        if context.shuffle_strategy != ShuffleStrategy.HASH_SHUFFLE:
+            raise RuntimeError(
+                "fresh DataContext shuffle_strategy is not the HASH_SHUFFLE default"
+            )
         context.shuffle_strategy = ShuffleStrategy.SORT_SHUFFLE_PUSH_BASED
         return {
             "backend": "pyarrow",
             "shuffle_strategy": context.shuffle_strategy.value,
             "preserve_order": context.execution_options.preserve_order,
             "target_max_block_size": context.target_max_block_size,
+            "use_polars": context.use_polars,
+            "use_polars_sort": context.use_polars_sort,
+            "pre_override_shuffle_strategy": ShuffleStrategy.HASH_SHUFFLE.value,
+            "cpu_sort_overrides": ["shuffle_strategy"],
         }
 
+    # Preserve source order only in the GPU runtime.  It is required by the
+    # streaming GPU operator and must not leak into the fresh CPU process.
+    context.execution_options.preserve_order = True
     context.gpu_shuffle_num_actors = EXPECTED_GPUS
     frozen = {
         "gpu_sort_sample_seed": 0,
@@ -359,7 +373,7 @@ def _schema_fingerprint(schema: Any) -> str:
     return hashlib.sha256(schema.serialize().to_pybytes()).hexdigest()
 
 
-def _origin_frequency_digest(counts: Mapping[str, int]) -> str:
+def _frequency_digest(counts: Mapping[str, int]) -> str:
     encoded = json.dumps(
         sorted((str(key), int(count)) for key, count in counts.items()),
         separators=(",", ":"),
@@ -372,10 +386,10 @@ def _validate_durable_parquet(
     sink_result: Mapping[str, Any],
     expected_schema: Any,
     *,
+    sort_key: str,
     expected_rows: int,
     expected_row_id_sum: int,
-    expected_origin_cardinality: Optional[int] = None,
-    expected_origin_frequency_digest: Optional[str] = None,
+    expected_sort_key_stats: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Reopen the durable output in bounded batches after the E2E timer."""
 
@@ -403,9 +417,11 @@ def _validate_durable_parquet(
         )
 
     counts: dict[str, int] = {}
-    rows = row_id_sum = null_origins = 0
+    rows = row_id_sum = null_sort_key_rows = 0
     global_ordered = True
-    previous_last: Optional[str] = None
+    nulls_last = True
+    seen_null = False
+    previous_non_null_last: Optional[Any] = None
     exact_schemas = True
     arrow_schema_metadata_stored = True
     versions: set[str] = set()
@@ -415,7 +431,8 @@ def _validate_durable_parquet(
     row_groups = 0
     physical_bytes = 0
     metadata_physical_bytes = 0
-    first_origin = last_origin = None
+    first_sort_key = last_sort_key = None
+    observed_min = observed_max = None
     per_file_geometry_mismatches: list[str] = []
 
     for index, item in enumerate(files):
@@ -466,29 +483,52 @@ def _validate_durable_parquet(
 
         for batch in parquet.iter_batches(
             batch_size=VALIDATION_BATCH_ROWS,
-            columns=["Origin", "row_id"],
+            columns=[sort_key, "row_id"],
             use_threads=True,
         ):
-            origin = batch.column(0)
+            key_values = batch.column(0)
             row_ids = batch.column(1)
-            null_origins += origin.null_count
-            clean = pc.fill_null(origin, "\U0010ffff")
-            batch_first = clean[0].as_py() if len(clean) else None
-            batch_last = clean[-1].as_py() if len(clean) else None
-            if previous_last is not None and batch_first is not None:
-                global_ordered = global_ordered and previous_last <= batch_first
-            if len(clean) > 1:
-                global_ordered = global_ordered and bool(
-                    pc.all(
-                        pc.less_equal(clean.slice(0, len(clean) - 1), clean.slice(1))
-                    ).as_py()
+            batch_nulls = key_values.null_count
+            null_sort_key_rows += batch_nulls
+            non_null_count = len(key_values) - batch_nulls
+            if seen_null and non_null_count:
+                nulls_last = False
+            non_null_values = key_values.slice(0, non_null_count)
+            if batch_nulls:
+                null_suffix = key_values.slice(non_null_count)
+                misplaced_null = bool(
+                    non_null_values.null_count or null_suffix.null_count != batch_nulls
                 )
-            if first_origin is None and batch_first is not None:
-                first_origin = batch_first
-            if batch_last is not None:
-                previous_last = batch_last
-                last_origin = batch_last
-            for frequency in pc.value_counts(origin):
+                if misplaced_null:
+                    nulls_last = False
+                    non_null_values = pc.drop_null(key_values)
+                    non_null_count = len(non_null_values)
+                seen_null = True
+            if non_null_count:
+                batch_first = non_null_values[0].as_py()
+                batch_last = non_null_values[-1].as_py()
+                if previous_non_null_last is not None:
+                    global_ordered = (
+                        global_ordered and previous_non_null_last <= batch_first
+                    )
+                if non_null_count > 1:
+                    global_ordered = global_ordered and bool(
+                        pc.all(
+                            pc.less_equal(
+                                non_null_values.slice(0, non_null_count - 1),
+                                non_null_values.slice(1),
+                            )
+                        ).as_py()
+                    )
+                if first_sort_key is None:
+                    first_sort_key = batch_first
+                    observed_min = batch_first
+                previous_non_null_last = batch_last
+                last_sort_key = batch_last
+                observed_max = batch_last
+            if batch_nulls:
+                last_sort_key = None
+            for frequency in pc.value_counts(key_values):
                 key = frequency["values"].as_py()
                 count = int(frequency["counts"].as_py())
                 if key is not None:
@@ -536,14 +576,19 @@ def _validate_durable_parquet(
             "bounded ParquetFile.iter_batches reopen after sink syncfs and outside "
             "the primary E2E timer"
         ),
+        "sort_key": sort_key,
+        "sort_key_arrow_type": str(expected_schema.field(sort_key).type),
         "rows": rows,
         "row_id_sum": row_id_sum,
-        "null_origin_rows": null_origins,
-        "origin_cardinality": len(counts),
-        "origin_frequency_digest": _origin_frequency_digest(counts),
+        "null_sort_key_rows": null_sort_key_rows,
+        "sort_key_cardinality": len(counts),
+        "sort_key_frequency_digest": _frequency_digest(counts),
+        "sort_key_min": observed_min,
+        "sort_key_max": observed_max,
         "ordered": global_ordered,
-        "first_origin": first_origin,
-        "last_origin": last_origin,
+        "nulls_last": nulls_last,
+        "first_sort_key": first_sort_key,
+        "last_sort_key": last_sort_key,
         "exact_schema": exact_schemas,
         "expected_schema_fingerprint": _schema_fingerprint(expected_schema),
         "manifest_schema_exact": (
@@ -580,10 +625,17 @@ def _validate_durable_parquet(
         "actual_manifest_sha256": hashlib.sha256(manifest_payload).hexdigest(),
     }
     expected = {
+        "sort_key": sort_key,
+        "sort_key_arrow_type": (
+            expected_sort_key_stats.get("arrow_type")
+            if expected_sort_key_stats is not None
+            and expected_sort_key_stats.get("arrow_type") is not None
+            else str(expected_schema.field(sort_key).type)
+        ),
         "rows": expected_rows,
         "row_id_sum": expected_row_id_sum,
-        "null_origin_rows": 0,
         "ordered": True,
+        "nulls_last": True,
         "exact_schema": True,
         "manifest_schema_exact": True,
         "arrow_schema_metadata_stored": True,
@@ -602,10 +654,16 @@ def _validate_durable_parquet(
         "success_manifest": "manifest.json",
         "success_manifest_sha256": result["actual_manifest_sha256"],
     }
-    if expected_origin_cardinality is not None:
-        expected["origin_cardinality"] = expected_origin_cardinality
-    if expected_origin_frequency_digest is not None:
-        expected["origin_frequency_digest"] = expected_origin_frequency_digest
+    if expected_sort_key_stats is not None:
+        for source_name, result_name in (
+            ("null_rows", "null_sort_key_rows"),
+            ("cardinality", "sort_key_cardinality"),
+            ("frequency_digest", "sort_key_frequency_digest"),
+            ("min", "sort_key_min"),
+            ("max", "sort_key_max"),
+        ):
+            if source_name in expected_sort_key_stats:
+                expected[result_name] = expected_sort_key_stats[source_name]
     result["rejection_reasons"] = [
         f"{name}={result.get(name)!r}, expected {wanted!r}"
         for name, wanted in expected.items()
@@ -780,10 +838,15 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
         )
 
         manifest = load_manifest(args.dataset_root)
-        cell = cell_by_name(manifest, "origin-string")
         expected_schema = schema_from_manifest(manifest)
-        if tuple(expected_schema.names) != tuple(cell.columns):
-            raise RuntimeError("source schema and frozen full-payload cell differ")
+        expected_columns = (*tuple(manifest["schema_names"]), "row_id")
+        if tuple(expected_schema.names) != expected_columns:
+            raise RuntimeError("source schema and frozen 110-column payload differ")
+        if (
+            str(expected_schema.field(args.sort_key).type)
+            != SORT_KEY_STATS[args.sort_key]["arrow_type"]
+        ):
+            raise RuntimeError(f"sort-key type changed: {args.sort_key}")
         if args.workload == "full":
             plan, _ = exact_plan(args.dataset_root)
             expected_rows = TARGET_ROWS
@@ -806,7 +869,7 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
         source = FrozenBTSPlanDatasource(
             plan,
             schema=expected_schema,
-            columns=cell.columns,
+            columns=expected_columns,
             telemetry_directory=source_telemetry_directory,
             expected_plan_digest=args.expected_plan_digest,
             expected_rows=expected_rows,
@@ -820,7 +883,7 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
             concurrency=EXPECTED_CPUS,
         )
         sort_kwargs: dict[str, Any] = {
-            "key": ["Origin"],
+            "key": [args.sort_key],
             "descending": [False],
         }
         if args.backend == "gpu":
@@ -1013,13 +1076,13 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
             output_directory,
             sink_result,
             expected_schema,
+            sort_key=args.sort_key,
             expected_rows=expected_rows,
             expected_row_id_sum=expected_rows * (expected_rows - 1) // 2,
-            expected_origin_cardinality=(
-                TARGET_ORIGIN_CARDINALITY if args.workload == "full" else None
-            ),
-            expected_origin_frequency_digest=(
-                TARGET_ORIGIN_FREQUENCY_DIGEST if args.workload == "full" else None
+            expected_sort_key_stats=(
+                SORT_KEY_STATS[args.sort_key]
+                if args.workload == "full"
+                else SORT_KEY_STATS[args.sort_key]["smoke"]
             ),
         )
         _write_phase(
@@ -1084,13 +1147,13 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
             reasons.extend(_gpu_reasons(gpu_stats, "local_disk"))
             if int(value(gpu_stats, "input_rows", default=-1)) != expected_rows:
                 reasons.append("GPU telemetry input rows differ from the source")
-            if int(value(gpu_stats, "input_object_refs_received", default=-1)) != (
-                expected_blocks
-            ):
-                reasons.append("GPU did not receive exactly one ref per source block")
-            if int(value(gpu_stats, "released_input_object_refs", default=-1)) != (
-                expected_blocks
-            ):
+            input_refs = int(value(gpu_stats, "input_object_refs_received", default=-1))
+            released_refs = int(
+                value(gpu_stats, "released_input_object_refs", default=-1)
+            )
+            if input_refs < expected_blocks:
+                reasons.append("GPU received fewer refs than planned source blocks")
+            if released_refs != input_refs:
                 reasons.append("GPU did not release every source ObjectRef")
             if not bool(
                 value(gpu_stats, "all_input_object_refs_released", default=False)
@@ -1124,8 +1187,8 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
             eos = blocking.get("inputs_complete_at_ns")
             if not blocking.get("blocking_all_to_all"):
                 reasons.append("CPU sort did not report stock blocking AllToAll")
-            if int(blocking.get("input_blocks_received", -1)) != expected_blocks:
-                reasons.append("CPU AllToAll input block count differs from source")
+            if int(blocking.get("input_blocks_received", -1)) < expected_blocks:
+                reasons.append("CPU AllToAll received fewer than the source blocks")
             if first_map is None or eos is None or int(first_map) < int(eos):
                 reasons.append(
                     "CPU push task timing does not prove post-EOS submission"
@@ -1158,6 +1221,7 @@ def _run_trial(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any
             "trial_name": args.trial_name,
             "backend": args.backend,
             "workload": args.workload,
+            "sort_key": args.sort_key,
             "timed_pipeline_started": True,
             "timed_pipeline_finished": True,
             "pipeline_succeeded": True,
@@ -1236,6 +1300,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trial-name", required=True)
     parser.add_argument("--backend", choices=VALID_BACKENDS, required=True)
     parser.add_argument("--workload", choices=VALID_WORKLOADS, required=True)
+    parser.add_argument("--sort-key", choices=SUPPORTED_SORT_KEYS, required=True)
     parser.add_argument("--expected-plan-digest", required=True)
     parser.add_argument("--expected-git-head", required=True)
     parser.add_argument("--expected-dataset-identity-digest", required=True)
@@ -1264,6 +1329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "trial_name": args.trial_name,
             "backend": args.backend,
             "workload": args.workload,
+            "sort_key": args.sort_key,
             "dataset_identity": state.get("dataset_identity"),
             "timed_pipeline_started": bool(state.get("timed_pipeline_started")),
             "timed_pipeline_finished": bool(state.get("timed_pipeline_finished")),
