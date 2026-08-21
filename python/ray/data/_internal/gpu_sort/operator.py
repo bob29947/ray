@@ -225,7 +225,13 @@ def _assign_blocks_by_locality(
     blocks: Sequence[_InputBlock],
     actor_node_ids: Sequence[str],
     object_locations: Mapping[Any, Mapping[str, Any]],
-) -> Tuple[List[List[_InputBlock]], List[int], List[int], List[int], List[int],]:
+) -> Tuple[
+    List[List[_InputBlock]],
+    List[int],
+    List[int],
+    List[int],
+    List[int],
+]:
     """Assign blocks locally, with deterministic decoded-byte balancing.
 
     An object may have multiple replicas, no reported location (for example an
@@ -814,6 +820,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._first_gpu_run_committed_at_ns: Optional[int] = None
         self._last_gpu_run_committed_at_ns: Optional[int] = None
         self._ranks_started_at_ns: Optional[int] = None
+        self._finalization_started_at_ns: Optional[int] = None
+        self._first_output_bundle_ready_at_ns: Optional[int] = None
+        self._last_output_bundle_ready_at_ns: Optional[int] = None
+        self._finalization_complete_at_ns: Optional[int] = None
         self._input_rows = 0
         self._input_bytes = 0
         self._input_schema = None
@@ -1167,6 +1177,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         ):
             return
         self._finalization_started = True
+        self._finalization_started_at_ns = time.time_ns()
         if not self._input_blocks:
             try:
                 diagnostics = ray.get(
@@ -1179,6 +1190,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 self._rank_pool.shutdown()
                 raise
             self._finalization_succeeded = True
+            self._finalization_complete_at_ns = time.time_ns()
             self._publish_diagnostics(diagnostics)
             self._rank_pool.shutdown_async()
             return
@@ -1380,6 +1392,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         for rank, actor in enumerate(self._rank_pool.actors):
 
             def _on_bundle_ready(bundle: RefBundle, rank: int = rank) -> None:
+                ready_at_ns = time.time_ns()
+                if self._first_output_bundle_ready_at_ns is None:
+                    self._first_output_bundle_ready_at_ns = ready_at_ns
+                self._last_output_bundle_ready_at_ns = ready_at_ns
                 schema = bundle.schema
                 metadata = schema.metadata if schema is not None else None
                 partition_id = rank
@@ -1434,8 +1450,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                     diagnostics = ray.get(
                         [actor.diagnostics.remote() for actor in self._rank_pool.actors]
                     )
-                    self._publish_diagnostics(diagnostics)
                     self._finalization_succeeded = True
+                    self._finalization_complete_at_ns = time.time_ns()
+                    self._publish_diagnostics(diagnostics)
                     self._rank_pool.shutdown_async()
 
             generator = actor.finish_and_extract.options(
@@ -1625,6 +1642,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "inputs_complete_at_ns": self._inputs_complete_at_ns,
             "first_gpu_run_committed_at_ns": (self._first_gpu_run_committed_at_ns),
             "last_gpu_run_committed_at_ns": self._last_gpu_run_committed_at_ns,
+            "finalization_started_at_ns": self._finalization_started_at_ns,
+            "first_output_bundle_ready_at_ns": (self._first_output_bundle_ready_at_ns),
+            "last_output_bundle_ready_at_ns": self._last_output_bundle_ready_at_ns,
+            "finalization_complete_at_ns": self._finalization_complete_at_ns,
             "gpu_processing_began_before_eos": (
                 self._first_gpu_run_committed_at_ns is not None
                 and self._inputs_complete_at_ns is not None

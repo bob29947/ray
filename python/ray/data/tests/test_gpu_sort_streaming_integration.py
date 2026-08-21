@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import math
 import os
 from pathlib import Path
+import shutil
 import time
 from typing import Iterator, List, Optional, Sequence
 import uuid
@@ -116,16 +117,25 @@ class _SlowOriginDatasource(Datasource):
 
 
 @pytest.fixture(scope="module")
-def two_gpu_ray_runtime(tmp_path_factory):
+def two_gpu_ray_runtime():
     if not _RUN_GPU_INTEGRATION:
         pytest.skip("two-GPU streaming-sort integration was not requested")
 
     ray.shutdown()
-    runtime_root = tmp_path_factory.mktemp("gpu-sort-ray")
+    configured = os.environ.get("RAY_DATA_GPU_SORT_TEST_RUN_DIR")
+    if not configured:
+        pytest.fail("RAY_DATA_GPU_SORT_TEST_RUN_DIR must be set under /raid")
+    run_base = Path(configured).resolve()
+    raid = Path("/raid").resolve()
+    if run_base == raid or not run_base.is_relative_to(raid):
+        pytest.fail("RAY_DATA_GPU_SORT_TEST_RUN_DIR must be a child of /raid")
+    token = uuid.uuid4().hex[:10]
+    runtime_root = run_base.parent / f"gpu-ray-{token}"
+    socket_root = Path("/dev/shm/rgs") / token
+    runtime_root.mkdir(parents=True, exist_ok=False)
+    socket_root.parent.mkdir(parents=True, exist_ok=True)
     spill = runtime_root / "spill"
-    ray_temp = runtime_root / "ray"
     spill.mkdir()
-    ray_temp.mkdir()
     worker_pythonpath = str(Path(__file__).resolve().parent)
     inherited_pythonpath = os.environ.get("PYTHONPATH")
     if inherited_pythonpath:
@@ -137,7 +147,7 @@ def two_gpu_ray_runtime(tmp_path_factory):
         object_spilling_directory=str(spill),
         include_dashboard=False,
         log_to_driver=True,
-        _temp_dir=str(ray_temp),
+        _temp_dir=str(socket_root),
         _system_config={"max_direct_call_object_size": 0},
         runtime_env={"env_vars": {"PYTHONPATH": worker_pythonpath}},
     )
@@ -148,6 +158,8 @@ def two_gpu_ray_runtime(tmp_path_factory):
         yield
     finally:
         ray.shutdown()
+        shutil.rmtree(runtime_root, ignore_errors=True)
+        shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def _run_root(label: str) -> Path:
@@ -160,6 +172,10 @@ def _run_root(label: str) -> Path:
     base = Path(configured)
     if not base.is_absolute():
         pytest.fail("RAY_DATA_GPU_SORT_TEST_RUN_DIR must be absolute")
+    if base.resolve() == Path("/raid") or not base.resolve().is_relative_to(
+        Path("/raid")
+    ):
+        pytest.fail("RAY_DATA_GPU_SORT_TEST_RUN_DIR must be a child of /raid")
     base.mkdir(parents=True, exist_ok=True)
     trial = base / f"{label}-{uuid.uuid4().hex}"
     trial.mkdir()
@@ -297,6 +313,9 @@ def test_streaming_origin_sort_externalizes_before_eos_and_releases_inputs(
     assert stats["ingest_rpc_count"] == _ORIGIN_BLOCKS
     assert sum(rank["input_blocks"] for rank in stats["ranks"]) == _ORIGIN_BLOCKS
     assert stats["source_run_count"] == _ORIGIN_BLOCKS
+    assert stats["source_run_count"] > len(stats["ranks"])
+    assert all(rank["source_run_count"] > 1 for rank in stats["ranks"])
+    assert stats["merge_pass_count"] + stats["direct_final_merge_count"] > 0
     assert stats["input_buffer_budget_bytes"] == _INPUT_BUFFER_BUDGET_BYTES
     assert stats["input_buffer_within_bound"] is True
     assert stats["peak_buffered_input_bytes"] <= (
