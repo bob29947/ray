@@ -16,7 +16,8 @@ from ray.data._internal.execution.operators.input_data_buffer import InputDataBu
 from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.progress.base_progress import NoopSubProgressBar
-from ray.data.block import BlockAccessor
+from ray.data._internal.stats import Timer
+from ray.data.block import BlockAccessor, BlockMetadata
 from ray.data.context import DataContext
 from ray.data.tests.util import (
     _get_blocks,
@@ -68,6 +69,141 @@ def test_input_data_buffer(ray_start_regular_shared):
     assert not op.has_completed()
     assert _take_outputs(op) == [[1, 2], [3], [4, 5]]
     assert op.has_completed()
+
+
+def test_input_data_buffer_bounds_one_shot_lazy_inputs():
+    created = []
+    iterator_closed = []
+
+    def input_iterator_factory(_target_max_block_size):
+        try:
+            for value in range(5):
+                created.append(value)
+                yield RefBundle(
+                    (
+                        (
+                            ray.ObjectRef(bytes([value + 1]) * 28),
+                            BlockMetadata(1, 8, None, None),
+                        ),
+                    ),
+                    owns_blocks=False,
+                    schema=None,
+                )
+        finally:
+            iterator_closed.append(True)
+
+    op = InputDataBuffer(
+        DataContext.get_current(),
+        input_data_iterator_factory=input_iterator_factory,
+        estimated_num_output_bundles=5,
+        max_pending_input_blocks=2,
+    )
+    assert created == []
+    assert not op.has_execution_finished()
+
+    op.start(ExecutionOptions())
+    assert created == []
+
+    # Repeated readiness checks create only one descriptor, and the external
+    # output window stops the executor's normal drain loop after two.
+    assert op.has_next()
+    assert op.has_next()
+    first = op.get_next()
+    op.metrics.num_external_outqueue_blocks += len(first.blocks)
+    second = op.get_next() if op.has_next() else None
+    assert second is not None
+    op.metrics.num_external_outqueue_blocks += len(second.blocks)
+    assert created == [0, 1]
+    assert not op.has_next()
+    assert not op.has_execution_finished()
+
+    # Each downstream dispatch opens one slot and advances the one-shot iterator
+    # exactly once. Lazy root bundles aren't retained by the driver.
+    while len(created) < 5:
+        op.metrics.num_external_outqueue_blocks -= 1
+        assert op.has_next()
+        bundle = op.get_next()
+        op.metrics.num_external_outqueue_blocks += len(bundle.blocks)
+    assert created == list(range(5))
+    assert op._input_data == []
+
+    op.metrics.num_external_outqueue_blocks -= 1
+    assert not op.has_next()
+    assert op.has_execution_finished()
+    assert iterator_closed == [True]
+
+
+def test_input_data_buffer_closes_lazy_input_on_early_shutdown():
+    created = []
+    iterator_closed = []
+
+    def input_iterator_factory(_target_max_block_size):
+        try:
+            for value in range(3):
+                created.append(value)
+                yield RefBundle(
+                    (
+                        (
+                            ray.ObjectRef(bytes([value + 1]) * 28),
+                            BlockMetadata(1, 8, None, None),
+                        ),
+                    ),
+                    owns_blocks=False,
+                    schema=None,
+                )
+        finally:
+            iterator_closed.append(True)
+
+    op = InputDataBuffer(
+        DataContext.get_current(),
+        input_data_iterator_factory=input_iterator_factory,
+        estimated_num_output_bundles=3,
+        max_pending_input_blocks=2,
+    )
+    op.start(ExecutionOptions())
+    assert op.has_next()
+    assert created == [0]
+
+    op.shutdown(timer=Timer(), force=False)
+
+    assert iterator_closed == [True]
+    assert not op.has_next()
+    assert op.has_execution_finished()
+    assert created == [0]
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected", "message"),
+    ((1, 2, "yielded 1 bundles, expected 2"), (2, 1, "yielded more than 1")),
+)
+def test_input_data_buffer_rejects_lazy_input_count_mismatch(actual, expected, message):
+    def input_iterator_factory(_target_max_block_size):
+        for value in range(actual):
+            yield RefBundle(
+                (
+                    (
+                        ray.ObjectRef(bytes([value + 1]) * 28),
+                        BlockMetadata(1, 8, None, None),
+                    ),
+                ),
+                owns_blocks=False,
+                schema=None,
+            )
+
+    op = InputDataBuffer(
+        DataContext.get_current(),
+        input_data_iterator_factory=input_iterator_factory,
+        estimated_num_output_bundles=expected,
+        max_pending_input_blocks=1,
+    )
+    op.start(ExecutionOptions())
+    assert op.has_next()
+    first = op.get_next()
+    op.metrics.num_external_outqueue_blocks += len(first.blocks)
+    op.metrics.num_external_outqueue_blocks -= len(first.blocks)
+
+    with pytest.raises(RuntimeError, match=message):
+        op.has_next()
 
 
 def test_all_to_all_operator():

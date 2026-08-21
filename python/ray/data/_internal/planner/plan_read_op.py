@@ -1,6 +1,6 @@
 import logging
 import warnings
-from typing import Iterable, List
+from typing import Iterable, Iterator, List, Optional, Protocol, runtime_checkable
 
 import ray
 from ray import ObjectRef
@@ -25,6 +25,26 @@ from ray.util.debug import log_once
 TASK_SIZE_WARN_THRESHOLD_BYTES = 1024 * 1024  # 1 MiB
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class _LazyReadTaskDatasource(Protocol):
+    """Internal opt-in contract for one-shot, bounded read-task submission."""
+
+    _supports_lazy_read_task_submission: bool
+
+    @property
+    def _read_task_count(self) -> int: ...
+
+    @property
+    def _read_task_submission_window(self) -> int: ...
+
+    def _iter_read_tasks(
+        self,
+        parallelism: int,
+        per_task_row_limit: Optional[int] = None,
+        data_context: Optional[DataContext] = None,
+    ) -> Iterator[ReadTask]: ...
 
 
 def _derive_metadata(read_task: ReadTask, read_task_ref: ObjectRef) -> BlockMetadata:
@@ -53,6 +73,26 @@ def _derive_metadata(read_task: ReadTask, read_task_ref: ObjectRef) -> BlockMeta
     )
 
 
+def _read_task_ref_bundle(read_task: ReadTask) -> RefBundle:
+    read_task_ref = ray.put(read_task)
+    return RefBundle(
+        (
+            (
+                # TODO: figure out a better way to pass read tasks other than
+                # ray.put().
+                read_task_ref,
+                _derive_metadata(read_task, read_task_ref),
+            ),
+        ),
+        # These refs are roots of the execution DAG, so downstream operators must
+        # not explicitly destroy them. Stock InputDataBuffer retains them for
+        # replay; the opt-in one-shot buffer keeps them only while queued or used
+        # by a submitted read task.
+        owns_blocks=False,
+        schema=None,
+    )
+
+
 def plan_read_op(
     op: Read,
     physical_children: List[PhysicalOperator],
@@ -65,14 +105,21 @@ def plan_read_op(
     """
     assert len(physical_children) == 0
 
-    def get_input_data(target_max_block_size) -> List[RefBundle]:
+    read_task_source = op.datasource_or_legacy_reader
+
+    def get_parallelism() -> int:
         parallelism = op.get_detected_parallelism()
         assert (
             parallelism is not None
         ), "Read parallelism must be set by the optimizer before execution"
+        return parallelism
+
+    def get_input_data(target_max_block_size) -> List[RefBundle]:
+        del target_max_block_size
+        parallelism = get_parallelism()
 
         # Get the original read tasks
-        read_tasks = op.datasource_or_legacy_reader.get_read_tasks(
+        read_tasks = read_task_source.get_read_tasks(
             parallelism,
             per_task_row_limit=op.per_block_limit,
             data_context=data_context,
@@ -82,26 +129,45 @@ def plan_read_op(
 
         ret = []
         for read_task in read_tasks:
-            read_task_ref = ray.put(read_task)
-            ref_bundle = RefBundle(
-                (
-                    (
-                        # TODO: figure out a better way to pass read
-                        # tasks other than ray.put().
-                        read_task_ref,
-                        _derive_metadata(read_task, read_task_ref),
-                    ),
-                ),
-                # `owns_blocks` is False, because these refs are the root of the
-                # DAG. We shouldn't eagerly free them. Otherwise, the DAG cannot
-                # be reconstructed.
-                owns_blocks=False,
-                schema=None,
-            )
-            ret.append(ref_bundle)
+            ret.append(_read_task_ref_bundle(read_task))
         return ret
 
-    inputs = InputDataBuffer(data_context, input_data_factory=get_input_data)
+    lazy_read_tasks = (
+        getattr(read_task_source, "_supports_lazy_read_task_submission", False) is True
+    )
+    if lazy_read_tasks:
+        if not isinstance(read_task_source, _LazyReadTaskDatasource):
+            raise TypeError("Lazy read-task datasource has an incomplete contract.")
+        read_task_count = read_task_source._read_task_count
+        submission_window = read_task_source._read_task_submission_window
+        if read_task_count < 0:
+            raise ValueError("Lazy read-task count must be nonnegative.")
+        if submission_window <= 0:
+            raise ValueError("Lazy read-task submission window must be positive.")
+
+        def get_input_data_iterator(
+            target_max_block_size: int,
+        ) -> Iterator[RefBundle]:
+            del target_max_block_size
+            parallelism = get_parallelism()
+            _warn_on_high_parallelism(parallelism, read_task_count)
+            for read_task in read_task_source._iter_read_tasks(
+                parallelism,
+                per_task_row_limit=op.per_block_limit,
+                data_context=data_context,
+            ):
+                yield _read_task_ref_bundle(read_task)
+
+        inputs = InputDataBuffer(
+            data_context,
+            input_data_iterator_factory=get_input_data_iterator,
+            estimated_num_output_bundles=read_task_count,
+            max_pending_input_blocks=submission_window,
+        )
+    else:
+        # Preserve the stock, replayable read-task behavior for all other
+        # datasources.
+        inputs = InputDataBuffer(data_context, input_data_factory=get_input_data)
 
     def do_read(blocks: Iterable[ReadTask], _: TaskContext) -> Iterable[Block]:
         for read_task in blocks:
