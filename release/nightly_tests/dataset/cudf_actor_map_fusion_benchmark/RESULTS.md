@@ -90,7 +90,7 @@ preprocessing.
 The benchmark uses the existing map-fusion candidate
 `aa17c53e462889bc835ab7f95446c3c6b80b24c4`, with Lee base
 `3605699192aca4b82231dde65a5136175d978481`. The wheel, bundle, and installed
-fusion-module hashes are recorded in `provenance.json`. This campaign changed
+fusion-module hashes are recorded in [PROVENANCE.json](PROVENANCE.json), and the\nper-pair metrics and correctness digests are in [RESULTS.json](RESULTS.json). This\ncampaign changed
 **zero tracked Ray or Ray Data production files**; benchmark and lifecycle
 artifacts live under `.codex-work/`.
 
