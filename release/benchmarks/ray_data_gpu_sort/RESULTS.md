@@ -57,7 +57,14 @@ objects to NVMe.  No dataset row is sorted or merged on CPU.
 
 Rows double from 1x to 2x, while GPU time grows 3.18x because run output and
 merge add a second H2D/D2H pass plus Plasma and NVMe traffic.  Archived CPU time
-grows more sharply, so the directional speedup increases to 5.11x.  The 2.45x
+grows more sharply, so the directional speedup increases to 5.11x.
+
+At 2x, the final GPU arm wrote **383.35 GiB** to Ray's NVMe spill tier and
+restored **14.45 GiB**.  The archived default-Ray CPU arm wrote **269.24 GiB**
+and restored **4.38 GiB**.  The CPU values are a cross-campaign,
+one-observation directional comparison, consistent with the CPU timing caveat
+above.  The sanitized source report has SHA-256
+`96a08625bc6709a68e085f1c090614d18ad229635e5bfd1ba1b51412912cf534`.  The 2.45x
 observations have material variability; their median does not prove 2.45x is
 intrinsically faster than 2x.  No 2.45x speedup is reported because the archived
 CPU observation did not complete.
