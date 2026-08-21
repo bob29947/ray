@@ -2,15 +2,17 @@
 
 The controller admits exact destination bytes to synchronized RAPIDS-MPF rounds.
 Destination ranks retain received tables while they fit their residency budget.
-Crossing that watermark converts complete GPU-sorted runs to Arrow ObjectRefs;
-those immutable runs are later merged with bounded pylibcudf operations. The
-CPU orders only the bounded planning sample, never dataset rows or runs.
+Crossing that watermark converts complete GPU-sorted tables to immutable Arrow
+runs in a configured actor-local store; those runs are later merged with
+bounded pylibcudf operations. The CPU orders only the bounded planning sample,
+never dataset rows or runs.
 """
 
 from __future__ import annotations
 
 import gc
 import hashlib
+import os
 import time
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
@@ -21,6 +23,12 @@ from ray.data._internal.gpu_sort.config import (
     GPUSortCapacityError,
     GPUSortConfig,
 )
+from ray.data._internal.gpu_sort.run_store import (
+    LocalDiskRunStore,
+    PlasmaRunStore,
+    RunStore,
+    _RunChunk,
+)
 
 GPU_SORT_PARTITION_ID_KEY = b"ray-data-gpu-sort-partition"
 GPU_SORT_DIAGNOSTICS_KEY = b"ray-data-gpu-sort-diagnostics"
@@ -30,13 +38,6 @@ _HIDDEN_BASE = "__ray_gpu_sort_cmp"
 _SAMPLE_BLOCK_BASE = "__ray_gpu_sort_sample_block"
 _SAMPLE_STRATUM_BASE = "__ray_gpu_sort_sample_stratum"
 _SAMPLE_INDEX_BASE = "__ray_gpu_sort_sample_index"
-
-
-@dataclass
-class _RunChunk:
-    ref: Any
-    rows: int
-    size_bytes: int
 
 
 @dataclass
@@ -508,6 +509,7 @@ def lazy_load_backend() -> type[Any]:
             self._memory_budget_bytes = 0
             self._payload_limit_bytes = 0
             self._run_chunk_bytes = 0
+            self._run_store: Optional[RunStore] = None
 
             self._device_tables: Dict[int, List[Any]] = {
                 partition: [] for partition in range(index, num_partitions, nranks)
@@ -565,8 +567,35 @@ def lazy_load_backend() -> type[Any]:
                 "h2d_bytes": 0,
                 "planning_h2d_bytes": 0,
                 "d2h_bytes": 0,
+                "run_store": self._config.external_run_store,
                 "plasma_read_bytes": 0,
                 "plasma_write_bytes": 0,
+                "plasma_intermediate_read_bytes": 0,
+                "plasma_intermediate_write_bytes": 0,
+                "plasma_intermediate_read_calls": 0,
+                "plasma_intermediate_write_calls": 0,
+                "plasma_intermediate_read_s": 0.0,
+                "plasma_intermediate_write_s": 0.0,
+                "plasma_output_write_bytes": 0,
+                "plasma_output_write_calls": 0,
+                "plasma_output_write_s": 0.0,
+                "local_run_write_bytes": 0,
+                "local_run_read_bytes": 0,
+                "local_run_physical_write_bytes": 0,
+                "local_run_physical_read_bytes": 0,
+                "local_run_write_calls": 0,
+                "local_run_read_calls": 0,
+                "local_run_write_s": 0.0,
+                "local_run_read_s": 0.0,
+                "local_run_restore_s": 0.0,
+                "local_run_live_bytes": 0,
+                "local_run_peak_bytes": 0,
+                "local_run_live_files": 0,
+                "local_run_peak_files": 0,
+                "local_run_write_errors": 0,
+                "local_run_read_errors": 0,
+                "local_run_cleanup_errors": 0,
+                "local_run_cleanup_pending_files": 0,
                 "mpf_host_spill_bytes": 0,
                 "ray_disk_spill_bytes": 0,
                 "cpu_sort_rows": 0,
@@ -651,6 +680,20 @@ def lazy_load_backend() -> type[Any]:
                 cudf.set_option("spill_device_limit", None)
             except (KeyError, ValueError):
                 pass
+            if self._config.external_run_store == "local_disk":
+                actor_directory = os.path.join(
+                    str(self._config.external_run_directory),
+                    str(self._config.external_run_id),
+                    f"rank-{actual_rank}",
+                )
+                self._run_store = LocalDiskRunStore(
+                    actor_directory,
+                    min_free_bytes=self._config.external_run_min_free_bytes,
+                    max_live_bytes=self._config.external_run_max_live_bytes,
+                )
+                self._stats["local_run_directory"] = actor_directory
+            else:
+                self._run_store = PlasmaRunStore()
             self._ray_spill_start = self._ray_spilled_bytes()
             self._stats["phases_s"]["orchestration"] += time.perf_counter() - started
             self._update_peak()
@@ -1674,25 +1717,66 @@ def lazy_load_backend() -> type[Any]:
                 self._stats["d2h_bytes"] += size_bytes
                 yield arrow
 
+        def _ensure_run_store(self) -> RunStore:
+            store = getattr(self, "_run_store", None)
+            if store is None:
+                # Unit-level backend method tests and the default production
+                # path both retain the historical Plasma behavior.
+                store = PlasmaRunStore()
+                self._run_store = store
+            return store
+
+        def _sync_run_store_stats(self) -> None:
+            store = getattr(self, "_run_store", None)
+            if store is None:
+                return
+            diagnostics = store.diagnostics()
+            self._stats.update(diagnostics)
+            self._stats["run_store"] = store.mode
+            self._stats["plasma_read_bytes"] = int(
+                diagnostics.get("plasma_intermediate_read_bytes", 0)
+            )
+            self._stats["plasma_write_bytes"] = int(
+                diagnostics.get("plasma_intermediate_write_bytes", 0)
+            ) + int(self._stats.get("plasma_output_write_bytes", 0))
+
+        def _release_run_chunks(self, chunks: List[_RunChunk]) -> None:
+            if not chunks:
+                return
+            self._ensure_run_store().release(chunks)
+            self._sync_run_store_stats()
+
         def _store_table_as_run(
             self, table: Any, *, initial: bool, replacement: bool = False
         ) -> _ExternalRun:
-            """D2H and seal one sorted GPU table as bounded Arrow chunks."""
-
-            import ray
+            """D2H and commit one sorted GPU table as bounded Arrow chunks."""
 
             rows = int(table.num_rows())
             run = _ExternalRun()
-            for arrow in self._iter_table_as_work_arrow(table):
-                size_bytes = int(arrow.nbytes)
-                seal_started = time.perf_counter()
-                ref = ray.put(arrow)
-                self._stats["phases_s"]["plasma_seal"] += (
-                    time.perf_counter() - seal_started
-                )
-                self._stats["plasma_write_bytes"] += size_bytes
-                run.chunks.append(
-                    _RunChunk(ref=ref, rows=int(arrow.num_rows), size_bytes=size_bytes)
+            store = self._ensure_run_store()
+            before_write_s = float(
+                store.diagnostics().get("plasma_intermediate_write_s", 0.0)
+            )
+            try:
+                for arrow in self._iter_table_as_work_arrow(table):
+                    run.chunks.append(store.write(arrow))
+            except BaseException:
+                # One GPU table is a transactional run: a later chunk failure
+                # must not orphan the earlier committed fragments.
+                store.release(run.chunks)
+                run.chunks.clear()
+                self._sync_run_store_stats()
+                raise
+            self._sync_run_store_stats()
+            if store.mode == "plasma":
+                self._stats["phases_s"]["plasma_seal"] += max(
+                    0.0,
+                    float(
+                        store.diagnostics().get(
+                            "plasma_intermediate_write_s", before_write_s
+                        )
+                    )
+                    - before_write_s,
                 )
             if initial:
                 self._stats["initial_run_count"] += 1
@@ -1707,28 +1791,51 @@ def lazy_load_backend() -> type[Any]:
         # -- bounded GPU-only external merge -----------------------------
 
         def _load_run_chunks(self, chunks: List[_RunChunk]) -> List[Any]:
-            """Restore one bounded set of merge heads in a single Ray fetch."""
+            """Restore one bounded set of merge heads in one store read."""
 
             import cudf
-            import ray
             from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
 
             if not chunks:
                 return []
-            read_started = time.perf_counter()
-            arrows = ray.get([chunk.ref for chunk in chunks])
-            total_bytes = sum(int(chunk.size_bytes) for chunk in chunks)
-            self._stats["plasma_read_bytes"] += total_bytes
-            self._stats["phases_s"]["orchestration"] += (
-                time.perf_counter() - read_started
+            store = self._ensure_run_store()
+            before_read_s = float(
+                store.diagnostics().get("plasma_intermediate_read_s", 0.0)
+            )
+            local_restore_started = (
+                time.perf_counter() if store.mode == "local_disk" else None
             )
             tables = []
-            for chunk, arrow in zip(chunks, arrows):
-                frame = cudf.DataFrame.from_arrow(arrow)
-                tables.append(cudf_to_pylibcudf_table(frame))
-                # Preserve completed transfer evidence if a later head fails
-                # conversion, for example because the RMM pool is exhausted.
-                self._stats["h2d_bytes"] += int(chunk.size_bytes)
+            try:
+                with store.read_many(chunks) as arrows:
+                    for chunk, arrow in zip(chunks, arrows):
+                        frame = cudf.DataFrame.from_arrow(arrow)
+                        tables.append(cudf_to_pylibcudf_table(frame))
+                        # Preserve completed transfer evidence if a later head
+                        # fails conversion, for example at the RMM ceiling.
+                        self._stats["h2d_bytes"] += int(chunk.size_bytes)
+                    if store.mode == "local_disk":
+                        # Do not let an mmap close while an asynchronous H2D
+                        # copy still references its Arrow buffers.
+                        import cupy as cp
+
+                        cp.cuda.runtime.deviceSynchronize()
+            finally:
+                if local_restore_started is not None:
+                    self._stats["local_run_restore_s"] = float(
+                        self._stats.get("local_run_restore_s", 0.0)
+                    ) + (time.perf_counter() - local_restore_started)
+                self._sync_run_store_stats()
+            if store.mode == "plasma":
+                self._stats["phases_s"]["orchestration"] += max(
+                    0.0,
+                    float(
+                        store.diagnostics().get(
+                            "plasma_intermediate_read_s", before_read_s
+                        )
+                    )
+                    - before_read_s,
+                )
             return tables
 
         def _watermark(self, tables: List[Any]):
@@ -1787,7 +1894,7 @@ def lazy_load_backend() -> type[Any]:
                 if len(active) == 1:
                     # With no competing head, the remaining stream is already
                     # globally ordered. Yield the resident suffix and then
-                    # reuse unread ObjectRefs without a GPU round-trip.
+                    # reuse unread stored chunks without a GPU round-trip.
                     state = active[0]
                     yield state["table"]
                     state["table"] = None
@@ -1832,15 +1939,32 @@ def lazy_load_backend() -> type[Any]:
             """Materialize one bounded intermediate GPU merge group."""
 
             output = _ExternalRun()
-            for source in self._iter_merged_sources(group):
-                if isinstance(source, _RunChunk):
-                    output.chunks.append(source)
-                else:
-                    replacement = self._store_table_as_run(source, initial=False)
-                    output.chunks.extend(replacement.chunks)
+            created_chunks: List[_RunChunk] = []
+            try:
+                for source in self._iter_merged_sources(group):
+                    if isinstance(source, _RunChunk):
+                        output.chunks.append(source)
+                    else:
+                        replacement = self._store_table_as_run(source, initial=False)
+                        output.chunks.extend(replacement.chunks)
+                        created_chunks.extend(replacement.chunks)
+            except BaseException:
+                # Preserve every source so the group still represents a
+                # complete run. Only partial replacement files are rolled back.
+                self._release_run_chunks(created_chunks)
+                output.chunks.clear()
+                raise
             self._stats["replacement_run_count"] += 1
-            # All output references are sealed before the prior-pass owners
-            # are released.  Reused chunks remain owned by ``output``.
+            # All output chunks are committed before prior-pass ownership is
+            # released. Unread suffixes move by object identity to ``output``.
+            transferred = {id(chunk) for chunk in output.chunks}
+            consumed = [
+                chunk
+                for run in group
+                for chunk in run.chunks
+                if id(chunk) not in transferred
+            ]
+            self._release_run_chunks(consumed)
             for run in group:
                 run.chunks.clear()
             return output
@@ -1866,9 +1990,7 @@ def lazy_load_backend() -> type[Any]:
         def _iter_final_work_arrow(
             self, final_group: List[_ExternalRun]
         ) -> Iterator[Any]:
-            """Stream the last merge pass without a replacement Plasma run."""
-
-            import ray
+            """Stream the last merge pass without a replacement stored run."""
 
             if len(final_group) == 1:
                 sources: Iterator[Any] = iter(final_group[0].chunks)
@@ -1878,13 +2000,28 @@ def lazy_load_backend() -> type[Any]:
 
             for source in sources:
                 if isinstance(source, _RunChunk):
-                    read_started = time.perf_counter()
-                    arrow = ray.get(source.ref)
-                    self._stats["plasma_read_bytes"] += int(source.size_bytes)
-                    self._stats["phases_s"]["orchestration"] += (
-                        time.perf_counter() - read_started
+                    store = self._ensure_run_store()
+                    before_read_s = float(
+                        store.diagnostics().get("plasma_intermediate_read_s", 0.0)
                     )
-                    yield arrow
+                    try:
+                        # The yielded Arrow table retains its mmap buffers even
+                        # after the NativeFile descriptor is closed. Source
+                        # files themselves remain owned until output sealing.
+                        with store.read_many([source]) as arrows:
+                            yield arrows[0]
+                    finally:
+                        self._sync_run_store_stats()
+                    if store.mode == "plasma":
+                        self._stats["phases_s"]["orchestration"] += max(
+                            0.0,
+                            float(
+                                store.diagnostics().get(
+                                    "plasma_intermediate_read_s", before_read_s
+                                )
+                            )
+                            - before_read_s,
+                        )
                 else:
                     yield from self._iter_table_as_work_arrow(source)
 
@@ -2235,25 +2372,36 @@ def lazy_load_backend() -> type[Any]:
                     self._runs[partition] = final_group
                     # Materialize intermediate merge passes, but stream the
                     # final fan-in directly to Ray. This avoids writing the
-                    # final replacement run to Plasma only to read and seal it
-                    # again as the operator output.
+                    # final replacement run only to read and seal it again as
+                    # the operator output.
                     target_output_bytes = max(128 << 10, self._run_chunk_bytes)
                     work_tables = self._iter_final_work_arrow(final_group)
                     for block in self._iter_coalesced_output_blocks(
                         work_tables, target_output_bytes
                     ):
                         self._stats["output_bytes"] += int(block.nbytes)
+                        self._stats["plasma_output_write_bytes"] = int(
+                            self._stats.get("plasma_output_write_bytes", 0)
+                        ) + int(block.nbytes)
+                        self._stats["plasma_output_write_calls"] = (
+                            int(self._stats.get("plasma_output_write_calls", 0)) + 1
+                        )
                         self._stats["plasma_write_bytes"] += int(block.nbytes)
                         creation_stats = yield block
                         if creation_stats is not None:
+                            self._stats["plasma_output_write_s"] = float(
+                                self._stats.get("plasma_output_write_s", 0.0)
+                            ) + float(creation_stats.object_creation_dur_s)
                             self._stats["phases_s"]["plasma_seal"] += float(
                                 creation_stats.object_creation_dur_s
                             )
                         yield self._tagged_metadata(block, partition, creation_stats)
-                    # The final output has been sealed before its source refs
-                    # are released. Reused chunks remain live throughout the
+                    # Every creation-stats acknowledgement above proves the
+                    # corresponding final block is sealed before its source is
+                    # deleted. Reused chunks remain live throughout the
                     # streaming generator's one-block look-behind.
                     for run in final_group:
+                        self._release_run_chunks(run.chunks)
                         run.chunks.clear()
                     self._runs[partition] = []
                 elif resident_table is not None:
@@ -2266,22 +2414,41 @@ def lazy_load_backend() -> type[Any]:
                     self._stats["d2h_bytes"] += int(work_arrow.nbytes)
                     block = self._output_arrow(work_arrow)
                     self._stats["output_bytes"] += int(block.nbytes)
+                    self._stats["plasma_output_write_bytes"] = int(
+                        self._stats.get("plasma_output_write_bytes", 0)
+                    ) + int(block.nbytes)
+                    self._stats["plasma_output_write_calls"] = (
+                        int(self._stats.get("plasma_output_write_calls", 0)) + 1
+                    )
                     self._stats["plasma_write_bytes"] += int(block.nbytes)
                     creation_stats = yield block
                     if creation_stats is not None:
+                        self._stats["plasma_output_write_s"] = float(
+                            self._stats.get("plasma_output_write_s", 0.0)
+                        ) + float(creation_stats.object_creation_dur_s)
                         self._stats["phases_s"]["plasma_seal"] += float(
                             creation_stats.object_creation_dur_s
                         )
                     yield self._tagged_metadata(block, partition, creation_stats)
                 else:
                     block = self._arrow_schema.empty_table()
+                    self._stats["plasma_output_write_calls"] = (
+                        int(self._stats.get("plasma_output_write_calls", 0)) + 1
+                    )
                     creation_stats = yield block
                     if creation_stats is not None:
+                        self._stats["plasma_output_write_s"] = float(
+                            self._stats.get("plasma_output_write_s", 0.0)
+                        ) + float(creation_stats.object_creation_dur_s)
                         self._stats["phases_s"]["plasma_seal"] += float(
                             creation_stats.object_creation_dur_s
                         )
                     yield self._tagged_metadata(block, partition, creation_stats)
             self._update_peak()
+            store = getattr(self, "_run_store", None)
+            if store is not None:
+                store.close()
+                self._sync_run_store_stats()
 
         # -- compact diagnostics and cleanup -----------------------------
 
@@ -2332,6 +2499,7 @@ def lazy_load_backend() -> type[Any]:
 
         def diagnostics(self) -> Dict[str, Any]:
             self._update_peak()
+            self._sync_run_store_stats()
             rapids_stats = self._rapids_stats()
             self._stats["mpf_host_spill_bytes"] = _sum_spill_bytes(rapids_stats)
             if self.rank() == 0:
@@ -2356,8 +2524,15 @@ def lazy_load_backend() -> type[Any]:
                 tables.clear()
             for runs in self._runs.values():
                 for run in runs:
+                    store = getattr(self, "_run_store", None)
+                    if store is not None:
+                        store.release(run.chunks)
                     run.chunks.clear()
                 runs.clear()
+            store = getattr(self, "_run_store", None)
+            if store is not None:
+                store.close()
+                self._sync_run_store_stats()
             self._boundary_keys = None
             gc.collect()
 

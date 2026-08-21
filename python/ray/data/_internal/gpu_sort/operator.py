@@ -15,6 +15,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -452,6 +453,9 @@ def _operator_config(data_context: DataContext) -> Dict[str, Any]:
     sample_size = max(
         65_536, int(data_context.get_config("gpu_sort_sample_size", 65_536))
     )
+    external_run_store = str(
+        data_context.get_config("gpu_sort_external_run_store", "plasma")
+    )
     return GPUSortConfig(
         sample_size=sample_size,
         sample_seed=int(data_context.get_config("gpu_sort_sample_seed", 0)),
@@ -466,6 +470,20 @@ def _operator_config(data_context: DataContext) -> Dict[str, Any]:
         ),
         run_chunk_bytes=int(
             data_context.get_config("gpu_sort_run_chunk_bytes", 512 << 20)
+        ),
+        merge_fan_in=int(data_context.get_config("gpu_sort_merge_fan_in", 4)),
+        external_run_store=external_run_store,
+        external_run_directory=data_context.get_config(
+            "gpu_sort_external_run_directory", None
+        ),
+        external_run_id=(
+            uuid.uuid4().hex if external_run_store == "local_disk" else None
+        ),
+        external_run_min_free_bytes=data_context.get_config(
+            "gpu_sort_external_run_min_free_bytes", 0
+        ),
+        external_run_max_live_bytes=data_context.get_config(
+            "gpu_sort_external_run_max_live_bytes", None
         ),
         setup_timeout_s=float(
             data_context.get_config("gpu_sort_setup_timeout_s", 300.0)
@@ -1083,6 +1101,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 else 0,
             )
             item.setdefault("peak_device_bytes", 0)
+            item.setdefault("run_store", self._config["external_run_store"])
             item.setdefault("input_bytes", self._assigned_bytes[default_rank])
             item.setdefault("input_blocks", self._assigned_blocks[default_rank])
             item.setdefault("local_input_bytes", self._local_bytes[default_rank])
@@ -1108,6 +1127,28 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "d2h_bytes",
                 "plasma_read_bytes",
                 "plasma_write_bytes",
+                "plasma_intermediate_read_bytes",
+                "plasma_intermediate_write_bytes",
+                "plasma_intermediate_read_calls",
+                "plasma_intermediate_write_calls",
+                "plasma_output_write_bytes",
+                "plasma_output_write_calls",
+                "plasma_output_write_s",
+                "local_run_write_bytes",
+                "local_run_read_bytes",
+                "local_run_physical_write_bytes",
+                "local_run_physical_read_bytes",
+                "local_run_write_calls",
+                "local_run_read_calls",
+                "local_run_restore_s",
+                "local_run_live_bytes",
+                "local_run_peak_bytes",
+                "local_run_live_files",
+                "local_run_peak_files",
+                "local_run_write_errors",
+                "local_run_read_errors",
+                "local_run_cleanup_errors",
+                "local_run_cleanup_pending_files",
                 "mpf_host_spill_bytes",
                 "ray_disk_spill_bytes",
                 "cpu_sort_rows",
@@ -1120,6 +1161,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
 
         def total(name: str) -> int:
             return sum(int(item.get(name, 0) or 0) for item in ranks)
+
+        def total_float(name: str) -> float:
+            return sum(float(item.get(name, 0.0) or 0.0) for item in ranks)
 
         phase_names = (
             "partition",
@@ -1158,6 +1202,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         ]
         LAST_RUN_STATS = {
             "mode": "external" if externalized_bytes else "resident",
+            "run_store": self._config["external_run_store"],
             "sampling_mode": "cpu_sampled_arrow",
             "sampling_scheme": "deterministic_stratified_random",
             "sampling_scheme_version": 1,
@@ -1223,6 +1268,32 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "d2h_bytes": total("d2h_bytes"),
             "plasma_read_bytes": total("plasma_read_bytes"),
             "plasma_write_bytes": total("plasma_write_bytes"),
+            "plasma_intermediate_read_bytes": total("plasma_intermediate_read_bytes"),
+            "plasma_intermediate_write_bytes": total("plasma_intermediate_write_bytes"),
+            "plasma_intermediate_read_calls": total("plasma_intermediate_read_calls"),
+            "plasma_intermediate_write_calls": total("plasma_intermediate_write_calls"),
+            "plasma_intermediate_read_s": total_float("plasma_intermediate_read_s"),
+            "plasma_intermediate_write_s": total_float("plasma_intermediate_write_s"),
+            "plasma_output_write_bytes": total("plasma_output_write_bytes"),
+            "plasma_output_write_calls": total("plasma_output_write_calls"),
+            "plasma_output_write_s": total_float("plasma_output_write_s"),
+            "local_run_write_bytes": total("local_run_write_bytes"),
+            "local_run_read_bytes": total("local_run_read_bytes"),
+            "local_run_physical_write_bytes": total("local_run_physical_write_bytes"),
+            "local_run_physical_read_bytes": total("local_run_physical_read_bytes"),
+            "local_run_write_calls": total("local_run_write_calls"),
+            "local_run_read_calls": total("local_run_read_calls"),
+            "local_run_write_s": total_float("local_run_write_s"),
+            "local_run_read_s": total_float("local_run_read_s"),
+            "local_run_restore_s": total_float("local_run_restore_s"),
+            "local_run_live_bytes": total("local_run_live_bytes"),
+            "local_run_peak_bytes": total("local_run_peak_bytes"),
+            "local_run_live_files": total("local_run_live_files"),
+            "local_run_peak_files": total("local_run_peak_files"),
+            "local_run_write_errors": total("local_run_write_errors"),
+            "local_run_read_errors": total("local_run_read_errors"),
+            "local_run_cleanup_errors": total("local_run_cleanup_errors"),
+            "local_run_cleanup_pending_files": total("local_run_cleanup_pending_files"),
             "mpf_host_spill_bytes": total("mpf_host_spill_bytes"),
             "ray_disk_spill_bytes": total("ray_disk_spill_bytes"),
             "cpu_sort_rows": total("cpu_sort_rows"),

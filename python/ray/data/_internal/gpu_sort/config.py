@@ -25,6 +25,8 @@ def _positive_bytes(value: Any) -> Optional[int]:
     else:
         text = str(value).strip().lower().replace(" ", "")
         units = {
+            "tib": 1 << 40,
+            "tb": 1 << 40,
             "gib": 1 << 30,
             "gb": 1 << 30,
             "mib": 1 << 20,
@@ -42,6 +44,18 @@ def _positive_bytes(value: Any) -> Optional[int]:
             result = int(text)
     if result <= 0:
         raise ValueError("GPU sort memory budget must be positive.")
+    return result
+
+
+def _nonnegative_bytes(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        raise ValueError("GPU sort memory budget must be a byte count.")
+    if value == 0:
+        return 0
+    result = _positive_bytes(value)
+    assert result is not None
     return result
 
 
@@ -69,6 +83,13 @@ class GPUSortConfig:
     exchange_batch_bytes: int = 512 << 20
     merge_fan_in: int = 4
     run_chunk_bytes: int = 512 << 20
+    # Intermediate external runs remain in Plasma unless a benchmark or
+    # deployment explicitly selects actor-local Arrow IPC files.
+    external_run_store: str = "plasma"
+    external_run_directory: Optional[str] = None
+    external_run_id: Optional[str] = None
+    external_run_min_free_bytes: int = 0
+    external_run_max_live_bytes: Optional[int] = None
     setup_timeout_s: float = 300.0
     null_position: str = "last"
     pinned_output_max_bytes: int = 12 << 30
@@ -85,6 +106,16 @@ class GPUSortConfig:
             self,
             "residency_budget_bytes",
             _positive_bytes(self.residency_budget_bytes),
+        )
+        object.__setattr__(
+            self,
+            "external_run_min_free_bytes",
+            _nonnegative_bytes(self.external_run_min_free_bytes),
+        )
+        object.__setattr__(
+            self,
+            "external_run_max_live_bytes",
+            _positive_bytes(self.external_run_max_live_bytes),
         )
         if self.sample_size < 1:
             raise ValueError("GPU sort sample_size must be positive.")
@@ -104,6 +135,26 @@ class GPUSortConfig:
             raise ValueError("GPU sort batch and run sizes must be positive.")
         if self.merge_fan_in < 2:
             raise ValueError("GPU sort merge_fan_in must be at least two.")
+        if self.external_run_store not in ("plasma", "local_disk"):
+            raise ValueError(
+                "GPU sort external_run_store must be 'plasma' or 'local_disk'."
+            )
+        if self.external_run_store == "local_disk":
+            if not self.external_run_directory:
+                raise ValueError(
+                    "GPU sort local_disk runs require external_run_directory."
+                )
+            if not os.path.isabs(self.external_run_directory):
+                raise ValueError(
+                    "GPU sort external_run_directory must be an absolute path."
+                )
+            run_id = self.external_run_id or ""
+            if not run_id or not all(
+                character.isalnum() or character in ("-", "_") for character in run_id
+            ):
+                raise ValueError(
+                    "GPU sort local_disk runs require an alphanumeric external_run_id."
+                )
         if self.setup_timeout_s <= 0:
             raise ValueError("GPU sort setup timeout must be positive.")
         if self.null_position not in ("first", "last"):

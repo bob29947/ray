@@ -31,6 +31,7 @@ from ray.data._internal.gpu_sort.operator import (
     _allocate_stratified_sample_quotas,
     _assign_blocks_by_locality,
     _make_waves,
+    _operator_config,
     _plan_exchange_round,
     _sampling_plan_digest,
     _validate_gpu_schema,
@@ -241,6 +242,25 @@ def test_gpu_sort_schema_and_wave_planning():
     )
     config = GPUSortConfig()
     assert config.rmm_initial_fraction == config.rmm_max_fraction == 0.85
+    local_config = GPUSortConfig(
+        external_run_store="local_disk",
+        external_run_directory="/raid/gpu-sort-runs",
+        external_run_id="sort_123",
+        external_run_min_free_bytes="4 TiB",
+        external_run_max_live_bytes="2 GiB",
+    )
+    assert local_config.external_run_min_free_bytes == 4 << 40
+    assert local_config.external_run_max_live_bytes == 2 << 30
+    with pytest.raises(ValueError, match="external_run_store"):
+        GPUSortConfig(external_run_store="disk")
+    with pytest.raises(ValueError, match="external_run_directory"):
+        GPUSortConfig(
+            external_run_store="local_disk",
+            external_run_directory="relative",
+            external_run_id="sort",
+        )
+    with pytest.raises(ValueError, match="byte count"):
+        GPUSortConfig(external_run_min_free_bytes=False)
     blocks = [
         [_InputBlock("a", 6, 1), _InputBlock("b", 6, 1)],
         [_InputBlock("c", 3, 1)],
@@ -248,6 +268,28 @@ def test_gpu_sort_schema_and_wave_planning():
     waves = _make_waves(blocks, target_bytes_per_rank=8)
     assert waves == [[["a"], ["c"]], [["b"], []]]
     assert _make_waves(blocks, target_bytes_per_rank=None) == [[["a", "b"], ["c"]]]
+
+
+def test_gpu_sort_operator_config_wires_local_run_store_controls():
+    values = {
+        "gpu_sort_external_run_store": "local_disk",
+        "gpu_sort_external_run_directory": "/raid/gpu-sort-runs",
+        "gpu_sort_external_run_min_free_bytes": 4 << 40,
+        "gpu_sort_external_run_max_live_bytes": 1 << 40,
+        "gpu_sort_merge_fan_in": 7,
+    }
+    context = types.SimpleNamespace(
+        get_config=lambda name, default: values.get(name, default)
+    )
+
+    config = _operator_config(context)
+
+    assert config["external_run_store"] == "local_disk"
+    assert config["external_run_directory"] == "/raid/gpu-sort-runs"
+    assert len(config["external_run_id"]) == 32
+    assert config["external_run_min_free_bytes"] == 4 << 40
+    assert config["external_run_max_live_bytes"] == 1 << 40
+    assert config["merge_fan_in"] == 7
 
 
 def test_gpu_sort_bounded_input_batching_preserves_order_and_chunks():
@@ -1642,6 +1684,199 @@ def test_gpu_sort_restores_merge_heads_in_one_ray_get(gpu_backend_class, monkeyp
     assert backend._stats["phases_s"]["orchestration"] == pytest.approx(1.25)
 
 
+def test_gpu_sort_local_mmap_stays_open_until_h2d_is_synchronized(
+    gpu_backend_class, monkeypatch
+):
+    events = []
+    chunk = _RunChunk(ref="/raid/run.arrow", rows=1, size_bytes=8)
+    arrow = object()
+
+    class ReadContext:
+        def __enter__(self):
+            events.append("mapping-open")
+            return [arrow]
+
+        def __exit__(self, *_args):
+            events.append("mapping-close")
+
+    class Store:
+        mode = "local_disk"
+
+        def read_many(self, chunks):
+            assert chunks == [chunk]
+            return ReadContext()
+
+        def diagnostics(self):
+            return {}
+
+    _stub_module(
+        monkeypatch,
+        "cudf",
+        DataFrame=types.SimpleNamespace(
+            from_arrow=lambda value: events.append("h2d")
+            or types.SimpleNamespace(table=("device", value))
+        ),
+    )
+    _stub_module(
+        monkeypatch,
+        "rapidsmpf.utils.cudf",
+        cudf_to_pylibcudf_table=lambda frame: frame.table,
+    )
+    _stub_module(
+        monkeypatch,
+        "cupy",
+        cuda=types.SimpleNamespace(
+            runtime=types.SimpleNamespace(
+                deviceSynchronize=lambda: events.append("synchronize")
+            )
+        ),
+    )
+    backend = _new_backend(
+        gpu_backend_class,
+        _run_store=Store(),
+        _stats={
+            "h2d_bytes": 0,
+            "plasma_output_write_bytes": 0,
+            "phases_s": {"orchestration": 0.0},
+        },
+    )
+    ticks = iter([10.0, 11.5])
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+    assert backend._load_run_chunks([chunk]) == [("device", arrow)]
+    assert events == ["mapping-open", "h2d", "synchronize", "mapping-close"]
+    assert backend._stats["local_run_restore_s"] == pytest.approx(1.5)
+
+
+def test_gpu_sort_partial_run_write_releases_committed_chunks(gpu_backend_class):
+    committed = _RunChunk(ref="new-0", rows=1, size_bytes=8)
+
+    class Store:
+        mode = "local_disk"
+
+        def __init__(self):
+            self.calls = 0
+            self.released = []
+
+        def write(self, _table):
+            self.calls += 1
+            if self.calls == 2:
+                raise OSError("synthetic run write failure")
+            return committed
+
+        def release(self, chunks):
+            self.released.extend(chunks)
+
+        def diagnostics(self):
+            return {}
+
+    store = Store()
+    table = _DeviceTable(2, 16)
+    backend = _new_backend(
+        gpu_backend_class,
+        _run_store=store,
+        _stats={
+            "initial_run_count": 0,
+            "externalized_rows": 0,
+            "externalized_bytes": 0,
+            "plasma_output_write_bytes": 0,
+            "phases_s": {"plasma_seal": 0.0},
+        },
+    )
+    backend._iter_table_as_work_arrow = lambda _table: iter(
+        [pa.table({"value": [1]}), pa.table({"value": [2]})]
+    )
+
+    with pytest.raises(OSError, match="synthetic run write failure"):
+        backend._store_table_as_run(table, initial=True)
+
+    assert store.released == [committed]
+    assert backend._stats["initial_run_count"] == 0
+
+
+def test_gpu_sort_merge_commit_transfers_suffix_and_releases_consumed_chunks(
+    gpu_backend_class,
+):
+    first = _RunChunk(ref="first", rows=1, size_bytes=1)
+    second = _RunChunk(ref="second", rows=1, size_bytes=1)
+    suffix = _RunChunk(ref="suffix", rows=1, size_bytes=1)
+    replacement = _RunChunk(ref="replacement", rows=2, size_bytes=2)
+
+    class Store:
+        mode = "local_disk"
+
+        def __init__(self):
+            self.released = []
+
+        def release(self, chunks):
+            self.released.extend(chunks)
+
+        def diagnostics(self):
+            return {}
+
+    store = Store()
+    group = [_ExternalRun([first, suffix]), _ExternalRun([second])]
+    backend = _new_backend(
+        gpu_backend_class,
+        _run_store=store,
+        _stats={"replacement_run_count": 0, "plasma_output_write_bytes": 0},
+    )
+    device_output = object()
+    backend._iter_merged_sources = lambda _group: iter([device_output, suffix])
+    backend._store_table_as_run = lambda table, initial: _ExternalRun([replacement])
+
+    output = backend._merge_group(group)
+
+    assert output.chunks == [replacement, suffix]
+    assert store.released == [first, second]
+    assert all(run.chunks == [] for run in group)
+    assert backend._stats["replacement_run_count"] == 1
+
+
+def test_gpu_sort_merge_failure_rolls_back_outputs_and_preserves_sources(
+    gpu_backend_class,
+):
+    sources = [
+        _RunChunk(ref="source-0", rows=1, size_bytes=1),
+        _RunChunk(ref="source-1", rows=1, size_bytes=1),
+    ]
+    replacement = _RunChunk(ref="replacement", rows=1, size_bytes=1)
+
+    class Store:
+        mode = "local_disk"
+
+        def __init__(self):
+            self.released = []
+
+        def release(self, chunks):
+            self.released.extend(chunks)
+
+        def diagnostics(self):
+            return {}
+
+    store = Store()
+    group = [_ExternalRun(list(sources))]
+    backend = _new_backend(
+        gpu_backend_class,
+        _run_store=store,
+        _stats={"replacement_run_count": 0, "plasma_output_write_bytes": 0},
+    )
+
+    def fail_after_one_output(_group):
+        yield object()
+        raise RuntimeError("synthetic merge failure")
+
+    backend._iter_merged_sources = fail_after_one_output
+    backend._store_table_as_run = lambda table, initial: _ExternalRun([replacement])
+
+    with pytest.raises(RuntimeError, match="synthetic merge failure"):
+        backend._merge_group(group)
+
+    assert store.released == [replacement]
+    assert group[0].chunks == sources
+    assert backend._stats["replacement_run_count"] == 0
+
+
 def test_gpu_sort_merge_batches_only_missing_run_heads(gpu_backend_class, monkeypatch):
     class Table:
         def __init__(self, value):
@@ -1759,10 +1994,30 @@ def test_gpu_sort_final_sources_live_until_output_is_sealed(
 ):
     _stub_module(monkeypatch, "cupy")
     _stub_module(monkeypatch, "pylibcudf")
-    source = _ExternalRun([object()])
+    source_chunk = _RunChunk(ref="source", rows=10, size_bytes=80)
+    source = _ExternalRun([source_chunk])
     table = pa.table({"value": np.arange(10, dtype=np.int64)})
+
+    class Store:
+        mode = "local_disk"
+
+        def __init__(self):
+            self.released = []
+            self.closed = False
+
+        def release(self, chunks):
+            self.released.extend(chunks)
+
+        def diagnostics(self):
+            return {}
+
+        def close(self):
+            self.closed = True
+
+    store = Store()
     backend = _new_backend(
         gpu_backend_class,
+        _run_store=store,
         _device_tables={0: []},
         _runs={0: [source]},
         _run_chunk_bytes=1,
@@ -1794,7 +2049,12 @@ def test_gpu_sort_final_sources_live_until_output_is_sealed(
     creation_stats = types.SimpleNamespace(object_creation_dur_s=1.25)
     assert stream.send(creation_stats) == ("metadata", 0, creation_stats)
     assert source.chunks
+    assert store.released == []
     with pytest.raises(StopIteration):
         next(stream)
     assert source.chunks == []
+    assert store.released == [source_chunk]
+    assert store.closed
     assert backend._stats["phases_s"]["plasma_seal"] == 1.25
+    assert backend._stats["plasma_output_write_calls"] == 1
+    assert backend._stats["plasma_output_write_s"] == 1.25
