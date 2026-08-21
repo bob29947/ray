@@ -899,6 +899,83 @@ class BlockRefBundler(BaseRefBundler):
         return bundle.num_rows() if bundle.num_rows() is not None else float("inf")
 
 
+class BytesRefBundler(BaseRefBundler):
+    """Rebundle consecutive RefBundles up to a decoded-byte target.
+
+    RefBundles are indivisible here. A singleton bundle larger than the target is
+    emitted on its own so the operator can continue to make progress.
+    """
+
+    def __init__(self, target_bytes_per_bundle: int):
+        if (
+            not isinstance(target_bytes_per_bundle, int)
+            or isinstance(target_bytes_per_bundle, bool)
+            or target_bytes_per_bundle <= 0
+        ):
+            raise ValueError(
+                "target_bytes_per_bundle must be a positive integer, got "
+                f"{target_bytes_per_bundle!r}."
+            )
+
+        self._target_bytes_per_bundle = target_bytes_per_bundle
+        self._bundle_buffer: List[RefBundle] = []
+        self._bundle_buffer_size_bytes = 0
+        self._finalized = False
+
+    def num_blocks(self) -> int:
+        return sum(len(bundle.block_refs) for bundle in self._bundle_buffer)
+
+    def add_bundle(self, bundle: RefBundle):
+        self._bundle_buffer.append(bundle)
+        self._bundle_buffer_size_bytes += bundle.size_bytes()
+
+    def has_bundle(self) -> bool:
+        return bool(self._bundle_buffer) and (
+            self._finalized
+            or self._bundle_buffer_size_bytes >= self._target_bytes_per_bundle
+        )
+
+    def size_bytes(self) -> int:
+        return self._bundle_buffer_size_bytes
+
+    def get_next_bundle(
+        self,
+    ) -> Tuple[List[RefBundle], RefBundle]:
+        assert self.has_bundle()
+
+        output_buffer: List[RefBundle] = []
+        output_size_bytes = 0
+        next_index = len(self._bundle_buffer)
+
+        for index, bundle in enumerate(self._bundle_buffer):
+            bundle_size_bytes = bundle.size_bytes()
+
+            # Never cross the target by combining bundles. The first bundle is
+            # always accepted so an indivisible oversized bundle can't deadlock.
+            if (
+                output_buffer
+                and output_size_bytes + bundle_size_bytes
+                > self._target_bytes_per_bundle
+            ):
+                next_index = index
+                break
+
+            output_buffer.append(bundle)
+            output_size_bytes += bundle_size_bytes
+
+            if output_size_bytes >= self._target_bytes_per_bundle:
+                next_index = index + 1
+                break
+
+        self._bundle_buffer = self._bundle_buffer[next_index:]
+        self._bundle_buffer_size_bytes -= output_size_bytes
+
+        return list(output_buffer), _merge_ref_bundles(*output_buffer)
+
+    def done_adding_bundles(self):
+        self._finalized = True
+
+
 def _merge_ref_bundles(*bundles: RefBundle) -> RefBundle:
     """Merge N ref bundles into a single bundle of multiple blocks."""
     # Check that at least one bundle is non-null.

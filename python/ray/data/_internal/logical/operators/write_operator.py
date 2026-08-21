@@ -26,8 +26,30 @@ class Write(AbstractMap):
             min_rows_per_bundled_input = (
                 datasink_or_legacy_datasource.min_rows_per_write
             )
+            target_bytes_per_bundled_input = (
+                datasink_or_legacy_datasource.target_bytes_per_write
+            )
         else:
             min_rows_per_bundled_input = None
+            target_bytes_per_bundled_input = None
+
+        if (
+            min_rows_per_bundled_input is not None
+            and target_bytes_per_bundled_input is not None
+        ):
+            raise ValueError(
+                "A Datasink can't set both min_rows_per_write and "
+                "target_bytes_per_write."
+            )
+        if target_bytes_per_bundled_input is not None and (
+            not isinstance(target_bytes_per_bundled_input, int)
+            or isinstance(target_bytes_per_bundled_input, bool)
+            or target_bytes_per_bundled_input <= 0
+        ):
+            raise ValueError(
+                "target_bytes_per_write must be a positive integer or None, got "
+                f"{target_bytes_per_bundled_input!r}."
+            )
 
         super().__init__(
             input_op=input_op,
@@ -37,4 +59,5 @@ class Write(AbstractMap):
             compute=compute,
         )
         self.datasink_or_legacy_datasource = datasink_or_legacy_datasource
+        self.target_bytes_per_bundled_input = target_bytes_per_bundled_input
         self.write_args = write_args

@@ -135,6 +135,24 @@ class Datasink(Generic[WriteReturnType]):
         """
         return None
 
+    @property
+    def target_bytes_per_write(self) -> Optional[int]:
+        """The maximum decoded input size for each :meth:`write` call.
+
+        Ray Data splits oversized input blocks on row boundaries, then combines
+        consecutive input bundles without exceeding this target. If one row alone
+        exceeds the target, the write fails instead of exceeding the bound.
+
+        This value is based on the decoded in-memory sizes recorded in block metadata,
+        not the encoded size of any files written by the datasink. Enforcing the hard
+        bound adds a streaming split task boundary before the write operator. If
+        ``None``, Ray Data doesn't bundle write inputs by bytes.
+
+        ``target_bytes_per_write`` and :attr:`min_rows_per_write` are mutually
+        exclusive.
+        """
+        return None
+
 
 @DeveloperAPI
 class DummyOutputDatasink(Datasink[None]):
