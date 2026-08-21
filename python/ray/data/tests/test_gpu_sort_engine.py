@@ -699,9 +699,13 @@ def test_gpu_sort_locality_assignment_balances_decoded_bytes():
         "n1": {"node_ids": ["node-1"]},
         "replicated": {"node_ids": ["node-0", "node-1"]},
     }
-    assigned, assigned_bytes, assigned_blocks, local_bytes, local_blocks = (
-        _assign_blocks_by_locality(blocks, ["node-0", "node-1"], locations)
-    )
+    (
+        assigned,
+        assigned_bytes,
+        assigned_blocks,
+        local_bytes,
+        local_blocks,
+    ) = _assign_blocks_by_locality(blocks, ["node-0", "node-1"], locations)
 
     assert [[block.value for block in rank] for rank in assigned] == [
         ["n0-large", "n0-small", "unknown"],
@@ -1268,17 +1272,19 @@ def test_gpu_sort_comparator_matches_arrow_null_nan_order(
         assert nulls == [
             null_order.AFTER,
             null_order.AFTER,
-            null_order.AFTER,
+            null_order.AFTER if ascending else null_order.BEFORE,
         ]
 
         backend._float_hidden = {}
-        for null_position, expected_null_order in (
-            ("first", null_order.BEFORE),
-            ("last", null_order.AFTER),
-        ):
+        for null_position in ("first", "last"):
             backend._config = GPUSortConfig(null_position=null_position)
             direct_orders, direct_nulls = backend._order_and_nulls()
             assert direct_orders == [order.ASCENDING if ascending else order.DESCENDING]
+            expected_null_order = (
+                null_order.BEFORE
+                if (null_position == "first") == ascending
+                else null_order.AFTER
+            )
             assert direct_nulls == [expected_null_order]
 
 
@@ -2203,8 +2209,9 @@ def test_gpu_sort_final_sources_live_until_output_is_sealed(
         def diagnostics(self):
             return {}
 
-        def close(self):
+        def close(self, *, strict=False):
             self.closed = True
+            self.strict = strict
 
     store = Store()
     backend = _new_backend(
@@ -2247,6 +2254,7 @@ def test_gpu_sort_final_sources_live_until_output_is_sealed(
     assert source.chunks == []
     assert store.released == [source_chunk]
     assert store.closed
+    assert store.strict
     assert backend._stats["phases_s"]["plasma_seal"] == 1.25
     assert backend._stats["plasma_output_write_calls"] == 1
     assert backend._stats["plasma_output_write_s"] == 1.25

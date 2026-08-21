@@ -120,6 +120,19 @@ class GPUSortActor:
             seed=seed,
         )
 
+    def ingest_blocks(
+        self, blocks: List[Any], block_ordinals: List[int]
+    ) -> Dict[str, Any]:
+        """Create actor-local sorted runs before upstream reaches EOS."""
+
+        return self._backend.ingest_blocks(
+            _iter_resolved_blocks(blocks),
+            block_ordinals=block_ordinals,
+        )
+
+    def finalize_ingest(self) -> Dict[str, Any]:
+        return self._backend.finalize_ingest()
+
     def compute_boundaries(self, samples: List[Any], schema: Any) -> Dict[str, Any]:
         return self._backend.compute_boundaries(samples, schema)
 
@@ -128,6 +141,9 @@ class GPUSortActor:
 
     def prepare_wave(self, wave_id: int, blocks: List[Any]) -> Dict[str, Any]:
         return self._backend.prepare_wave(wave_id, _resolve_blocks(blocks))
+
+    def prepare_ingested_runs(self, wave_id: int, run_ids: List[int]) -> Dict[str, Any]:
+        return self._backend.prepare_ingested_runs(wave_id, run_ids)
 
     def prepare_more(self, wave_id: int) -> Dict[str, Any]:
         return self._backend.prepare_more(wave_id)
@@ -142,6 +158,9 @@ class GPUSortActor:
         return self._backend.exchange_prepared_round(
             wave_id, exchange_id, batch_ids, final_subround
         )
+
+    def commit_source_wave(self, wave_id: int) -> Dict[str, Any]:
+        return self._backend.commit_source_wave(wave_id)
 
     def finish_and_extract(self) -> Iterator[Any]:
         try:
@@ -161,5 +180,6 @@ class GPUSortActor:
         result["communication_environment"] = dict(self._communication_environment)
         return result
 
-    def release(self) -> None:
-        self._backend.release()
+    def release(self, *, strict: bool = False) -> Dict[str, Any]:
+        self._backend.release(strict=strict)
+        return self.diagnostics()

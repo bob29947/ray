@@ -459,6 +459,78 @@ def _coalesce_arrow_inputs(tables: List[Any], target_bytes: int) -> Iterator[Any
         yield pending[0] if len(pending) == 1 else pa.concat_tables(pending)
 
 
+def _duplicate_boundary_cuts(
+    lowers: List[int],
+    uppers: List[int],
+    group_spans: List[Tuple[int, int]],
+    *,
+    num_partitions: int,
+    rows: int,
+    phase: int = 0,
+) -> List[int]:
+    """Split equal-key intervals evenly across repeated adjacent ranges."""
+
+    boundary_count = int(num_partitions) - 1
+    if (
+        boundary_count < 0
+        or len(lowers) != boundary_count
+        or len(uppers) != boundary_count
+    ):
+        raise ValueError("GPU sort boundary search results have the wrong size.")
+    covered = [False] * boundary_count
+    for start, end in group_spans:
+        start, end = int(start), int(end)
+        if not 0 <= start < end <= boundary_count:
+            raise ValueError("GPU sort boundary group spans are invalid.")
+        if any(covered[start:end]):
+            raise ValueError("GPU sort boundary group spans overlap.")
+        if any(
+            lowers[index] != lowers[start] or uppers[index] != uppers[start]
+            for index in range(start, end)
+        ):
+            raise ValueError("Equal GPU sort boundaries returned unequal intervals.")
+        for boundary_index in range(start, end):
+            covered[boundary_index] = True
+    if not all(covered) and boundary_count:
+        raise ValueError("GPU sort boundary groups do not cover every boundary.")
+
+    # Arrow equality deliberately distinguishes NaN values, while the sort
+    # comparator groups them into one category. GPU search intervals are the
+    # authoritative comparator result, so coalesce adjacent boundaries that
+    # returned the same interval. This is also harmless when a source run has
+    # no rows between two distinct boundaries: the interval width is zero.
+    effective_spans: List[Tuple[int, int]] = []
+    effective_start = 0
+    for index in range(1, boundary_count + 1):
+        if index < boundary_count and (
+            lowers[index],
+            uppers[index],
+        ) == (lowers[effective_start], uppers[effective_start]):
+            continue
+        if effective_start < index:
+            effective_spans.append((effective_start, index))
+        effective_start = index
+
+    cuts = [0] * boundary_count
+    for start, end in effective_spans:
+        lower, upper = int(lowers[start]), int(uppers[start])
+        divisions = end - start + 1
+        base, remainder = divmod(upper - lower, divisions)
+        counts = [base] * divisions
+        remainder_start = (int(phase) + lower + start) % divisions
+        for offset in range(remainder):
+            counts[(remainder_start + offset) % divisions] += 1
+        cumulative = lower
+        for boundary_index, count in zip(range(start, end), counts):
+            cumulative += count
+            cuts[boundary_index] = cumulative
+    if any(left > right for left, right in zip(cuts, cuts[1:])) or (
+        cuts and (cuts[0] < 0 or cuts[-1] > int(rows))
+    ):
+        raise RuntimeError(f"GPU sort produced invalid contiguous range cuts: {cuts}.")
+    return cuts
+
+
 def lazy_load_backend() -> type[Any]:
     """Build the implementation only inside a one-GPU Ray actor."""
 
@@ -500,6 +572,7 @@ def lazy_load_backend() -> type[Any]:
             self._sample_stratum_name = ""
             self._sample_index_name = ""
             self._boundary_keys = None
+            self._boundary_group_spans: List[Tuple[int, int]] = []
 
             self._mr = None
             self._buffer_resource = None
@@ -520,6 +593,18 @@ def lazy_load_backend() -> type[Any]:
             self._runs: Dict[int, List[_ExternalRun]] = {
                 partition: [] for partition in self._device_tables
             }
+            # Source runs are full-key sorted during one-pass ingestion before
+            # global range boundaries are known. They remain actor-local until
+            # post-EOS redistribution commits their destination ranges.
+            self._source_runs: Dict[int, _ExternalRun] = {}
+            self._source_run_rows: Dict[int, int] = {}
+            self._next_source_run_id = 0
+            self._active_source_run_ids: List[int] = []
+            self._active_source_wave_id: Optional[int] = None
+            self._streaming_sample = None
+            self._streaming_sample_candidate_rows = 0
+            self._streaming_sampled_blocks = 0
+            self._ingest_finalized = False
             self._row_ordinal = 0
             self._duplicate_kernel = None
             self._prepared_wave_id: Optional[int] = None
@@ -528,6 +613,7 @@ def lazy_load_backend() -> type[Any]:
             self._pending_arrow_batches: Optional[Iterator[Any]] = None
             self._next_arrow_batch = None
             self._source_input_complete = False
+            self._pending_inputs_sorted = False
             self._next_prepared_batch_id = 0
             self._started_at = time.perf_counter()
             self._ray_spill_start = 0
@@ -542,6 +628,18 @@ def lazy_load_backend() -> type[Any]:
                 "input_bytes": 0,
                 "input_rows": 0,
                 "input_block_count": 0,
+                "ingest_rpc_count": 0,
+                "source_run_count": 0,
+                "source_run_bytes": 0,
+                "source_run_rows": 0,
+                "redistributed_run_count": 0,
+                "redistributed_run_bytes": 0,
+                "redistributed_run_rows": 0,
+                "first_ingest_started_at_ns": None,
+                "first_run_committed_at_ns": None,
+                "last_run_committed_at_ns": None,
+                "ingest_wall_s": 0.0,
+                "streaming_sample_construction_s": 0.0,
                 "input_batch_requested_bytes": self._config.exchange_batch_bytes,
                 "input_batch_count": 0,
                 "min_input_batch_target_bytes": 0,
@@ -672,6 +770,7 @@ def lazy_load_backend() -> type[Any]:
                     "GPU sort residency budget must be at least 16 MiB."
                 )
             self._stats["memory_budget_bytes"] = self._memory_budget_bytes
+            self._initialize_run_limits()
             try:
                 import cudf
 
@@ -705,6 +804,28 @@ def lazy_load_backend() -> type[Any]:
 
         def is_ready(self) -> bool:
             return self.is_initialized() and self._buffer_resource is not None
+
+        def _initialize_run_limits(self) -> None:
+            """Set run-sort and merge bounds before streaming input arrives."""
+
+            self._payload_limit_bytes = max(
+                4 << 20,
+                int(
+                    self._memory_budget_bytes / self._config.final_sort_workspace_factor
+                ),
+            )
+            merge_bound = max(
+                1 << 20,
+                int(
+                    self._memory_budget_bytes
+                    / (
+                        2
+                        * self._config.merge_fan_in
+                        * self._config.merge_workspace_factor
+                    )
+                ),
+            )
+            self._run_chunk_bytes = min(self._config.run_chunk_bytes, merge_bound)
 
         def _set_schema(self, schema: Any) -> None:
             import pyarrow as pa
@@ -791,6 +912,19 @@ def lazy_load_backend() -> type[Any]:
 
             order: List[Any] = []
             nulls: List[Any] = []
+
+            def null_order(ascending: bool) -> Any:
+                # libcudf applies BEFORE/AFTER in the column's natural
+                # ascending order, then reverses it for DESCENDING. Choose the
+                # physical enum that preserves Arrow's direction-independent
+                # null placement.
+                null_first = self._config.null_position == "first"
+                return (
+                    plc.types.NullOrder.BEFORE
+                    if null_first == bool(ascending)
+                    else plc.types.NullOrder.AFTER
+                )
+
             for key, ascending in zip(self._key_columns, self._ascending):
                 if key in self._float_hidden:
                     category_ascending = self._config.null_position == "last"
@@ -799,11 +933,7 @@ def lazy_load_backend() -> type[Any]:
                         if category_ascending
                         else plc.types.Order.DESCENDING
                     )
-                    category_nulls = (
-                        plc.types.NullOrder.AFTER
-                        if category_ascending
-                        else plc.types.NullOrder.BEFORE
-                    )
+                    category_nulls = null_order(category_ascending)
                     order.extend([category_order, category_order])
                     nulls.extend([category_nulls, category_nulls])
                 value_order = (
@@ -811,13 +941,7 @@ def lazy_load_backend() -> type[Any]:
                     if ascending
                     else plc.types.Order.DESCENDING
                 )
-                # libcudf's BEFORE/AFTER is the requested position relative to
-                # non-null values, independent of the value sort direction.
-                value_nulls = (
-                    plc.types.NullOrder.BEFORE
-                    if self._config.null_position == "first"
-                    else plc.types.NullOrder.AFTER
-                )
+                value_nulls = null_order(ascending)
                 order.append(value_order)
                 nulls.append(value_nulls)
             return order, nulls
@@ -931,6 +1055,266 @@ def lazy_load_backend() -> type[Any]:
                 "planning_h2d_bytes": 0,
             }
 
+        def _streaming_sample_for_arrow(self, arrow: Any, *, block_ordinal: int) -> Any:
+            """Build one bounded, weighted sample without replaying a block."""
+
+            import numpy as np
+            import pyarrow as pa
+
+            rows = int(arrow.num_rows)
+            if rows == 0:
+                return None
+            take = min(rows, int(self._config.streaming_sample_rows_per_block))
+            indices, stratum_widths = _stratified_sample_indices(
+                rows,
+                take,
+                seed=int(self._config.sample_seed),
+                block_ordinal=int(block_ordinal),
+            )
+            sampled = arrow.take(pa.array(indices, type=pa.int64()))
+            weights = _scale_sample_weights_by_stratum(
+                _sampled_arrow_row_weights(sampled), stratum_widths
+            )
+            selected = sampled.select(self._key_columns)
+            selected = (
+                selected.append_column(
+                    self._weight_name, pa.array(weights, type=pa.uint64())
+                )
+                .append_column(
+                    self._sample_block_name,
+                    pa.array(
+                        np.full(take, int(block_ordinal), dtype=np.uint64),
+                        type=pa.uint64(),
+                    ),
+                )
+                .append_column(
+                    self._sample_stratum_name,
+                    pa.array(np.arange(take, dtype=np.uint64), type=pa.uint64()),
+                )
+                .append_column(
+                    self._sample_index_name,
+                    pa.array(indices.astype(np.uint64), type=pa.uint64()),
+                )
+            )
+            sample_schema = pa.schema(
+                [self._arrow_schema.field(name) for name in self._key_columns]
+                + [
+                    pa.field(self._weight_name, pa.uint64(), nullable=False),
+                    pa.field(self._sample_block_name, pa.uint64(), nullable=False),
+                    pa.field(self._sample_stratum_name, pa.uint64(), nullable=False),
+                    pa.field(self._sample_index_name, pa.uint64(), nullable=False),
+                ]
+            )
+            return selected.cast(sample_schema)
+
+        def _commit_source_arrow(self, arrow: Any) -> List[int]:
+            """GPU-sort one Arrow block into transactional full-key source runs."""
+
+            import cupy as cp
+            import cudf
+            from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
+
+            committed: List[int] = []
+            remaining = arrow
+            try:
+                while remaining is not None and int(remaining.num_rows):
+                    target = min(
+                        int(self._config.exchange_batch_bytes),
+                        int(self._payload_limit_bytes),
+                    )
+                    piece, remainder = self._bounded_arrow_prefix(remaining, target)
+                    while True:
+                        frame = None
+                        table = None
+                        sorted_table = None
+                        sort_started = None
+                        try:
+                            arrow_bytes = int(piece.nbytes)
+                            frame = cudf.DataFrame.from_arrow(piece)
+                            self._stats["h2d_bytes"] += arrow_bytes
+                            table = cudf_to_pylibcudf_table(frame)
+                            table, _ = self._augment_table(table, list(frame.columns))
+                            sort_started = time.perf_counter()
+                            sorted_table = self._sort_table(table)
+                            cp.cuda.runtime.deviceSynchronize()
+                            self._stats["phases_s"]["run_sort"] += (
+                                time.perf_counter() - sort_started
+                            )
+                            sort_started = None
+                            run = self._store_table_as_run(sorted_table, initial=True)
+                            run_id = self._next_source_run_id
+                            self._next_source_run_id += 1
+                            self._source_runs[run_id] = run
+                            self._source_run_rows[run_id] = int(piece.num_rows)
+                            committed.append(run_id)
+                            now_ns = time.time_ns()
+                            if self._stats["first_run_committed_at_ns"] is None:
+                                self._stats["first_run_committed_at_ns"] = now_ns
+                                self._stats["first_externalize_s"] = (
+                                    time.perf_counter() - self._started_at
+                                )
+                                self._stats["first_externalize_wave"] = -1
+                            self._stats["last_run_committed_at_ns"] = now_ns
+                            break
+                        except MemoryError as exc:
+                            if sort_started is not None:
+                                self._stats["phases_s"]["run_sort"] += max(
+                                    0.0, time.perf_counter() - sort_started
+                                )
+                            self._stats["run_sort_oom_retry_count"] += 1
+                            frame = table = sorted_table = None
+                            gc.collect()
+                            cp.cuda.runtime.deviceSynchronize()
+                            rows = int(piece.num_rows)
+                            if rows <= 1:
+                                raise GPUSortCapacityError(
+                                    "One GPU sort source row cannot fit in the RMM pool."
+                                ) from exc
+                            take = max(1, rows // 2)
+                            piece = remaining.slice(0, take)
+                            remainder = remaining.slice(take)
+                            continue
+                        finally:
+                            frame = table = sorted_table = None
+                    remaining = remainder
+                return committed
+            except BaseException:
+                for run_id in committed:
+                    run = self._source_runs.pop(run_id, None)
+                    self._source_run_rows.pop(run_id, None)
+                    if run is not None:
+                        self._release_run_chunks(run.chunks)
+                        run.chunks.clear()
+                raise
+
+        def ingest_blocks(
+            self,
+            blocks: Iterable[Any],
+            *,
+            block_ordinals: List[int],
+        ) -> Dict[str, Any]:
+            """Consume, sample, and durably externalize one bounded input RPC."""
+
+            from ray.data._internal.gpu_sort.streaming_sample import (
+                select_priority_sample,
+            )
+
+            if self._ingest_finalized:
+                raise RuntimeError("GPU sort input was already finalized.")
+            block_iterator = iter(blocks)
+            created_ids: List[int] = []
+            samples = []
+            rows = 0
+            input_bytes = 0
+            nonempty_blocks = 0
+            if self._stats["first_ingest_started_at_ns"] is None:
+                self._stats["first_ingest_started_at_ns"] = time.time_ns()
+            started = time.perf_counter()
+            sample_construction_s = 0.0
+            try:
+                for block_ordinal in block_ordinals:
+                    try:
+                        block = next(block_iterator)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "GPU sort ingestion ordinals do not match its blocks."
+                        ) from exc
+                    arrow = self._to_arrow_table(block)
+                    self._set_schema(arrow.schema)
+                    block_rows = int(arrow.num_rows)
+                    rows += block_rows
+                    input_bytes += int(arrow.nbytes)
+                    sample_started = time.perf_counter()
+                    sample = self._streaming_sample_for_arrow(
+                        arrow, block_ordinal=int(block_ordinal)
+                    )
+                    sample_construction_s += time.perf_counter() - sample_started
+                    if sample is not None:
+                        samples.append(sample)
+                        nonempty_blocks += 1
+                    created_ids.extend(self._commit_source_arrow(arrow))
+                exhausted = object()
+                if next(block_iterator, exhausted) is not exhausted:
+                    raise ValueError(
+                        "GPU sort ingestion ordinals do not match its blocks."
+                    )
+
+                if samples:
+                    sample_started = time.perf_counter()
+                    candidate_rows = sum(int(sample.num_rows) for sample in samples)
+                    self._streaming_sample_candidate_rows += candidate_rows
+                    combined = [self._streaming_sample, *samples]
+                    self._streaming_sample = select_priority_sample(
+                        [sample for sample in combined if sample is not None],
+                        capacity=int(self._config.sample_size),
+                        seed=int(self._config.sample_seed),
+                        block_name=self._sample_block_name,
+                        stratum_name=self._sample_stratum_name,
+                        index_name=self._sample_index_name,
+                    )
+                    self._streaming_sampled_blocks += nonempty_blocks
+                    sample_construction_s += time.perf_counter() - sample_started
+                committed_bytes = sum(
+                    chunk.size_bytes
+                    for run_id in created_ids
+                    for chunk in self._source_runs[run_id].chunks
+                )
+                self._stats["input_rows"] += rows
+                self._stats["input_bytes"] += input_bytes
+                self._stats["input_block_count"] += len(block_ordinals)
+                self._stats["ingest_rpc_count"] += 1
+                self._stats["source_run_count"] += len(created_ids)
+                self._stats["source_run_bytes"] += committed_bytes
+                self._stats["source_run_rows"] += rows
+                elapsed = time.perf_counter() - started
+                self._stats["ingest_wall_s"] += elapsed
+                self._stats["streaming_sample_construction_s"] += sample_construction_s
+                self._stats["phases_s"]["sampling"] += sample_construction_s
+                self._update_peak()
+                return {
+                    "rank": self.rank(),
+                    "rows": rows,
+                    "input_bytes": input_bytes,
+                    "input_blocks": len(block_ordinals),
+                    "source_runs": len(created_ids),
+                    "source_run_bytes": committed_bytes,
+                    "first_run_committed_at_ns": self._stats[
+                        "first_run_committed_at_ns"
+                    ],
+                    "last_run_committed_at_ns": self._stats["last_run_committed_at_ns"],
+                }
+            except BaseException:
+                for run_id in created_ids:
+                    run = self._source_runs.pop(run_id, None)
+                    self._source_run_rows.pop(run_id, None)
+                    if run is not None:
+                        self._release_run_chunks(run.chunks)
+                        run.chunks.clear()
+                raise
+
+        def finalize_ingest(self) -> Dict[str, Any]:
+            """Return the bounded reservoir and source-run geometry at EOS."""
+
+            self._ingest_finalized = True
+            return {
+                "rank": self.rank(),
+                "schema": self._arrow_schema,
+                "sample": self._streaming_sample,
+                "sample_candidate_rows": self._streaming_sample_candidate_rows,
+                "sampled_block_count": self._streaming_sampled_blocks,
+                "runs": [
+                    {
+                        "run_id": run_id,
+                        "rows": int(self._source_run_rows[run_id]),
+                        "bytes": sum(
+                            int(chunk.size_bytes)
+                            for chunk in self._source_runs[run_id].chunks
+                        ),
+                    }
+                    for run_id in sorted(self._source_runs)
+                ],
+            }
+
         def compute_boundaries(self, samples: List[Any], schema: Any) -> Dict[str, Any]:
             started = time.perf_counter()
             self._set_schema(schema)
@@ -968,24 +1352,17 @@ def lazy_load_backend() -> type[Any]:
                 boundary_table, list(boundary_frame.columns)
             )
             self._boundary_keys = self._comparison_table(boundary_table, names)
-            self._payload_limit_bytes = max(
-                4 << 20,
-                int(
-                    self._memory_budget_bytes / self._config.final_sort_workspace_factor
-                ),
-            )
-            merge_bound = max(
-                1 << 20,
-                int(
-                    self._memory_budget_bytes
-                    / (
-                        2
-                        * self._config.merge_fan_in
-                        * self._config.merge_workspace_factor
-                    )
-                ),
-            )
-            self._run_chunk_bytes = min(self._config.run_chunk_bytes, merge_bound)
+            self._boundary_group_spans = []
+            group_start = 0
+            for index in range(1, int(boundaries.num_rows) + 1):
+                if index < int(boundaries.num_rows) and boundaries.slice(
+                    group_start, 1
+                ).equals(boundaries.slice(index, 1)):
+                    continue
+                if group_start < index:
+                    self._boundary_group_spans.append((group_start, index))
+                group_start = index
+            self._initialize_run_limits()
             return {
                 "rank": self.rank(),
                 "payload_limit_bytes": self._payload_limit_bytes,
@@ -1088,6 +1465,75 @@ def lazy_load_backend() -> type[Any]:
             packed = split_and_pack(
                 partitioned,
                 normalized[1:-1],
+                DEFAULT_STREAM,
+                self._buffer_resource,
+            )
+            return packed, tuple(destination_bytes)
+
+        def _partition_sorted_and_pack(self, frame: Any, wave_id: int):
+            """Split one sorted source run into contiguous ordered ranges."""
+
+            import cudf
+            import pylibcudf as plc
+            from rapidsmpf.integrations.cudf.partition import split_and_pack
+            from rapidsmpf.utils.cudf import cudf_to_pylibcudf_table
+            from rmm.pylibrmm.stream import DEFAULT_STREAM
+
+            table = cudf_to_pylibcudf_table(frame)
+            names = list(frame.columns)
+            if names != self._work_names:
+                raise TypeError(
+                    "GPU sort restored source runs do not match the work schema."
+                )
+            rows = int(table.num_rows())
+            if rows == 0:
+                return {}, (0,) * self._num_partitions
+            keys = self._comparison_table(table, names)
+            order, nulls = self._order_and_nulls()
+            lower_column = plc.search.lower_bound(
+                keys, self._boundary_keys, order, nulls
+            )
+            upper_column = plc.search.upper_bound(
+                keys, self._boundary_keys, order, nulls
+            )
+            lowers = [
+                int(value)
+                for value in cudf.Series.from_pylibcudf(lower_column)
+                .to_arrow()
+                .to_pylist()
+            ]
+            uppers = [
+                int(value)
+                for value in cudf.Series.from_pylibcudf(upper_column)
+                .to_arrow()
+                .to_pylist()
+            ]
+            cuts = _duplicate_boundary_cuts(
+                lowers,
+                uppers,
+                self._boundary_group_spans,
+                num_partitions=self._num_partitions,
+                rows=rows,
+                phase=(int(wave_id) * 0x9E3779B1)
+                + int(self.rank())
+                + int(self._row_ordinal),
+            )
+            self._row_ordinal += rows
+            offsets = [0, *cuts, rows]
+            destination_bytes = []
+            for start, end in zip(offsets[:-1], offsets[1:]):
+                if start == end:
+                    destination_bytes.append(0)
+                    continue
+                view = self._slice_table(table, start, end)
+                packer = plc.contiguous_split.ChunkedPack.create(
+                    view, 1 << 20, DEFAULT_STREAM
+                )
+                destination_bytes.append(int(packer.get_total_contiguous_size()))
+                del packer, view
+            packed = split_and_pack(
+                table,
+                cuts,
                 DEFAULT_STREAM,
                 self._buffer_resource,
             )
@@ -1231,9 +1677,14 @@ def lazy_load_backend() -> type[Any]:
                     try:
                         frame = cudf.DataFrame.from_arrow(arrow)
                         self._stats["h2d_bytes"] += arrow_bytes
-                        chunks, destination_bytes = self._partition_and_pack(
-                            frame, int(self._prepared_wave_id)
-                        )
+                        if getattr(self, "_pending_inputs_sorted", False):
+                            chunks, destination_bytes = self._partition_sorted_and_pack(
+                                frame, int(self._prepared_wave_id)
+                            )
+                        else:
+                            chunks, destination_bytes = self._partition_and_pack(
+                                frame, int(self._prepared_wave_id)
+                            )
                         physical_bytes = sum(destination_bytes)
                         # The decoded-payload cap does not include fixed pack
                         # metadata. Exact packed bytes instead have to fit the
@@ -1319,7 +1770,14 @@ def lazy_load_backend() -> type[Any]:
                 "pool_max_bytes": self._pool_max_bytes,
             }
 
-        def prepare_wave(self, wave_id: int, blocks: List[Any]) -> Dict[str, Any]:
+        def prepare_wave(
+            self,
+            wave_id: int,
+            blocks: List[Any],
+            *,
+            count_input_blocks: bool = True,
+            inputs_are_sorted: bool = False,
+        ) -> Dict[str, Any]:
             """Begin a wave and prepare its first memory-bounded source group."""
 
             if self._boundary_keys is None:
@@ -1331,6 +1789,7 @@ def lazy_load_backend() -> type[Any]:
             self._externalize_before_next_wave(wave_id)
             self._prepared_wave_id = int(wave_id)
             self._source_input_complete = False
+            self._pending_inputs_sorted = bool(inputs_are_sorted)
             self._next_prepared_batch_id = 0
             self._next_arrow_batch = None
             input_rows = 0
@@ -1339,15 +1798,29 @@ def lazy_load_backend() -> type[Any]:
             try:
                 for block in blocks:
                     arrow = self._to_arrow_table(block)
-                    self._set_schema(arrow.schema)
+                    if inputs_are_sorted:
+                        if self._work_schema is None or not arrow.schema.equals(
+                            self._work_schema, check_metadata=False
+                        ):
+                            raise TypeError(
+                                "GPU sort restored source run schema changed "
+                                "after ingestion."
+                            )
+                    else:
+                        self._set_schema(arrow.schema)
                     self._pending_arrow_owners.append(arrow)
                     input_rows += int(arrow.num_rows)
                     input_bytes += int(arrow.nbytes)
-                self._stats["input_block_count"] += len(blocks)
-                self._pending_arrow_batches = iter(
-                    _coalesce_arrow_inputs(
-                        self._pending_arrow_owners,
-                        self._config.exchange_batch_bytes,
+                if count_input_blocks:
+                    self._stats["input_block_count"] += len(blocks)
+                self._pending_arrow_batches = (
+                    iter(self._pending_arrow_owners)
+                    if self._pending_inputs_sorted
+                    else iter(
+                        _coalesce_arrow_inputs(
+                            self._pending_arrow_owners,
+                            self._config.exchange_batch_bytes,
+                        )
                     )
                 )
                 self._prepare_more()
@@ -1361,7 +1834,50 @@ def lazy_load_backend() -> type[Any]:
                 self._pending_arrow_batches = None
                 self._next_arrow_batch = None
                 self._prepared_wave_id = None
+                self._pending_inputs_sorted = False
                 raise
+
+        def prepare_ingested_runs(
+            self, wave_id: int, run_ids: List[int]
+        ) -> Dict[str, Any]:
+            """Restore actor-local source runs for one redistribution wave."""
+
+            if not self._ingest_finalized:
+                raise RuntimeError("GPU sort ingestion must be finalized first.")
+            if self._active_source_wave_id is not None:
+                raise RuntimeError("GPU sort already has an active source-run wave.")
+            normalized = [int(run_id) for run_id in run_ids]
+            if len(normalized) != len(set(normalized)) or any(
+                run_id not in self._source_runs for run_id in normalized
+            ):
+                raise RuntimeError("GPU sort selected an invalid source run.")
+            chunks = [
+                chunk
+                for run_id in normalized
+                for chunk in self._source_runs[run_id].chunks
+            ]
+            store = self._ensure_run_store()
+            local_restore_started = (
+                time.perf_counter() if store.mode == "local_disk" else None
+            )
+            try:
+                with store.read_many(chunks) as arrows:
+                    manifest = self.prepare_wave(
+                        wave_id,
+                        list(arrows),
+                        count_input_blocks=False,
+                        inputs_are_sorted=True,
+                    )
+            finally:
+                if local_restore_started is not None:
+                    self._stats["local_run_restore_s"] = float(
+                        self._stats.get("local_run_restore_s", 0.0)
+                    ) + (time.perf_counter() - local_restore_started)
+                self._sync_run_store_stats()
+            self._active_source_run_ids = normalized
+            self._active_source_wave_id = int(wave_id)
+            manifest["source_run_ids"] = list(normalized)
+            return manifest
 
         def prepare_more(self, wave_id: int) -> Dict[str, Any]:
             """Prepare the next source group after prior batches were exchanged."""
@@ -1430,7 +1946,10 @@ def lazy_load_backend() -> type[Any]:
                         cp.cuda.runtime.deviceSynchronize()
                         del chunk
                         received_rows += int(table.num_rows())
-                        self._accept_received(partition, table, wave_id)
+                        if getattr(self, "_pending_inputs_sorted", False):
+                            self._accept_sorted_received(partition, table)
+                        else:
+                            self._accept_received(partition, table, wave_id)
                         del table
                 received.clear()
                 cp.cuda.runtime.deviceSynchronize()
@@ -1456,6 +1975,7 @@ def lazy_load_backend() -> type[Any]:
                     )
                 else:
                     self._prepared_wave_id = None
+                    self._pending_inputs_sorted = False
                 self._stats["exchange_subround_count"] += 1
             finally:
                 selected_owners.clear()
@@ -1470,6 +1990,35 @@ def lazy_load_backend() -> type[Any]:
                 "remaining_batches": len(self._prepared_batches),
                 "source_complete": bool(self._source_input_complete),
                 "current_allocated_bytes": int(self._mr.current_allocated),
+            }
+
+        def commit_source_wave(self, wave_id: int) -> Dict[str, Any]:
+            """Release source runs after every rank completed redistribution."""
+
+            if self._active_source_wave_id != int(wave_id):
+                raise RuntimeError("GPU sort source-wave commit does not match.")
+            if self._prepared_wave_id is not None or self._prepared_batches:
+                raise RuntimeError("GPU sort cannot commit an unfinished source wave.")
+            released_bytes = 0
+            released_runs = 0
+            released_rows = 0
+            released_run_ids = list(self._active_source_run_ids)
+            for run_id in self._active_source_run_ids:
+                run = self._source_runs.pop(run_id)
+                released_rows += int(self._source_run_rows.pop(run_id))
+                released_bytes += sum(int(chunk.size_bytes) for chunk in run.chunks)
+                self._release_run_chunks(run.chunks)
+                run.chunks.clear()
+                released_runs += 1
+            self._active_source_run_ids = []
+            self._active_source_wave_id = None
+            return {
+                "rank": self.rank(),
+                "wave": int(wave_id),
+                "released_source_runs": released_runs,
+                "released_source_run_ids": released_run_ids,
+                "released_source_rows": released_rows,
+                "released_source_bytes": released_bytes,
             }
 
         def _accept_received(self, partition: int, table: Any, wave_id: int) -> None:
@@ -1506,6 +2055,22 @@ def lazy_load_backend() -> type[Any]:
                 )
                 if self._device_bytes[partition] >= self._payload_limit_bytes:
                     self._externalize_device_tables(partition, wave_id)
+
+        def _accept_sorted_received(self, partition: int, table: Any) -> None:
+            """Commit an already ordered range segment without sorting it again."""
+
+            rows = int(table.num_rows())
+            if rows == 0:
+                return
+            run = self._store_table_as_run(table, initial=False)
+            self._runs[partition].append(run)
+            run_bytes = sum(int(chunk.size_bytes) for chunk in run.chunks)
+            self._stats["redistributed_run_count"] += 1
+            self._stats["redistributed_run_bytes"] += run_bytes
+            self._stats["redistributed_run_rows"] += rows
+            self._stats["state"] = "EXTERNAL_RUNS"
+            self._stats["mode"] = "external"
+            self._update_peak()
 
         def _externalize_device_tables(self, partition: int, wave_id: int) -> None:
             import cupy as cp
@@ -2447,7 +3012,10 @@ def lazy_load_backend() -> type[Any]:
             self._update_peak()
             store = getattr(self, "_run_store", None)
             if store is not None:
-                store.close()
+                # This generator finishes only after Ray has acknowledged every
+                # final output seal. Do not report successful extraction while
+                # actor-local intermediate files remain on disk.
+                store.close(strict=True)
                 self._sync_run_store_stats()
 
         # -- compact diagnostics and cleanup -----------------------------
@@ -2514,7 +3082,7 @@ def lazy_load_backend() -> type[Any]:
                 "rapidsmpf": rapids_stats,
             }
 
-        def release(self) -> None:
+        def release(self, *, strict: bool = False) -> None:
             self._prepared_batches.clear()
             self._pending_arrow_owners.clear()
             self._pending_arrow_batches = None
@@ -2529,9 +3097,18 @@ def lazy_load_backend() -> type[Any]:
                         store.release(run.chunks)
                     run.chunks.clear()
                 runs.clear()
+            for run in self._source_runs.values():
+                store = getattr(self, "_run_store", None)
+                if store is not None:
+                    store.release(run.chunks)
+                run.chunks.clear()
+            self._source_runs.clear()
+            self._source_run_rows.clear()
+            self._active_source_run_ids = []
+            self._active_source_wave_id = None
             store = getattr(self, "_run_store", None)
             if store is not None:
-                store.close()
+                store.close(strict=strict)
                 self._sync_run_store_stats()
             self._boundary_keys = None
             gc.collect()

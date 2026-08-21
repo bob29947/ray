@@ -1,9 +1,8 @@
-"""Physical Ray Data operator for the spillable distributed GPU sort.
+"""Physical Ray Data operator for the streaming spillable GPU range sort.
 
-The driver deliberately keeps only Plasma references until all input is known.
-GPU ranks first make a bounded sampling pass, then process synchronized shuffle
-waves.  This is the key distinction from the original prototype: an input no
-longer has to fit in aggregate VRAM before range boundaries can be selected.
+GPU ranks turn bounded input into durable actor-local sorted runs while the
+upstream source is still producing blocks.  Only range planning and the final
+redistribution wait for end-of-input.
 """
 
 from __future__ import annotations
@@ -28,7 +27,11 @@ from ray.data._internal.execution.interfaces import (
     PhysicalOperator,
     RefBundle,
 )
-from ray.data._internal.execution.interfaces.physical_operator import DataOpTask, OpTask
+from ray.data._internal.execution.interfaces.physical_operator import (
+    DataOpTask,
+    MetadataOpTask,
+    OpTask,
+)
 from ray.data._internal.execution.operators.hash_shuffle import (
     _get_total_cluster_resources,
 )
@@ -222,13 +225,7 @@ def _assign_blocks_by_locality(
     blocks: Sequence[_InputBlock],
     actor_node_ids: Sequence[str],
     object_locations: Mapping[Any, Mapping[str, Any]],
-) -> Tuple[
-    List[List[_InputBlock]],
-    List[int],
-    List[int],
-    List[int],
-    List[int],
-]:
+) -> Tuple[List[List[_InputBlock]], List[int], List[int], List[int], List[int],]:
     """Assign blocks locally, with deterministic decoded-byte balancing.
 
     An object may have multiple replicas, no reported location (for example an
@@ -318,6 +315,101 @@ def _make_waves(
         [waves[index] if index < len(waves) else [] for waves in rank_waves]
         for index in range(count)
     ]
+
+
+def _ordered_exchange_receipts(
+    receipts: Sequence[Mapping[str, Any]],
+    *,
+    nranks: int,
+    wave_id: int,
+    exchange_id: int,
+) -> List[Dict[str, Any]]:
+    """Validate and order one all-rank exchange acknowledgement."""
+
+    by_rank: List[Optional[Dict[str, Any]]] = [None] * int(nranks)
+    for raw in receipts:
+        item = dict(raw)
+        rank = int(item.get("rank", -1))
+        if (
+            not 0 <= rank < nranks
+            or by_rank[rank] is not None
+            or int(item.get("wave", -1)) != int(wave_id)
+            or int(item.get("exchange", -1)) != int(exchange_id)
+        ):
+            raise RuntimeError("GPU sort exchange receipts are invalid or duplicated.")
+        received_rows = int(item.get("received_rows", -1))
+        if received_rows < 0:
+            raise RuntimeError("GPU sort exchange receipt has an invalid row count.")
+        by_rank[rank] = item
+    if any(item is None for item in by_rank):
+        raise RuntimeError("GPU sort exchange receipts are incomplete.")
+    return [item for item in by_rank if item is not None]
+
+
+def _validate_source_wave_rows(
+    blocks_for_ranks: Sequence[Sequence[_InputBlock]],
+    *,
+    wave_id: int,
+    received_rows: int,
+) -> None:
+    """Prove redistribution conserved a wave before deleting source runs."""
+
+    expected_wave_rows = sum(
+        int(block.num_rows) for blocks in blocks_for_ranks for block in blocks
+    )
+    if int(received_rows) != expected_wave_rows:
+        raise RuntimeError(
+            "GPU sort source wave did not conserve rows before commit: "
+            f"wave={wave_id}, expected={expected_wave_rows}, "
+            f"received={received_rows}."
+        )
+
+
+def _validate_source_wave_commit(
+    receipts: Sequence[Mapping[str, Any]],
+    blocks_for_ranks: Sequence[Sequence[_InputBlock]],
+    *,
+    wave_id: int,
+    received_rows: int,
+) -> None:
+    """Validate exact actor ownership release after a conserved exchange."""
+
+    _validate_source_wave_rows(
+        blocks_for_ranks, wave_id=wave_id, received_rows=received_rows
+    )
+
+    by_rank: List[Optional[Dict[str, Any]]] = [None] * len(blocks_for_ranks)
+    for raw in receipts:
+        item = dict(raw)
+        rank = int(item.get("rank", -1))
+        if (
+            not 0 <= rank < len(by_rank)
+            or by_rank[rank] is not None
+            or int(item.get("wave", -1)) != int(wave_id)
+        ):
+            raise RuntimeError(
+                "GPU sort source-wave commit receipts are invalid or duplicated."
+            )
+        by_rank[rank] = item
+    if any(item is None for item in by_rank):
+        raise RuntimeError("GPU sort source-wave commit receipts are incomplete.")
+
+    for rank, (item, blocks) in enumerate(zip(by_rank, blocks_for_ranks)):
+        assert item is not None
+        expected_ids = [int(block.value) for block in blocks]
+        expected_rows = sum(int(block.num_rows) for block in blocks)
+        expected_bytes = sum(int(block.size_bytes) for block in blocks)
+        actual_ids = [int(value) for value in item.get("released_source_run_ids", ())]
+        if (
+            actual_ids != expected_ids
+            or int(item.get("released_source_runs", -1)) != len(expected_ids)
+            or int(item.get("released_source_rows", -1)) != expected_rows
+            or int(item.get("released_source_bytes", -1)) != expected_bytes
+        ):
+            raise RuntimeError(
+                "GPU sort source-wave commit receipt does not match its owned "
+                f"runs for rank {rank}."
+            )
 
 
 def _plan_exchange_round(
@@ -459,6 +551,12 @@ def _operator_config(data_context: DataContext) -> Dict[str, Any]:
     return GPUSortConfig(
         sample_size=sample_size,
         sample_seed=int(data_context.get_config("gpu_sort_sample_seed", 0)),
+        input_buffer_budget_bytes=int(
+            data_context.get_config("gpu_sort_input_buffer_budget_bytes", 16 << 30)
+        ),
+        streaming_sample_rows_per_block=int(
+            data_context.get_config("gpu_sort_streaming_sample_rows_per_block", 64)
+        ),
         residency_budget_bytes=(
             env_budget if env_budget is not None else context_budget
         ),
@@ -697,7 +795,25 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._minimum_modeled_mpf_headroom_bytes: Optional[int] = None
         self._maximum_exchange_destination_bytes = 0
         self._next_exchange_id = 0
-        self._input_bundles: List[RefBundle] = []
+        self._ingest_tasks: Dict[int, MetadataOpTask] = {}
+        self._next_ingest_task_id = 0
+        self._next_block_ordinal = 0
+        self._buffered_input_bytes = 0
+        self._buffered_input_blocks = 0
+        self._peak_buffered_input_bytes = 0
+        self._peak_buffered_input_blocks = 0
+        self._max_input_block_bytes = 0
+        # Store only hexadecimal IDs for proof counters. Keeping ObjectRef
+        # instances here would pin every released input in Plasma.
+        self._input_ref_ids_received: set[str] = set()
+        self._released_input_ref_ids: set[str] = set()
+        self._released_input_object_refs = 0
+        self._first_input_received_at_ns: Optional[int] = None
+        self._last_input_received_at_ns: Optional[int] = None
+        self._inputs_complete_at_ns: Optional[int] = None
+        self._first_gpu_run_committed_at_ns: Optional[int] = None
+        self._last_gpu_run_committed_at_ns: Optional[int] = None
+        self._ranks_started_at_ns: Optional[int] = None
         self._input_rows = 0
         self._input_bytes = 0
         self._input_schema = None
@@ -732,23 +848,44 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         self._progress = {"GPU Sample": None, "GPU Sort/Merge": None}
 
     def start(self, options: ExecutionOptions) -> None:
-        # Actor creation happens after all Plasma refs are collected, but before
-        # sampling.  It remains inside the measured Dataset.sort boundary.
         if not options.preserve_order:
             raise RuntimeError(
                 "GPU sort requires preserve_order=True so logical block "
                 "ordinals remain reproducible."
             )
         super().start(options)
+        self._run_started_at = time.perf_counter()
+        started = time.perf_counter()
+        self._rank_pool.start()
+        self._controller_phases["startup"] = time.perf_counter() - started
+        self._ranks_started_at_ns = time.time_ns()
+
+    def can_add_input(self) -> bool:
+        """Apply real upstream backpressure at the configured decoded-byte cap."""
+
+        return (
+            self._started
+            and not self._inputs_complete
+            and self._buffered_input_bytes
+            < int(self._config["input_buffer_budget_bytes"])
+        )
 
     def _add_input_inner(self, bundle: RefBundle, input_index: int) -> None:
         if input_index != 0:
             raise ValueError("GPU sort accepts exactly one input dependency.")
-        self._input_bundles.append(bundle)
+        if len(bundle.blocks) != 1:
+            raise ValueError(
+                "Streaming GPU sort requires singleton RefBundles so its input "
+                "budget is bounded by the configured limit plus one input block."
+            )
+        if not self._rank_pool.actors:
+            raise RuntimeError("GPU sort ranks must start before accepting input.")
+        self._metrics.on_input_queued(bundle, input_index=0)
         self._input_stats.extend(to_stats(bundle.metadata))
         if self._input_schema is None and bundle.schema is not None:
             self._input_schema = bundle.schema
 
+        blocks: List[_InputBlock] = []
         for (block_ref, metadata), block_slice in zip(bundle.blocks, bundle.slices):
             if block_slice is None:
                 if metadata.num_rows is None:
@@ -772,84 +909,147 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                     if full_rows
                     else int(metadata.size_bytes or 0)
                 )
-            # Actor placement and communicator rank order are not known until
-            # MPF bootstrap, so assignment is deliberately deferred.
+            block = _InputBlock(
+                value=value,
+                size_bytes=size_bytes,
+                num_rows=rows,
+                ordinal=self._next_block_ordinal,
+            )
+            self._next_block_ordinal += 1
+            blocks.append(block)
+            # Keep only metadata for deterministic sample-plan telemetry. The
+            # ObjectRef itself lives solely in the outstanding actor RPC.
             self._input_blocks.append(
                 _InputBlock(
-                    value=value,
+                    value=None,
                     size_bytes=size_bytes,
                     num_rows=rows,
-                    ordinal=len(self._input_blocks),
+                    ordinal=block.ordinal,
                 )
+            )
+            self._sample_quotas.append(
+                min(rows, int(self._config["streaming_sample_rows_per_block"]))
+                if rows
+                else 0
             )
             self._input_bytes += size_bytes
             self._input_rows += rows
 
-    def _assign_input_blocks(self) -> None:
-        actor_node_ids = [
-            str(info.get("node_id", "")) for info in self._rank_pool.rank_infos
-        ]
-        refs = []
-        seen = set()
-        for block in self._input_blocks:
-            ref = _underlying_object_ref(block)
-            if isinstance(ref, ray.ObjectRef) and ref not in seen:
-                seen.add(ref)
-                refs.append(ref)
-        try:
-            locations = ray.experimental.get_object_locations(refs) if refs else {}
-        except Exception:
-            # The API is experimental and excludes some valid objects.  A
-            # deterministic non-local assignment is always safe.
-            locations = {}
-        (
-            self._blocks_by_rank,
-            self._assigned_bytes,
-            self._assigned_blocks,
-            self._local_bytes,
-            self._local_blocks,
-        ) = _assign_blocks_by_locality(self._input_blocks, actor_node_ids, locations)
-
-    def _prepare_sampling_plan(self) -> None:
-        self._sample_quotas, self._sample_target_rows = (
-            _allocate_stratified_sample_quotas(
-                self._input_blocks, int(self._config["sample_size"])
-            )
+        bundle_bytes = sum(block.size_bytes for block in blocks)
+        bundle_blocks = len(blocks)
+        rank = min(
+            range(len(self._rank_pool.actors)),
+            key=lambda item: (
+                self._assigned_bytes[item],
+                self._assigned_blocks[item],
+                item,
+            ),
         )
-        self._sampled_block_count = sum(1 for quota in self._sample_quotas if quota > 0)
-        self._sample_quota_rows = _sample_quota_summary(self._sample_quotas)
-        self._sample_plan_digest = _sampling_plan_digest(
-            self._input_blocks,
-            self._sample_quotas,
-            seed=int(self._config["sample_seed"]),
-            target_rows=self._sample_target_rows,
+        self._assigned_bytes[rank] += bundle_bytes
+        self._assigned_blocks[rank] += bundle_blocks
+        self._buffered_input_bytes += bundle_bytes
+        self._buffered_input_blocks += bundle_blocks
+        self._peak_buffered_input_bytes = max(
+            self._peak_buffered_input_bytes, self._buffered_input_bytes
+        )
+        self._peak_buffered_input_blocks = max(
+            self._peak_buffered_input_blocks, self._buffered_input_blocks
+        )
+        self._max_input_block_bytes = max(
+            self._max_input_block_bytes,
+            max((block.size_bytes for block in blocks), default=0),
+        )
+        received_at_ns = time.time_ns()
+        if self._first_input_received_at_ns is None:
+            self._first_input_received_at_ns = received_at_ns
+        self._last_input_received_at_ns = received_at_ns
+        self._input_ref_ids_received.update(ref.hex() for ref in bundle.block_refs)
+
+        task_index = self._next_ingest_task_id
+        self._next_ingest_task_id += 1
+        expected_rows = sum(block.num_rows for block in blocks)
+        input_ref_ids = [ref.hex() for ref in bundle.block_refs]
+        # The task callback can outlive this stack frame. Keep its one bundle
+        # in a mutable holder so completion can explicitly sever the closure's
+        # ObjectRef ownership before the executor enters synchronous EOS work.
+        bundle_holder = [bundle]
+        result_ref = self._rank_pool.actors[rank].ingest_blocks.remote(
+            [block.value for block in blocks],
+            [block.ordinal for block in blocks],
         )
 
-    def _sample(self) -> Tuple[Any, Any]:
-        seed = self._config["sample_seed"]
-        quotas_by_ordinal = {
-            block.ordinal: quota
-            for block, quota in zip(self._input_blocks, self._sample_quotas)
-        }
+        def _on_ingest_done() -> None:
+            owned_bundle = bundle_holder[0]
+            try:
+                receipt = dict(ray.get(result_ref))
+                if int(receipt.get("rank", -1)) != rank:
+                    raise RuntimeError("GPU sort ingest receipt has the wrong rank.")
+                if int(receipt.get("rows", -1)) != expected_rows:
+                    raise RuntimeError(
+                        "GPU sort ingest receipt has the wrong row count."
+                    )
+                if int(receipt.get("input_blocks", -1)) != bundle_blocks:
+                    raise RuntimeError(
+                        "GPU sort ingest receipt has the wrong block count."
+                    )
+                committed_at = receipt.get("first_run_committed_at_ns")
+                if committed_at is not None:
+                    committed_at = int(committed_at)
+                    self._first_gpu_run_committed_at_ns = (
+                        committed_at
+                        if self._first_gpu_run_committed_at_ns is None
+                        else min(self._first_gpu_run_committed_at_ns, committed_at)
+                    )
+                last_committed = receipt.get("last_run_committed_at_ns")
+                if last_committed is not None:
+                    self._last_gpu_run_committed_at_ns = max(
+                        self._last_gpu_run_committed_at_ns or 0,
+                        int(last_committed),
+                    )
+                for ref_id in input_ref_ids:
+                    if ref_id not in self._released_input_ref_ids:
+                        self._released_input_ref_ids.add(ref_id)
+                        self._released_input_object_refs += 1
+            finally:
+                self._buffered_input_bytes -= bundle_bytes
+                self._buffered_input_blocks -= bundle_blocks
+                self._metrics.on_input_dequeued(owned_bundle, input_index=0)
+                owned_bundle.destroy_if_owned()
+                bundle_holder.clear()
+                self._ingest_tasks.pop(task_index, None)
+
+        self._ingest_tasks[task_index] = MetadataOpTask(
+            task_index=task_index,
+            object_ref=result_ref,
+            task_done_callback=_on_ingest_done,
+        )
+
+    def all_inputs_done(self) -> None:
+        self._inputs_complete_at_ns = time.time_ns()
+        super().all_inputs_done()
+
+    def _finalize_streaming_sample(self) -> Tuple[Any, Any]:
+        """Merge rank reservoirs and freeze range boundaries after EOS."""
+
+        from ray.data._internal.gpu_sort.streaming_sample import (
+            finalize_priority_sample,
+        )
+
         construction_started = time.perf_counter()
-        refs = [
-            actor.sample_blocks.remote(
-                [block.value for block in blocks],
-                [block.ordinal for block in blocks],
-                [quotas_by_ordinal[block.ordinal] for block in blocks],
-                seed,
-            )
-            for actor, blocks in zip(self._rank_pool.actors, self._blocks_by_rank)
-        ]
-        manifests = ray.get(refs, timeout=self._config["setup_timeout_s"])
-        self._sampling_subphases["cpu_sample_construction"] = (
-            time.perf_counter() - construction_started
+        manifests = ray.get(
+            [actor.finalize_ingest.remote() for actor in self._rank_pool.actors],
+            timeout=self._config["setup_timeout_s"],
         )
-        self._sample_manifests = [dict(item) for item in manifests]
+        manifests_by_rank = {int(item["rank"]): dict(item) for item in manifests}
+        if len(manifests_by_rank) != len(self._rank_pool.actors):
+            raise RuntimeError("GPU sort ingest manifests are incomplete.")
+        self._sample_manifests = [
+            manifests_by_rank[rank] for rank in range(len(self._rank_pool.actors))
+        ]
         schema = self._input_schema or next(
             (
                 item.get("schema")
-                for item in manifests
+                for item in self._sample_manifests
                 if item.get("schema") is not None
             ),
             None,
@@ -858,11 +1058,73 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             raise ValueError("GPU sort could not determine the input Arrow schema.")
         _validate_gpu_schema(schema, self._key_columns)
         self._sort_key.validate_schema(getattr(schema, "base_schema", schema))
-        samples = [
+        candidate_rows = sum(
+            int(item.get("sample_candidate_rows", 0) or 0)
+            for item in self._sample_manifests
+        )
+        self._sample_target_rows = min(int(self._config["sample_size"]), candidate_rows)
+        rank_samples = [
             item["sample"]
-            for item in manifests
+            for item in self._sample_manifests
             if item.get("sample") is not None and item["sample"].num_rows
         ]
+        if rank_samples:
+            first_sample = rank_samples[0]
+            coordinate_names = first_sample.column_names[-4:]
+            weight_name, block_name, stratum_name, index_name = coordinate_names
+            sample = finalize_priority_sample(
+                rank_samples,
+                candidate_rows=candidate_rows,
+                capacity=int(self._config["sample_size"]),
+                seed=int(self._config["sample_seed"]),
+                weight_name=weight_name,
+                block_name=block_name,
+                stratum_name=stratum_name,
+                index_name=index_name,
+            )
+            samples = [sample]
+        else:
+            samples = []
+
+        self._sampled_block_count = sum(
+            int(item.get("sampled_block_count", 0) or 0)
+            for item in self._sample_manifests
+        )
+        self._sample_quota_rows = _sample_quota_summary(self._sample_quotas)
+        sample_plan = {
+            "scheme": "deterministic_streaming_priority_stratified",
+            "version": 1,
+            "seed": int(self._config["sample_seed"]),
+            "capacity": int(self._config["sample_size"]),
+            "candidate_rows": candidate_rows,
+            "blocks": [
+                [int(block.ordinal), int(block.num_rows), int(quota)]
+                for block, quota in zip(self._input_blocks, self._sample_quotas)
+            ],
+        }
+        self._sample_plan_digest = hashlib.sha256(
+            json.dumps(sample_plan, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+        self._blocks_by_rank = []
+        run_ordinal = 0
+        for rank, item in enumerate(self._sample_manifests):
+            rank_runs = []
+            for run in item.get("runs", ()):
+                rank_runs.append(
+                    _InputBlock(
+                        value=int(run["run_id"]),
+                        size_bytes=int(run["bytes"]),
+                        num_rows=int(run["rows"]),
+                        ordinal=run_ordinal,
+                    )
+                )
+                run_ordinal += 1
+            self._blocks_by_rank.append(rank_runs)
+
+        self._sampling_subphases["cpu_sample_construction"] = (
+            time.perf_counter() - construction_started
+        )
         result = ray.get(
             self._rank_pool.actors[0].compute_boundaries.remote(samples, schema),
             timeout=self._config["setup_timeout_s"],
@@ -898,27 +1160,32 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         return waves
 
     def _try_finalize(self) -> None:
-        if self._finalization_started or not self._inputs_complete:
+        if (
+            self._finalization_started
+            or not self._inputs_complete
+            or self._ingest_tasks
+        ):
             return
         self._finalization_started = True
-        self._run_started_at = time.perf_counter()
         if not self._input_blocks:
+            try:
+                diagnostics = ray.get(
+                    [
+                        actor.release.remote(strict=True)
+                        for actor in self._rank_pool.actors
+                    ]
+                )
+            except Exception:
+                self._rank_pool.shutdown()
+                raise
             self._finalization_succeeded = True
-            self._publish_diagnostics([])
+            self._publish_diagnostics(diagnostics)
+            self._rank_pool.shutdown_async()
             return
 
         try:
             started = time.perf_counter()
-            self._rank_pool.start()
-            self._controller_phases["startup"] = time.perf_counter() - started
-
-            started = time.perf_counter()
-            self._prepare_sampling_plan()
-            self._assign_input_blocks()
-            self._controller_phases["input_assignment"] = time.perf_counter() - started
-
-            started = time.perf_counter()
-            schema, boundaries = self._sample()
+            schema, boundaries = self._finalize_streaming_sample()
             self._controller_phases["sampling"] = time.perf_counter() - started
             self._sampling_subphases["orchestration_remainder"] = max(
                 0.0,
@@ -936,10 +1203,19 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 timeout=self._config["setup_timeout_s"],
             )
             waves = self._plan_waves()
+            source_run_geometry = [
+                {int(block.value): block for block in blocks}
+                for blocks in self._blocks_by_rank
+            ]
             for wave_id, blocks_for_ranks in enumerate(waves):
+                wave_geometry = [
+                    [source_run_geometry[rank][int(run_id)] for run_id in run_ids]
+                    for rank, run_ids in enumerate(blocks_for_ranks)
+                ]
+                received_rows_for_wave = 0
                 prepared = ray.get(
                     [
-                        actor.prepare_wave.remote(wave_id, blocks)
+                        actor.prepare_ingested_runs.remote(wave_id, blocks)
                         for actor, blocks in zip(
                             self._rank_pool.actors, blocks_for_ranks
                         )
@@ -987,13 +1263,23 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                             raise GPUSortCapacityError(
                                 "GPU sort could not prepare one bounded source batch."
                             )
-                        ray.get(
+                        exchange_id = self._next_exchange_id
+                        receipts = ray.get(
                             [
                                 actor.exchange_prepared_round.remote(
-                                    wave_id, self._next_exchange_id, [], True
+                                    wave_id, exchange_id, [], True
                                 )
                                 for actor in self._rank_pool.actors
                             ]
+                        )
+                        ordered_receipts = _ordered_exchange_receipts(
+                            receipts,
+                            nranks=len(self._rank_pool.actors),
+                            wave_id=wave_id,
+                            exchange_id=exchange_id,
+                        )
+                        received_rows_for_wave += sum(
+                            int(item["received_rows"]) for item in ordered_receipts
                         )
                         self._next_exchange_id += 1
                         rounds_for_wave += 1
@@ -1015,11 +1301,12 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                             for rank, items in enumerate(pending)
                         ]
                         final_subround = not any(remaining) and all(source_complete)
+                        exchange_id = self._next_exchange_id
                         receipts = ray.get(
                             [
                                 actor.exchange_prepared_round.remote(
                                     wave_id,
-                                    self._next_exchange_id,
+                                    exchange_id,
                                     list(plan.batch_ids_by_rank[rank]),
                                     final_subround,
                                 )
@@ -1028,17 +1315,18 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                         )
                         self._next_exchange_id += 1
                         rounds_for_wave += 1
-                        receipts_by_rank = {
-                            int(item["rank"]): dict(item) for item in receipts
-                        }
-                        if len(receipts_by_rank) != len(self._rank_pool.actors):
-                            raise RuntimeError(
-                                "GPU sort exchange receipts are incomplete or "
-                                "duplicated."
-                            )
+                        ordered_receipts = _ordered_exchange_receipts(
+                            receipts,
+                            nranks=len(self._rank_pool.actors),
+                            wave_id=wave_id,
+                            exchange_id=exchange_id,
+                        )
+                        received_rows_for_wave += sum(
+                            int(item["received_rows"]) for item in ordered_receipts
+                        )
                         allocated = [
-                            int(receipts_by_rank[rank]["current_allocated_bytes"])
-                            for rank in range(len(self._rank_pool.actors))
+                            int(item["current_allocated_bytes"])
+                            for item in ordered_receipts
                         ]
                         pending = remaining
                         self._minimum_modeled_mpf_headroom_bytes = min(
@@ -1061,6 +1349,23 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                             for actor in self._rank_pool.actors
                         ]
                     )
+                _validate_source_wave_rows(
+                    wave_geometry,
+                    wave_id=wave_id,
+                    received_rows=received_rows_for_wave,
+                )
+                commit_receipts = ray.get(
+                    [
+                        actor.commit_source_wave.remote(wave_id)
+                        for actor in self._rank_pool.actors
+                    ]
+                )
+                _validate_source_wave_commit(
+                    commit_receipts,
+                    wave_geometry,
+                    wave_id=wave_id,
+                    received_rows=received_rows_for_wave,
+                )
                 self._exchange_subround_count += rounds_for_wave
                 self._exchange_rounds_per_wave.append(rounds_for_wave)
             self._controller_phases["partition_and_exchange"] = (
@@ -1179,6 +1484,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "output_bytes",
                 "externalized_bytes",
                 "externalized_rows",
+                "ingest_rpc_count",
+                "source_run_count",
+                "source_run_bytes",
+                "source_run_rows",
                 "initial_run_count",
                 "merge_pass_count",
                 "replacement_run_count",
@@ -1209,6 +1518,7 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "local_run_physical_read_bytes",
                 "local_run_write_calls",
                 "local_run_read_calls",
+                "local_run_sync_calls",
                 "local_run_restore_s",
                 "local_run_live_bytes",
                 "local_run_peak_bytes",
@@ -1218,6 +1528,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
                 "local_run_read_errors",
                 "local_run_cleanup_errors",
                 "local_run_cleanup_pending_files",
+                "local_run_cleanup_pending_bytes",
+                "local_run_cleanup_calls",
+                "local_run_cleanup_files",
+                "local_run_cleanup_bytes",
                 "mpf_host_spill_bytes",
                 "ray_disk_spill_bytes",
                 "cpu_sort_rows",
@@ -1272,8 +1586,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         LAST_RUN_STATS = {
             "mode": "external" if externalized_bytes else "resident",
             "run_store": self._config["external_run_store"],
-            "sampling_mode": "cpu_sampled_arrow",
-            "sampling_scheme": "deterministic_stratified_random",
+            "streaming_input": True,
+            "sampling_mode": "one_pass_rank_reservoir",
+            "sampling_scheme": "deterministic_streaming_priority_stratified",
             "sampling_scheme_version": 1,
             "sample_seed": int(self._config["sample_seed"]),
             "sample_target_rows": self._sample_target_rows,
@@ -1293,6 +1608,28 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             ),
             "input_rows": self._input_rows,
             "input_bytes": self._input_bytes,
+            "input_buffer_budget_bytes": int(self._config["input_buffer_budget_bytes"]),
+            "peak_buffered_input_bytes": self._peak_buffered_input_bytes,
+            "peak_buffered_input_blocks": self._peak_buffered_input_blocks,
+            "max_input_block_bytes": self._max_input_block_bytes,
+            "input_buffer_within_bound": self._peak_buffered_input_bytes
+            <= int(self._config["input_buffer_budget_bytes"])
+            + self._max_input_block_bytes,
+            "input_object_refs_received": len(self._input_ref_ids_received),
+            "released_input_object_refs": self._released_input_object_refs,
+            "all_input_object_refs_released": self._released_input_object_refs
+            == len(self._input_ref_ids_received),
+            "ranks_started_at_ns": self._ranks_started_at_ns,
+            "first_input_received_at_ns": self._first_input_received_at_ns,
+            "last_input_received_at_ns": self._last_input_received_at_ns,
+            "inputs_complete_at_ns": self._inputs_complete_at_ns,
+            "first_gpu_run_committed_at_ns": (self._first_gpu_run_committed_at_ns),
+            "last_gpu_run_committed_at_ns": self._last_gpu_run_committed_at_ns,
+            "gpu_processing_began_before_eos": (
+                self._first_gpu_run_committed_at_ns is not None
+                and self._inputs_complete_at_ns is not None
+                and self._first_gpu_run_committed_at_ns < self._inputs_complete_at_ns
+            ),
             "auto_wave_fraction": float(self._config["auto_wave_fraction"]),
             "wave_target_bytes": self._wave_target_bytes,
             "wave_count": self._wave_count,
@@ -1325,6 +1662,14 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "first_externalize_s": min(first_times) if first_times else None,
             "first_externalize_wave": min(first_waves) if first_waves else None,
             "initial_run_count": total("initial_run_count"),
+            "source_run_count": total("source_run_count"),
+            "source_run_bytes": total("source_run_bytes"),
+            "source_run_rows": total("source_run_rows"),
+            "ingest_rpc_count": total("ingest_rpc_count"),
+            "ingest_wall_s_rank_sum": total_float("ingest_wall_s"),
+            "streaming_sample_construction_s_rank_sum": total_float(
+                "streaming_sample_construction_s"
+            ),
             "merge_pass_count": max(
                 (int(item["merge_pass_count"]) for item in ranks), default=0
             ),
@@ -1354,6 +1699,8 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "local_run_read_calls": total("local_run_read_calls"),
             "local_run_write_s": total_float("local_run_write_s"),
             "local_run_read_s": total_float("local_run_read_s"),
+            "local_run_sync_s": total_float("local_run_sync_s"),
+            "local_run_sync_calls": total("local_run_sync_calls"),
             "local_run_restore_s": total_float("local_run_restore_s"),
             "local_run_live_bytes": total("local_run_live_bytes"),
             "local_run_peak_bytes": total("local_run_peak_bytes"),
@@ -1363,6 +1710,10 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
             "local_run_read_errors": total("local_run_read_errors"),
             "local_run_cleanup_errors": total("local_run_cleanup_errors"),
             "local_run_cleanup_pending_files": total("local_run_cleanup_pending_files"),
+            "local_run_cleanup_pending_bytes": total("local_run_cleanup_pending_bytes"),
+            "local_run_cleanup_calls": total("local_run_cleanup_calls"),
+            "local_run_cleanup_files": total("local_run_cleanup_files"),
+            "local_run_cleanup_bytes": total("local_run_cleanup_bytes"),
             "mpf_host_spill_bytes": total("mpf_host_spill_bytes"),
             "ray_disk_spill_bytes": total("ray_disk_spill_bytes"),
             "cpu_sort_rows": total("cpu_sort_rows"),
@@ -1385,18 +1736,23 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
 
     def get_active_tasks(self) -> List[OpTask]:
         self._try_finalize()
-        return list(self._extraction_tasks.values())
+        return list(self._ingest_tasks.values()) + list(self._extraction_tasks.values())
 
     def has_completed(self) -> bool:
         return (
             self._finalization_started
+            and not self._ingest_tasks
             and not self._extraction_tasks
             and super().has_completed()
         )
 
     def _do_shutdown(self, force: bool = False) -> None:
+        # ``PhysicalOperator._do_shutdown`` asks for active tasks while
+        # cancelling them. Prevent that error path from re-entering EOS
+        # finalization after this method has already torn down the rank pool.
+        self._finalization_started = True
         self._rank_pool.shutdown()
-        self._input_bundles.clear()
+        self._ingest_tasks.clear()
         self._extraction_tasks.clear()
         super()._do_shutdown(force)
 
@@ -1410,7 +1766,9 @@ class GPUSortOperator(PhysicalOperator, SubProgressBarMixin):
         return ExecutionResources(gpu=self._rank_pool.nranks)
 
     def incremental_resource_usage(self) -> ExecutionResources:
-        return ExecutionResources(gpu=1)
+        # Ingest RPCs run on the already-reserved one-GPU rank actors; they do
+        # not require an additional schedulable GPU per input bundle.
+        return ExecutionResources()
 
     def get_sub_progress_bar_names(self) -> List[str]:
         return list(self._progress)

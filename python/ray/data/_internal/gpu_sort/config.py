@@ -70,6 +70,15 @@ class GPUSortConfig:
 
     sample_size: int = 1 << 16
     sample_seed: int = 0
+    # Maximum decoded input bytes whose actor calls may be outstanding on the
+    # driver. ``PhysicalOperator.can_add_input`` applies backpressure at this
+    # watermark; one already-produced upstream block may take the live total
+    # above it.
+    input_buffer_budget_bytes: int = 16 << 30
+    # Each logical block contributes a small deterministic stratified sample.
+    # A bounded global priority reservoir reduces these candidates to
+    # ``sample_size`` after end-of-input without replaying the source.
+    streaming_sample_rows_per_block: int = 64
     # Preallocate the bounded pool as one arena. Growing from a smaller pool
     # can leave enough total bytes but no contiguous segment for run sorting.
     rmm_initial_fraction: float = 0.85
@@ -119,6 +128,12 @@ class GPUSortConfig:
         )
         if self.sample_size < 1:
             raise ValueError("GPU sort sample_size must be positive.")
+        if self.input_buffer_budget_bytes < 1:
+            raise ValueError("GPU sort input buffer budget must be positive.")
+        if self.streaming_sample_rows_per_block < 1:
+            raise ValueError(
+                "GPU sort streaming sample rows per block must be positive."
+            )
         if (
             not isinstance(self.sample_seed, int)
             or isinstance(self.sample_seed, bool)
