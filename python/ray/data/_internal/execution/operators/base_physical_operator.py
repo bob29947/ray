@@ -1,6 +1,8 @@
 import abc
+import threading
+import time
 import typing
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ray.data._internal.execution.bundle_queue import FIFOBundleQueue
 from ray.data._internal.execution.interfaces import (
@@ -16,6 +18,38 @@ from ray.data.context import DataContext
 
 if typing.TYPE_CHECKING:
     from ray.data._internal.progress.base_progress import BaseProgressBar
+
+
+_ALL_TO_ALL_TELEMETRY_TASK_CONTEXT_KEY = "_all_to_all_execution_telemetry"
+_last_all_to_all_stats: Optional[Dict[str, Any]] = None
+_last_all_to_all_stats_lock = threading.Lock()
+
+
+def reset_last_all_to_all_stats() -> None:
+    """Clear the most recently completed all-to-all execution telemetry."""
+    global _last_all_to_all_stats
+    with _last_all_to_all_stats_lock:
+        _last_all_to_all_stats = None
+
+
+def get_last_all_to_all_stats() -> Optional[Dict[str, Any]]:
+    """Return telemetry for the active or most recently finished all-to-all.
+
+    This is intentionally driver-local. It is primarily useful for benchmarks that
+    need to prove when a blocking all-to-all retained input and began its bulk work.
+    Publishing bounded snapshots while input is collected also preserves capacity
+    evidence if the driver is killed before the blocking bulk function returns.
+    """
+    with _last_all_to_all_stats_lock:
+        if _last_all_to_all_stats is None:
+            return None
+        return dict(_last_all_to_all_stats)
+
+
+def _publish_last_all_to_all_stats(stats: Dict[str, Any]) -> None:
+    global _last_all_to_all_stats
+    with _last_all_to_all_stats_lock:
+        _last_all_to_all_stats = dict(stats)
 
 
 class InternalQueueOperatorMixin(PhysicalOperator, abc.ABC):
@@ -135,6 +169,41 @@ class AllToAllOperator(
         self._input_buffer: FIFOBundleQueue = FIFOBundleQueue()
         self._output_buffer: FIFOBundleQueue = FIFOBundleQueue()
         self._stats: StatsDict = {}
+        self._execution_telemetry: Dict[str, Any] = {
+            "operator_name": name,
+            "first_input_received_at_ns": None,
+            "last_input_received_at_ns": None,
+            "input_bundles": 0,
+            "input_blocks": 0,
+            "input_metadata_bytes": 0,
+            "current_retained_blocks": 0,
+            "current_retained_bytes": 0,
+            "peak_retained_blocks": 0,
+            "peak_retained_bytes": 0,
+            "retained_blocks_at_eos": None,
+            "retained_bytes_at_eos": None,
+            "eos_received_at_ns": None,
+            "bulk_started_at_ns": None,
+            "bulk_completed_at_ns": None,
+            "bulk_failed_at_ns": None,
+            "bulk_failure_type": None,
+            "bulk_failure_message": None,
+            "all_to_all_completed_at_ns": None,
+            "all_to_all_failed_at_ns": None,
+            "status": "collecting_inputs",
+            # These fields are populated by the push-based shuffle scheduler when
+            # this all-to-all uses it. They stay null/zero for other bulk functions.
+            "push_shuffle_started_at_ns": None,
+            "first_push_map_task_submitted_at_ns": None,
+            "last_push_map_task_submitted_at_ns": None,
+            "first_push_map_task_index": None,
+            "push_map_tasks_submitted": 0,
+            "push_shuffle_completed_at_ns": None,
+            "push_shuffle_failed_at_ns": None,
+            "push_shuffle_failure_type": None,
+            "push_shuffle_failure_message": None,
+            "first_push_map_task_preceded_eos": None,
+        }
         super().__init__(name, [input_op], data_context, target_max_block_size_override)
 
     def num_outputs_total(self) -> Optional[int]:
@@ -154,26 +223,50 @@ class AllToAllOperator(
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         assert not self.has_completed()
         assert input_index == 0, input_index
+        received_at_ns = time.time_ns()
         self._input_buffer.add(refs)
         self._metrics.on_input_queued(refs, input_index=0)
 
+        telemetry = self._execution_telemetry
+        if telemetry["first_input_received_at_ns"] is None:
+            telemetry["first_input_received_at_ns"] = received_at_ns
+        telemetry["last_input_received_at_ns"] = received_at_ns
+        telemetry["input_bundles"] += 1
+        telemetry["input_blocks"] += len(refs.blocks)
+        telemetry["input_metadata_bytes"] += sum(
+            metadata.size_bytes for _, metadata in refs.blocks
+        )
+        retained_blocks = self._input_buffer.num_blocks()
+        retained_bytes = self._input_buffer.estimate_size_bytes()
+        telemetry["current_retained_blocks"] = retained_blocks
+        telemetry["current_retained_bytes"] = retained_bytes
+        telemetry["peak_retained_blocks"] = max(
+            telemetry["peak_retained_blocks"], retained_blocks
+        )
+        telemetry["peak_retained_bytes"] = max(
+            telemetry["peak_retained_bytes"], retained_bytes
+        )
+        _publish_last_all_to_all_stats(telemetry)
+
     def internal_input_queue_num_blocks(self) -> int:
-        return sum(len(bundle.block_refs) for bundle in self._input_buffer)
+        return self._input_buffer.num_blocks()
 
     def internal_input_queue_num_bytes(self) -> int:
-        return sum(bundle.size_bytes() for bundle in self._input_buffer)
+        return self._input_buffer.estimate_size_bytes()
 
     def internal_output_queue_num_blocks(self) -> int:
-        return sum(len(bundle.block_refs) for bundle in self._output_buffer)
+        return self._output_buffer.num_blocks()
 
     def internal_output_queue_num_bytes(self) -> int:
-        return sum(bundle.size_bytes() for bundle in self._output_buffer)
+        return self._output_buffer.estimate_size_bytes()
 
     def clear_internal_input_queue(self) -> None:
         """Clear internal input queue."""
         while self._input_buffer.has_next():
             bundle = self._input_buffer.get_next()
             self._metrics.on_input_dequeued(bundle, input_index=0)
+        self._execution_telemetry["current_retained_blocks"] = 0
+        self._execution_telemetry["current_retained_bytes"] = 0
 
     def clear_internal_output_queue(self) -> None:
         """Clear internal output queue."""
@@ -182,27 +275,56 @@ class AllToAllOperator(
             self._metrics.on_output_dequeued(bundle)
 
     def all_inputs_done(self) -> None:
+        eos_received_at_ns = time.time_ns()
+        telemetry = self._execution_telemetry
+        telemetry["eos_received_at_ns"] = eos_received_at_ns
+        telemetry["retained_blocks_at_eos"] = self._input_buffer.num_blocks()
+        telemetry["retained_bytes_at_eos"] = self._input_buffer.estimate_size_bytes()
+        telemetry["status"] = "running_bulk"
         ctx = TaskContext(
             task_idx=self._next_task_index,
             op_name=self.name,
             sub_progress_bar_dict=self._sub_progress_bar_dict,
             target_max_block_size_override=self.target_max_block_size_override,
         )
-        # NOTE: We don't account object store memory use from intermediate `bulk_fn`
-        # outputs (e.g., map outputs for map-reduce).
-        output_buffer, self._stats = self._bulk_fn(self._input_buffer.to_list(), ctx)
-        self._output_buffer = FIFOBundleQueue(output_buffer)
+        ctx.kwargs[_ALL_TO_ALL_TELEMETRY_TASK_CONTEXT_KEY] = telemetry
+        telemetry["bulk_started_at_ns"] = time.time_ns()
+        _publish_last_all_to_all_stats(telemetry)
+        try:
+            # NOTE: We don't account object store memory use from intermediate
+            # `bulk_fn` outputs (e.g., map outputs for map-reduce).
+            output_buffer, self._stats = self._bulk_fn(
+                self._input_buffer.to_list(), ctx
+            )
+            telemetry["bulk_completed_at_ns"] = time.time_ns()
+            self._output_buffer = FIFOBundleQueue(output_buffer)
 
-        while self._input_buffer.has_next():
-            refs = self._input_buffer.get_next()
-            self._metrics.on_input_dequeued(refs, input_index=0)
+            while self._input_buffer.has_next():
+                refs = self._input_buffer.get_next()
+                self._metrics.on_input_dequeued(refs, input_index=0)
+            telemetry["current_retained_blocks"] = 0
+            telemetry["current_retained_bytes"] = 0
 
-        for ref in self._output_buffer:
-            self._metrics.on_output_queued(ref)
+            for ref in self._output_buffer:
+                self._metrics.on_output_queued(ref)
 
-        self._next_task_index += 1
+            self._next_task_index += 1
 
-        super().all_inputs_done()
+            super().all_inputs_done()
+            telemetry["all_to_all_completed_at_ns"] = time.time_ns()
+            telemetry["status"] = "succeeded"
+        except BaseException as exc:
+            failed_at_ns = time.time_ns()
+            if telemetry["bulk_completed_at_ns"] is None:
+                telemetry["bulk_failed_at_ns"] = failed_at_ns
+            telemetry["all_to_all_failed_at_ns"] = failed_at_ns
+            telemetry["bulk_failure_type"] = type(exc).__name__
+            telemetry["bulk_failure_message"] = str(exc)
+            telemetry["status"] = "failed"
+            raise
+        finally:
+            ctx.kwargs.pop(_ALL_TO_ALL_TELEMETRY_TASK_CONTEXT_KEY, None)
+            _publish_last_all_to_all_stats(telemetry)
 
     def has_next(self) -> bool:
         return len(self._output_buffer) > 0

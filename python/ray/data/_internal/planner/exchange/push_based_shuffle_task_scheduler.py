@@ -1,6 +1,18 @@
 import logging
 import math
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypeVar, Union
+import threading
+import time
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import ray
 from ray._private.ray_constants import CALLER_MEMORY_USAGE_PER_OBJECT_REF
@@ -37,6 +49,31 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 U = TypeVar("U")
+
+_ALL_TO_ALL_TELEMETRY_TASK_CONTEXT_KEY = "_all_to_all_execution_telemetry"
+_last_push_based_shuffle_stats: Optional[Dict[str, Any]] = None
+_last_push_based_shuffle_stats_lock = threading.Lock()
+
+
+def reset_last_push_based_shuffle_stats() -> None:
+    """Clear telemetry for the most recently completed push-based shuffle."""
+    global _last_push_based_shuffle_stats
+    with _last_push_based_shuffle_stats_lock:
+        _last_push_based_shuffle_stats = None
+
+
+def get_last_push_based_shuffle_stats() -> Optional[Dict[str, Any]]:
+    """Return JSON-serializable driver-side push-shuffle telemetry."""
+    with _last_push_based_shuffle_stats_lock:
+        if _last_push_based_shuffle_stats is None:
+            return None
+        return dict(_last_push_based_shuffle_stats)
+
+
+def _publish_last_push_based_shuffle_stats(stats: Dict[str, Any]) -> None:
+    global _last_push_based_shuffle_stats
+    with _last_push_based_shuffle_stats_lock:
+        _last_push_based_shuffle_stats = dict(stats)
 
 
 class _MergeTaskSchedule:
@@ -242,10 +279,17 @@ class _PipelinedStageExecutor:
 
 
 class _MapStageIterator:
-    def __init__(self, input_blocks_list, shuffle_map, map_args):
+    def __init__(
+        self,
+        input_blocks_list,
+        shuffle_map,
+        map_args,
+        on_map_task_submitted: Optional[Callable[[int, int], None]] = None,
+    ):
         self._input_blocks_list = input_blocks_list
         self._shuffle_map = shuffle_map
         self._map_args = map_args
+        self._on_map_task_submitted = on_map_task_submitted
 
         self._mapper_idx = 0
         self._map_results = []
@@ -263,11 +307,14 @@ class _MapStageIterator:
         # Therefore, we do not specify a node affinity policy for map tasks
         # in case the caller or Ray has a better scheduling strategy, e.g.,
         # based on data locality.
+        submitted_at_ns = time.time_ns()
         map_result = self._shuffle_map.remote(
             self._mapper_idx,
             block,
             *self._map_args,
         )
+        if self._on_map_task_submitted is not None:
+            self._on_map_task_submitted(submitted_at_ns, self._mapper_idx)
         metadata_schema_ref = map_result.pop(-1)
         self._map_results.append(map_result)
         self._mapper_idx += 1
@@ -456,6 +503,116 @@ class PushBasedShuffleTaskScheduler(ExchangeTaskScheduler):
         merge_factor: float = 2,
         _debug_limit_execution_to_num_blocks: int = None,
     ) -> Tuple[List[RefBundle], StatsDict]:
+        """Execute a push shuffle and record driver-side submission telemetry."""
+        parent_stats = task_ctx.kwargs.get(_ALL_TO_ALL_TELEMETRY_TASK_CONTEXT_KEY)
+        eos_received_at_ns = (
+            parent_stats.get("eos_received_at_ns")
+            if isinstance(parent_stats, dict)
+            else None
+        )
+        self._execution_telemetry: Dict[str, Any] = {
+            "scheduler_name": type(self).__name__,
+            "shuffle_started_at_ns": time.time_ns(),
+            "eos_received_at_ns": eos_received_at_ns,
+            "first_push_map_task_submitted_at_ns": None,
+            "last_push_map_task_submitted_at_ns": None,
+            "first_push_map_task_index": None,
+            "push_map_tasks_submitted": 0,
+            "shuffle_completed_at_ns": None,
+            "shuffle_failed_at_ns": None,
+            "shuffle_failure_type": None,
+            "shuffle_failure_message": None,
+            "first_push_map_task_preceded_eos": None,
+            # The scheduler is invoked synchronously by AllToAllOperator only
+            # after all_inputs_done() enters the bulk function.
+            "submission_code_path_requires_eos": isinstance(parent_stats, dict),
+            "status": "running",
+        }
+        self._parent_all_to_all_telemetry = (
+            parent_stats if isinstance(parent_stats, dict) else None
+        )
+        self._sync_parent_all_to_all_telemetry()
+        _publish_last_push_based_shuffle_stats(self._execution_telemetry)
+        try:
+            result = self._execute_impl(
+                refs,
+                output_num_blocks,
+                task_ctx,
+                map_ray_remote_args=map_ray_remote_args,
+                reduce_ray_remote_args=reduce_ray_remote_args,
+                merge_factor=merge_factor,
+                _debug_limit_execution_to_num_blocks=(
+                    _debug_limit_execution_to_num_blocks
+                ),
+            )
+            self._execution_telemetry["shuffle_completed_at_ns"] = time.time_ns()
+            self._execution_telemetry["status"] = "succeeded"
+            return result
+        except BaseException as exc:
+            self._execution_telemetry["shuffle_failed_at_ns"] = time.time_ns()
+            self._execution_telemetry["shuffle_failure_type"] = type(exc).__name__
+            self._execution_telemetry["shuffle_failure_message"] = str(exc)
+            self._execution_telemetry["status"] = "failed"
+            raise
+        finally:
+            self._sync_parent_all_to_all_telemetry()
+            _publish_last_push_based_shuffle_stats(self._execution_telemetry)
+            self._parent_all_to_all_telemetry = None
+
+    def _record_map_task_submission(
+        self, submitted_at_ns: int, mapper_idx: int
+    ) -> None:
+        telemetry = self._execution_telemetry
+        if telemetry["first_push_map_task_submitted_at_ns"] is None:
+            telemetry["first_push_map_task_submitted_at_ns"] = submitted_at_ns
+            telemetry["first_push_map_task_index"] = mapper_idx
+            eos_received_at_ns = telemetry["eos_received_at_ns"]
+            telemetry["first_push_map_task_preceded_eos"] = (
+                submitted_at_ns < eos_received_at_ns
+                if eos_received_at_ns is not None
+                else None
+            )
+        telemetry["last_push_map_task_submitted_at_ns"] = submitted_at_ns
+        telemetry["push_map_tasks_submitted"] += 1
+        self._sync_parent_all_to_all_telemetry()
+        _publish_last_push_based_shuffle_stats(telemetry)
+
+    def _sync_parent_all_to_all_telemetry(self) -> None:
+        parent = self._parent_all_to_all_telemetry
+        if parent is None:
+            return
+        telemetry = self._execution_telemetry
+        parent.update(
+            {
+                "push_shuffle_started_at_ns": telemetry["shuffle_started_at_ns"],
+                "first_push_map_task_submitted_at_ns": telemetry[
+                    "first_push_map_task_submitted_at_ns"
+                ],
+                "last_push_map_task_submitted_at_ns": telemetry[
+                    "last_push_map_task_submitted_at_ns"
+                ],
+                "first_push_map_task_index": telemetry["first_push_map_task_index"],
+                "push_map_tasks_submitted": telemetry["push_map_tasks_submitted"],
+                "push_shuffle_completed_at_ns": telemetry["shuffle_completed_at_ns"],
+                "push_shuffle_failed_at_ns": telemetry["shuffle_failed_at_ns"],
+                "push_shuffle_failure_type": telemetry["shuffle_failure_type"],
+                "push_shuffle_failure_message": telemetry["shuffle_failure_message"],
+                "first_push_map_task_preceded_eos": telemetry[
+                    "first_push_map_task_preceded_eos"
+                ],
+            }
+        )
+
+    def _execute_impl(
+        self,
+        refs: List[RefBundle],
+        output_num_blocks: int,
+        task_ctx: TaskContext,
+        map_ray_remote_args: Optional[Dict[str, Any]] = None,
+        reduce_ray_remote_args: Optional[Dict[str, Any]] = None,
+        merge_factor: float = 2,
+        _debug_limit_execution_to_num_blocks: int = None,
+    ) -> Tuple[List[RefBundle], StatsDict]:
         logger.debug("Using experimental push-based shuffle.")
         # TODO: Preemptively clear the blocks list since we will incrementally delete
         # the last remaining references as we submit the dependent map tasks during the
@@ -532,6 +689,7 @@ class PushBasedShuffleTaskScheduler(ExchangeTaskScheduler):
             input_blocks_list,
             shuffle_map,
             [output_num_blocks, stage.merge_schedule, *self._exchange_spec._map_args],
+            on_map_task_submitted=self._record_map_task_submission,
         )
 
         sub_progress_bar_dict = task_ctx.sub_progress_bar_dict
