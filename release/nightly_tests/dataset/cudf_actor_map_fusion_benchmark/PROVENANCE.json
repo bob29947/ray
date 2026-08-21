@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "candidate_commit": "aa17c53e462889bc835ab7f95446c3c6b80b24c4",
+  "wheel_sha256": "4106870d1edd3d1cdff04ab4ae7c0ae072272113186e5cc61a620afda13e3b20",
+  "wheel_manifest_sha256": "7ef1ee68cb66dcb8a72a40e7d990015de14d542fea3fc2d924af2615712ab1a0",
+  "bundle_payload_sha256": "ea600dfa689b3ff2440261adbee4056c358ce99e6f20fbc2e884c377f08db097",
+  "bundle_manifest_sha256": "d39b1f792680045096c1b99bf6773d0dc64c549e4ae23e9176be208ac51559d2",
+  "worker_sha256": "f5b20ca2966a690d24210ea4d38391446bbf988c579e5cb662c0553473b25f18",
+  "installed_fusion_module": {
+    "path": "ray/data/_internal/logical/rules/cudf_actor_fusion.py",
+    "sha256": "270fbc4a89ec5b6302d88f03e3fdefd83919c484007ae710a6fc4def23b27916"
+  },
+  "note": "Sanitized publication receipt. Cloud resource identifiers and internal filesystem paths are intentionally omitted."
+}
